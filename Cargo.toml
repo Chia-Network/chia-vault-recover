@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [dev-dependencies]
 chia-sdk-test = "0.36"
 hex-literal = "1.1"
-rstest = "0.26"
+rstest = "0.27"
 
 [profile.release]
 lto = true
