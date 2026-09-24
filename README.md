@@ -235,15 +235,17 @@ Every green CI uploads release binaries for:
 - Windows `x86_64`
 - Linux `x86_64` and `aarch64`
 
-GitHub Release tags (`v*`) also attach those artifacts to the release.
+GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed binaries: macOS is Developer ID signed and notarized, Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned.
 
-### macOS Gatekeeper
+### Forks and local builds
 
-Release macOS binaries are not Apple-signed or notarized. After a download, double-clicking `chia-vault-recover-gui-macos-universal` (or the CLI binary) shows *Apple could not verify … is free of malware* with **Move to Trash** / **Done**. That is expected.
+Forks do not receive the Chia signing secrets. Their CI still passes and uploads unsigned binaries, including on a GitHub Release. A local `cargo build --release` is also unsigned. macOS only quarantines files downloaded from the internet, so a binary you built on the same Mac is not blocked.
 
-**Settings (matches that dialog):** click **Done**, then System Settings → Privacy & Security → scroll to Security → **Open Anyway** for the blocked file. Confirm the next prompt.
+If you downloaded an unsigned macOS binary (from your fork's CI or release), double-clicking `chia-vault-recover-gui-macos-universal` or the CLI binary shows *Apple could not verify … is free of malware* with **Move to Trash** / **Done**. Windows SmartScreen can show a similar warning for an unsigned `.exe`.
 
-**Terminal** (GUI or CLI; use the path where you saved the download):
+**macOS Settings:** click **Done**, then System Settings → Privacy & Security → scroll to Security → **Open Anyway** for the blocked file. Confirm the next prompt.
+
+**macOS Terminal** (GUI or CLI; use the path where you saved the download):
 
 ```bash
 xattr -d com.apple.quarantine chia-vault-recover-gui-macos-universal
@@ -251,4 +253,4 @@ chmod +x chia-vault-recover-gui-macos-universal
 ./chia-vault-recover-gui-macos-universal
 ```
 
-Same `xattr` / `chmod` for `chia-vault-recover-macos-universal`. A local `cargo build --release` is not quarantined. Control-click → Open does not clear the Sequoia/Tahoe dialog.
+Same `xattr` / `chmod` for `chia-vault-recover-macos-universal`. Control-click → Open does not clear the Sequoia/Tahoe dialog.

@@ -80,7 +80,10 @@ jobs:
             target: universal-apple-darwin
             artifact: macos-universal
             universal: true
-    environment: ${{ matrix.sign-environment }}
+    # Forks have no windows-code-signing environment. An empty name means no environment.
+    environment: ${{ github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' && matrix.sign-environment || '' }}
+    env:
+      SIGN_RELEASES: ${{ github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -147,15 +150,19 @@ jobs:
             cp "$TARGET_DIR/chia-vault-recover-gui${EXT}" "dist/chia-vault-recover-gui-${{ matrix.artifact }}${EXT}"
           fi
 
+      - name: Skip code signing on forks
+        if: github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover' && (matrix.universal || matrix.sign-environment)
+        run: echo "Skipping code signing on ${{ github.repository }}. Release artifacts from forks are unsigned."
+
       - name: Vault login
-        if: github.event_name == 'release' && (matrix.universal || matrix.sign-environment)
+        if: env.SIGN_RELEASES == 'true' && (matrix.universal || matrix.sign-environment)
         uses: Chia-Network/actions/vault/login@main
         with:
           vault_url: ${{ secrets.VAULT_URL }}
           role_name: github-chia-vault-recover
 
       - name: Read Apple signing secrets
-        if: github.event_name == 'release' && matrix.universal
+        if: env.SIGN_RELEASES == 'true' && matrix.universal
         uses: hashicorp/vault-action@v4
         with:
           url: ${{ secrets.VAULT_URL }}
@@ -168,11 +175,11 @@ jobs:
             secret/data/code-signing/apple team_id | APPLE_TEAM_ID ;
 
       - name: Delete keychain if it already exists
-        if: github.event_name == 'release' && matrix.universal
+        if: env.SIGN_RELEASES == 'true' && matrix.universal
         run: security delete-keychain signing_temp.keychain || true
 
       - name: Import Apple app signing certificate
-        if: github.event_name == 'release' && matrix.universal
+        if: env.SIGN_RELEASES == 'true' && matrix.universal
         run: |
           if [ -z "$APPLE_DEV_ID_APP" ] || [ -z "$APPLE_DEV_ID_APP_PASS" ]; then
             echo "Release builds require Vault secrets secret/data/code-signing/apple dev_id_app and dev_id_app_pass." >&2
@@ -189,7 +196,7 @@ jobs:
           rm -f "$RUNNER_TEMP/apple-dev-id-app.p12"
 
       - name: Sign and notarize macOS binaries
-        if: github.event_name == 'release' && matrix.universal
+        if: env.SIGN_RELEASES == 'true' && matrix.universal
         run: |
           if [ -z "$APPLE_NOTARIZE_USERNAME" ] || [ -z "$APPLE_NOTARIZE_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
             echo "Release builds require Vault secrets secret/data/code-signing/apple notarize_username, notarize_password, and team_id." >&2
@@ -209,11 +216,11 @@ jobs:
           rm -f "$RUNNER_TEMP/macos-notarize.zip"
 
       - name: Delete signing keychain
-        if: always() && github.event_name == 'release' && matrix.universal
+        if: always() && env.SIGN_RELEASES == 'true' && matrix.universal
         run: security delete-keychain signing_temp.keychain || true
 
       - name: Read Azure signing secrets
-        if: github.event_name == 'release' && matrix.sign-environment
+        if: env.SIGN_RELEASES == 'true' && matrix.sign-environment
         uses: hashicorp/vault-action@v4
         with:
           url: ${{ secrets.VAULT_URL }}
@@ -224,7 +231,7 @@ jobs:
 
       - name: Check Azure signing secrets
         id: azure_signing
-        if: github.event_name == 'release' && matrix.sign-environment
+        if: env.SIGN_RELEASES == 'true' && matrix.sign-environment
         shell: bash
         run: |
           if [ -z "$AZURE_SIGNING_TENANT_ID" ] || [ -z "$AZURE_SIGNING_CLIENT_ID" ]; then
@@ -241,7 +248,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Sign Windows binaries
-        if: github.event_name == 'release' && matrix.sign-environment
+        if: env.SIGN_RELEASES == 'true' && matrix.sign-environment
         uses: Chia-Network/actions/sign/azure-windows@main
         with:
           azure_tenant_id: ${{ steps.azure_signing.outputs.tenant_id }}
