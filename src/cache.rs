@@ -12,7 +12,8 @@ use clvm_utils::TreeHash;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    VaultConfigMember, config_members_from_keys, keys_from_config_members, parse_bytes32,
+    VaultConfig, VaultConfigMember, config_members_from_keys, keys_from_config_members,
+    parse_bytes32,
 };
 use crate::discover::{ClawbackGuess, DiscoveredCustodyPath, FoundVault};
 use crate::error::{Error, Result};
@@ -37,12 +38,19 @@ pub fn app_dir() -> PathBuf {
     home_dir().join(".chia-vault-recover")
 }
 
-/// The last successful lookup, plus an optional clawback guess.
+/// What a successful lookup stored. A hint is the layout. A found vault still needs reconstruction.
+#[derive(Debug, Clone)]
+pub enum CachedLayout {
+    Hinted(VaultConfig),
+    Found(FoundVault),
+}
+
+/// The last successful lookup, plus an optional clawback guess for custody reconstruction.
 #[derive(Debug, Clone)]
 pub struct CachedLookup {
     pub receive_address: String,
     pub network: Network,
-    pub found: FoundVault,
+    pub layout: CachedLayout,
     pub clawback: ClawbackGuess,
 }
 
@@ -51,23 +59,49 @@ impl CachedLookup {
         Self {
             receive_address: address.trim().to_string(),
             network,
-            found,
+            layout: CachedLayout::Found(found),
             clawback: ClawbackGuess::Unknown,
         }
     }
 
-    /// Replace chain facts. Keeps a clawback guess only when the launcher is unchanged.
+    pub fn hinted(address: &str, network: Network, config: VaultConfig) -> Self {
+        let clawback = ClawbackGuess::Known(config.recovery.clawback_timelock);
+        Self {
+            receive_address: address.trim().to_string(),
+            network,
+            layout: CachedLayout::Hinted(config),
+            clawback,
+        }
+    }
+
+    pub fn launcher_id(&self) -> Result<Bytes32> {
+        match &self.layout {
+            CachedLayout::Hinted(config) => config.launcher_id_bytes(),
+            CachedLayout::Found(found) => Ok(found.launcher_id),
+        }
+    }
+
+    /// Clawback shown in the UI. A hint's seconds come from the config, not the guess field.
+    pub fn clawback_display(&self) -> ClawbackGuess {
+        match &self.layout {
+            CachedLayout::Hinted(config) => ClawbackGuess::Known(config.recovery.clawback_timelock),
+            CachedLayout::Found(_) => self.clawback,
+        }
+    }
+
+    /// Replace a custody-spend lookup. Keeps a clawback guess only when the launcher is unchanged.
     pub fn replace_found(self, address: &str, network: Network, found: FoundVault) -> Self {
-        let clawback = if self.found.launcher_id == found.launcher_id {
-            self.clawback
-        } else {
-            ClawbackGuess::Unknown
+        let previous = match &self.layout {
+            CachedLayout::Found(existing) if existing.launcher_id == found.launcher_id => {
+                self.clawback
+            }
+            _ => ClawbackGuess::Unknown,
         };
         Self {
             receive_address: address.trim().to_string(),
             network,
-            found,
-            clawback,
+            layout: CachedLayout::Found(found),
+            clawback: previous,
         }
     }
 
@@ -96,13 +130,20 @@ pub struct LookupCache {
 struct CacheFile {
     receive_address: String,
     network: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     launcher_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     launcher_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     custody_hash: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     custody_members: Vec<VaultConfigMember>,
+    #[serde(default, skip_serializing_if = "CoinRecord::is_blank")]
     current_coin: CoinRecord,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ancestor_puzzle_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hinted_config: Option<VaultConfig>,
     #[serde(default, skip_serializing_if = "ClawbackGuess::is_unknown")]
     clawback: ClawbackGuess,
 }
@@ -110,9 +151,28 @@ struct CacheFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CoinRecord {
+    #[serde(default)]
     parent_coin_info: String,
+    #[serde(default)]
     puzzle_hash: String,
+    #[serde(default)]
     amount: u64,
+}
+
+impl Default for CoinRecord {
+    fn default() -> Self {
+        Self {
+            parent_coin_info: String::new(),
+            puzzle_hash: String::new(),
+            amount: 0,
+        }
+    }
+}
+
+impl CoinRecord {
+    fn is_blank(&self) -> bool {
+        self.parent_coin_info.is_empty() && self.puzzle_hash.is_empty()
+    }
 }
 
 impl LookupCache {
@@ -171,6 +231,31 @@ impl LookupCache {
             .ok_or_else(|| Error::msg("no cached lookup for this address; look up the vault first"))
     }
 
+    pub(crate) fn require_found(&self, address: &str) -> Result<FoundCache> {
+        let entry = self.require(address)?;
+        let CachedLayout::Found(found) = entry.layout else {
+            return Err(Error::msg(
+                "cached lookup is an on-chain hint; start from that layout",
+            ));
+        };
+        Ok(FoundCache {
+            found,
+            clawback: entry.clawback,
+        })
+    }
+
+    /// Bind a hinted layout. The clawback is the one in the config.
+    pub fn persist_hinted(
+        &mut self,
+        address: &str,
+        network: Network,
+        config: VaultConfig,
+    ) -> Result<CachedLookup> {
+        let entry = CachedLookup::hinted(address, network, config);
+        self.store(entry.clone())?;
+        Ok(entry)
+    }
+
     /// Bind identity. Keeps a clawback guess when the launcher is unchanged.
     pub fn persist_found(
         &mut self,
@@ -192,10 +277,26 @@ impl LookupCache {
         address: &str,
         clawback: ClawbackGuess,
     ) -> Result<CachedLookup> {
-        let entry = self.require(address)?.with_clawback(clawback);
+        let entry = self.require(address)?;
+        if let CachedLayout::Hinted(config) = &entry.layout {
+            let known = config.recovery.clawback_timelock;
+            if clawback.secs().is_some_and(|secs| secs != known) {
+                return Err(Error::msg(format!(
+                    "on-chain hint clawback is {known}s, not {}s",
+                    clawback.secs().unwrap_or(known)
+                )));
+            }
+            return Ok(entry);
+        }
+        let entry = entry.with_clawback(clawback);
         self.store(entry.clone())?;
         Ok(entry)
     }
+}
+
+pub(crate) struct FoundCache {
+    pub found: FoundVault,
+    pub clawback: ClawbackGuess,
 }
 
 fn cache_key(address: &str) -> String {
@@ -215,28 +316,44 @@ fn hex_id(id: &Bytes32) -> String {
 
 impl CacheFile {
     fn from_cached(entry: &CachedLookup) -> Self {
-        Self {
+        let base = Self {
             receive_address: entry.receive_address.clone(),
             network: entry.network.as_str().to_string(),
-            launcher_id: hex_id(&entry.found.launcher_id),
-            launcher_source: entry.found.launcher_source.clone(),
-            custody_hash: format!("0x{}", hex::encode(entry.found.custody.custody_hash)),
-            custody_members: config_members_from_keys(
-                &entry.found.custody.members,
-                &entry.found.custody.vault_launcher_ids,
-            ),
+            launcher_id: String::new(),
+            launcher_source: String::new(),
+            custody_hash: String::new(),
+            custody_members: Vec::new(),
             current_coin: CoinRecord {
-                parent_coin_info: hex_id(&entry.found.current_coin.parent_coin_info),
-                puzzle_hash: hex_id(&entry.found.current_coin.puzzle_hash),
-                amount: entry.found.current_coin.amount,
+                parent_coin_info: String::new(),
+                puzzle_hash: String::new(),
+                amount: 0,
             },
-            ancestor_puzzle_hashes: entry
-                .found
-                .ancestor_puzzle_hashes
-                .iter()
-                .map(hex_id)
-                .collect(),
+            ancestor_puzzle_hashes: Vec::new(),
+            hinted_config: None,
             clawback: entry.clawback,
+        };
+        match &entry.layout {
+            CachedLayout::Hinted(config) => Self {
+                hinted_config: Some(config.clone()),
+                clawback: ClawbackGuess::Known(config.recovery.clawback_timelock),
+                ..base
+            },
+            CachedLayout::Found(found) => Self {
+                launcher_id: hex_id(&found.launcher_id),
+                launcher_source: found.launcher_source.clone(),
+                custody_hash: format!("0x{}", hex::encode(found.custody.custody_hash)),
+                custody_members: config_members_from_keys(
+                    &found.custody.members,
+                    &found.custody.vault_launcher_ids,
+                ),
+                current_coin: CoinRecord {
+                    parent_coin_info: hex_id(&found.current_coin.parent_coin_info),
+                    puzzle_hash: hex_id(&found.current_coin.puzzle_hash),
+                    amount: found.current_coin.amount,
+                },
+                ancestor_puzzle_hashes: found.ancestor_puzzle_hashes.iter().map(hex_id).collect(),
+                ..base
+            },
         }
     }
 
@@ -244,6 +361,9 @@ impl CacheFile {
         let network = Network::parse(&self.network).ok_or_else(|| {
             Error::msg(format!("lookup cache has unknown network {}", self.network))
         })?;
+        if let Some(config) = self.hinted_config {
+            return Ok(CachedLookup::hinted(&self.receive_address, network, config));
+        }
         let (members, vault_launcher_ids) = keys_from_config_members(&self.custody_members)?;
         let mut ancestor_puzzle_hashes = Vec::new();
         for ph in &self.ancestor_puzzle_hashes {
@@ -252,7 +372,7 @@ impl CacheFile {
         Ok(CachedLookup {
             receive_address: self.receive_address,
             network,
-            found: FoundVault {
+            layout: CachedLayout::Found(FoundVault {
                 launcher_id: parse_bytes32(&self.launcher_id)?,
                 launcher_source: self.launcher_source,
                 custody: DiscoveredCustodyPath {
@@ -266,7 +386,7 @@ impl CacheFile {
                     self.current_coin.amount,
                 ),
                 ancestor_puzzle_hashes,
-            },
+            }),
             clawback: self.clawback,
         })
     }
@@ -317,7 +437,7 @@ mod tests {
         let entry = loaded.matching("xch1abc").expect("cached");
         assert_eq!(entry.receive_address, "XCH1ABC");
         assert_eq!(entry.network, Network::Mainnet);
-        assert_eq!(entry.found.launcher_id, Bytes32::new([0xaa; 32]));
+        assert_eq!(entry.launcher_id().unwrap(), Bytes32::new([0xaa; 32]));
         assert_eq!(entry.clawback, ClawbackGuess::Unknown);
         assert!(!fs::read_to_string(&path).unwrap().contains("mnemonic"));
         let _ = fs::remove_file(path);

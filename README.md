@@ -6,13 +6,13 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## What you need
 
-1. **The vault Receive address** — the bech32m `xch1…` or `txch1…` address shown in Cloud Wallet. Start here. The first run only looks up the launcher and checks whether a prior custody spend is on chain. You do **not** enter the recovery phrase for this check.
-2. **Recovery passphrase** — the 24-word phrase Cloud Wallet gave you for vault recovery. Needed to **Start recovery** (to rebuild the public layout and to sign). You may also enter it after lookup to verify a clawback; it is never written to the lookup cache.
+1. **The vault Receive address** — the bech32m `xch1…` or `txch1…` address shown in Cloud Wallet. Start here. The first run looks up the launcher and reads the on-chain recovery hint. You do **not** enter the recovery phrase for this check.
+2. **Recovery passphrase** — the 24-word phrase Cloud Wallet gave you for vault recovery. Needed to **Start recovery** (to sign). You may also enter it after lookup to confirm it matches the hint. It is never written to the lookup cache.
 3. **A new custody mnemonic** — 24 words by default (12 optional); this becomes the post-recovery spend key. The tool can auto-generate a second mnemonic for the new recovery branch. Also only needed when you start.
 
 You also need network access (coinset by default, or a full node) to find the vault singleton and broadcast transactions.
 
-**You usually do not need a `vault-config-*.json` file.** That download is a fallback when this vault has never published its layout on chain. See [If lookup says you need a vault-config](#if-lookup-says-you-need-a-vault-config).
+Cloud Wallet publishes the public vault layout in a CHIP-0043 memo on the vault singleton (the recovery hint). This tool reads that memo. It includes custody and recovery public keys and the clawback timelock. It does not include the recovery phrase.
 
 ## Recover a vault
 
@@ -24,9 +24,9 @@ chia-vault-recover-gui
 
 The GUI is a short wizard: **Look up → Start → Finish**. Only one step is on screen at a time.
 
-1. **Look up** — Paste the vault Receive address and click **Look up vault**. This does not ask for the recovery phrase. A successful lookup is saved on disk (see [Lookup cache](#lookup-cache)). Advanced options (full node URL, vault-config JSON) are collapsed until needed.
-2. If lookup asks for a self-send or a vault-config, follow the on-screen steps (same as the CLI notes below).
-3. **Start** — Optionally enter the clawback window and/or recovery phrase and click **Check clawback now**. This is not required. Paste the recovery phrase and a new custody mnemonic, then **Start recovery**. Public configs are written under `~/.chia-vault-recover/` by default (override with Browse).
+1. **Look up** — Paste the vault Receive address and click **Look up vault**. This does not ask for the recovery phrase. A successful lookup is saved on disk (see [Lookup cache](#lookup-cache)). The full node URL is under Advanced.
+2. If lookup asks for a self-send, follow the on-screen steps (same as the CLI notes below). That spend publishes the recovery hint.
+3. **Start** — When the hint is present, the clawback window is already filled in. Paste the recovery phrase and a new custody mnemonic, then **Start recovery**. Public configs are written under `~/.chia-vault-recover/` by default (override with Browse).
 4. You can **close the app** after lookup or after Start. The next launch skips any home screen and opens **Start** (saved lookup) or **Finish** (recovery already started).
 5. **Finish** — After the clawback window, click **Finish recovery**. Remaining time is shown when Start was recorded in this app.
 
@@ -46,10 +46,10 @@ The tool:
 
 1. Decodes the Receive address
 2. Finds the vault launcher id from spent coins at that address (or their parents)
-3. Walks the vault singleton and looks for a previous **custody** spend
-4. Tells you whether this vault can be recovered later, or whether a vault-config JSON is required
+3. Walks the vault singleton and reads the Cloud Wallet recovery hint from the CHIP-0043 memo
+4. If that hint is missing, falls back to a previous **custody** spend
 
-You should see: *This vault can be recovered.* The lookup is written to the [lookup cache](#lookup-cache). The recovery phrase is not needed until `start` (or an optional clawback check).
+You should see: *This vault can be recovered from the on-chain hint.* The lookup is written to the [lookup cache](#lookup-cache). The recovery phrase is not needed until `start`.
 
 To store a clawback hint, or to verify one if you also pass the phrase:
 
@@ -63,18 +63,13 @@ The recovery phrase is used only in memory. It is never written to the cache.
 
 #### 2. If lookup cannot find a custody spend
 
-The Receive address does **not** contain the launcher id. An unused vault, or a vault that has only ever received funds, has nothing on chain for this tool to parse.
+The Receive address does **not** contain the launcher id. An unused vault, or a vault that has only ever received funds, has nothing on chain for this tool to parse. A vault that has not yet been spent with the recovery hint also cannot be rebuilt from the address alone.
 
 **If you can still open the vault at [vault.chia.net](https://vault.chia.net):**
 
-1. **Preferred — send any amount from the vault back to the same Receive address** (or any address you control). A self-send is enough. Cloud Wallet spends the vault singleton with your passkey or the Chia Signer App, which publishes the launcher id and the custody path. Wait for that transaction to confirm, then run `lookup` on the same address again.
-2. **Or download the public vault-config JSON** without sending: while logged in, open DevTools → Console (macOS: Option-Command-J; Windows/Linux: Ctrl+Shift+J), paste [`scripts/download-vault-config.js`](scripts/download-vault-config.js), and press Enter. Then:
+Send any amount from the vault back to the same Receive address (or any address you control). A self-send is enough. Cloud Wallet spends the vault singleton with your passkey or the Chia Signer App, which publishes the launcher id and the recovery hint. Wait for that transaction to confirm, then run `lookup` on the same address again.
 
-```bash
-chia-vault-recover inspect --config vault-config-….json
-```
-
-If you cannot access Cloud Wallet, you need a `vault-config-*.json` you saved earlier.
+If you cannot access Cloud Wallet and the hint is not already on chain, this tool cannot recover the vault from the address alone.
 
 #### 3. Start delayed recovery
 
@@ -86,9 +81,9 @@ chia-vault-recover start \
   --out-config post-recovery-vault-config.json
 ```
 
-`start --vault` reuses the lookup cache when present (no chain walk). Otherwise it looks up the vault, writes the cache, rebuilds the public layout from the recovery phrase, then signs. If you know the current clawback window, pass `--clawback-secs` (for example `43200`). If you omit it, a verified cache value is used; then a hint (tried first, then defaults); then common Cloud Wallet values until the reconstructed spend matches the chain. The vault enters RECOVERY (the old passkey or Chia Signer App can still claw back during the window). Run `lookup` again to refresh a stale cache.
+`start --vault` reuses the lookup cache when present (no chain walk). Otherwise it looks up the vault and writes the cache. When the on-chain hint is present, that layout and clawback are used and the recovery phrase only signs. Without the hint, the public layout is rebuilt from the recovery phrase. If you know the current clawback window, pass `--clawback-secs` (for example `43200`). If you omit it, a verified cache value is used; then a user-supplied hint (tried first, then defaults); then common Cloud Wallet values until the reconstructed spend matches the chain. The vault enters RECOVERY (the old passkey or Chia Signer App can still claw back during the window). Run `lookup` again to refresh a stale cache.
 
-Or pass `--config vault-config.json` if you already have a downloaded file (that file already includes the timelock).
+`start` writes the public layout to `vault-config.json` (override with `--lookup-config`). `finish` reads that file. Pass `--config` only when you already have the public layout this tool wrote.
 
 #### 4. Wait, then finish
 
@@ -102,27 +97,6 @@ chia-vault-recover finish \
 
 Default destination: new **24-word** BLS custody + an **auto-generated** second BLS recovery mnemonic (12-word option available). The generated recovery mnemonic is shown once (CLI print / GUI clipboard) and is **not** written into the public post-recovery config file.
 
-## If lookup says you need a vault-config
-
-A **Download Config** button is coming soon to [vault.chia.net](https://vault.chia.net). Until then, the browser script exports the same public file the API already returns while you are logged in.
-
-The file is public vault layout only. It does **not** include your recovery passphrase or any private key.
-
-1. Log in at [vault.chia.net](https://vault.chia.net) (or the testnet Cloud Wallet host).
-2. Open the vault you want to export.
-3. Open DevTools → Console (macOS: Option-Command-J; Windows/Linux: Ctrl+Shift+J).
-4. Paste the contents of [`scripts/download-vault-config.js`](scripts/download-vault-config.js) and press Enter.
-5. The browser downloads one `vault-config-*.json`. Store it with your backups.
-6. Confirm it matches the chain before recovery:
-
-```bash
-chia-vault-recover inspect --config vault-config.json
-```
-
-Only paste that script on the Cloud Wallet site while you are logged in. It uses your existing session to read vault public keys from the same GraphQL API the page already calls.
-
-Prefer a self-send (step 2 above) when you still have Cloud Wallet access and just need this tool to see the vault. The script is the right choice when you want a saved copy of the layout, or you cannot wait for a spend to confirm.
-
 ## Install / build
 
 ```bash
@@ -134,7 +108,7 @@ cargo build --release
 ## CLI reference
 
 ```bash
-# First run: address only (can this vault be recovered later?)
+# First run: address only (reads the on-chain recovery hint)
 chia-vault-recover lookup --vault xch1...
 
 # Optional: save a clawback hint, or verify it with the recovery phrase
@@ -160,7 +134,7 @@ chia-vault-recover finish \
   --config vault-config.json \
   --post-recovery-config post-recovery-vault-config.json
 
-# Fallback: verify a downloaded JSON
+# Confirm the public layout this tool wrote
 chia-vault-recover inspect --config vault-config.json
 ```
 
@@ -174,7 +148,7 @@ Useful flags:
 | `--network mainnet\|testnet11` | Used when the input is a hex launcher id. Addresses pick the network from `xch` / `txch` |
 | `--backend coinset\|rpc` | Default **coinset**; with `rpc` set `--full-node-url` |
 | `--word-count 12\|24` | Length for auto-generated recovery mnemonic (default 24) |
-| `--clawback-secs` | On `lookup`, saved as a hint unless a recovery phrase is also given (then verified). On `start --vault`, an explicit value is tried alone; if omitted, a verified cache value, then a hint, then common Cloud Wallet values (including 43200 / 12h) |
+| `--clawback-secs` | On `lookup`, saved as a user hint unless a recovery phrase is also given (then verified). Ignored when the on-chain hint already has the timelock, unless the value disagrees with that hint. On `start --vault` without an on-chain hint, an explicit value is tried alone; if omitted, a verified cache value, then a user hint, then common Cloud Wallet values (including 43200 / 12h) |
 
 Fees are not supported yet (zero-fee spends only).
 
@@ -184,8 +158,8 @@ Mnemonics may also be passed via env: `CHIA_VAULT_RECOVERY_MNEMONIC`, `CHIA_VAUL
 
 Cloud Wallet vaults are MIPS 1-of-2 singletons (custody | recovery). This tool runs **delayed (timelocked) recovery**:
 
-1. **lookup** — address → launcher → prior custody spend (no recovery phrase); writes the lookup cache
-2. **start** — reuse cache when present; recovery phrase (+ optional `--clawback-secs`, else cache / common values) → rebuild public layout and sign; vault enters RECOVERY
+1. **lookup** — address → launcher → on-chain recovery hint (or a prior custody spend if the hint is absent); writes the lookup cache. No recovery phrase
+2. **start** — reuse cache when present; recovery phrase signs. The hint supplies the public layout and clawback. Without a hint, `--clawback-secs` or the cache / common values rebuild the layout. Vault enters RECOVERY
 3. wait for `clawbackTimelock` seconds
 4. **finish** — permissionless rekey to the new custody configuration
 
@@ -210,7 +184,9 @@ The GUI stores public vault-config / post-recovery-config files in that same dir
 
 On GUI launch, the last saved vault opens on **Start** (or **Finish** if recovery was already started). Run **Look up vault** again to refresh from the chain, or use **Look up a different vault** to clear the GUI session.
 
-A clawback value is stored only when you supply one:
+When lookup reads the on-chain hint, the clawback from that memo is saved as **verified**.
+
+A user-supplied clawback is stored only when you pass one and the hint did not:
 
 - Without the recovery phrase: saved as a **hint** (tried first at Start, then the usual defaults)
 - With the recovery phrase: checked against the chain and saved as **verified** when it matches
@@ -226,7 +202,7 @@ cargo test --all
 ### Manual testnet11 recipe
 
 1. Look up a testnet vault address (`txch1…`).
-2. If lookup asks for a self-send, send a dust amount back to the same address from Cloud Wallet and wait for confirmation.
+2. If lookup asks for a self-send, send a dust amount back to the same address from Cloud Wallet and wait for confirmation. That publishes the recovery hint.
 3. Ensure the vault singleton is unspent (zero-fee spends only).
 4. Run:
 
@@ -246,7 +222,7 @@ Or point `--backend rpc --full-node-url https://localhost:8555` at a synced full
 
 - Instant recovery (spend/passkey or Chia Signer App key) is out of scope — use delayed recovery with the passphrase.
 - A never-spent Receive address cannot yield a launcher id. One Cloud Wallet send (including a self-send) is enough.
-- `lookup` also needs a previous **custody** spend of the current vault configuration. An unspent eve singleton, or a vault that has only ever been spent via recovery, cannot reveal the custody path. Cloud Wallet has not shipped on-chain config hints (`TEMP_VAULT_CONFIG_EXPORT` is still the JSON export/restore path).
+- `lookup` reads the Cloud Wallet CHIP-0043 recovery hint from the spend that created the current singleton (including the launcher mint). An unspent eve singleton or a vault spent before that hint existed has no memo to read. One custody send publishes it. A previous custody spend is the fallback when the hint is absent.
 - Clawback during the window still requires the old custody passkey or Chia Signer App (not implemented here).
 - After finish, custody is on-chain BLS; Cloud Wallet’s product UI may not re-import that vault as a normal passkey or Chia Signer App vault.
 - p2-singleton XCH/CATs are unchanged; only the vault singleton’s custody hash changes.

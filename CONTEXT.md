@@ -32,9 +32,13 @@ _Avoid_: vault-config (that file also has clawback and recovery pubkey)
 The last found vault on disk, shared by GUI and CLI, so a later run can skip lookup.
 _Avoid_: vault-config, session, save file
 
+**On-chain recovery hint**:
+The CHIP-0043 memo Cloud Wallet writes on the vault singleton. It reveals the public custody and recovery layout, including the clawback timelock. Primary source for recovery.
+_Avoid_: download, vault-config export
+
 **Clawback hint**:
 A user-supplied clawback timelock that has not been checked against the chain (no recovery phrase yet).
-_Avoid_: clawback (unqualified)
+_Avoid_: clawback (unqualified), on-chain recovery hint
 
 **Verified clawback**:
 A clawback timelock that matched the chain when reconstructed with the recovery phrase.

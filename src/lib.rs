@@ -7,6 +7,7 @@ pub mod config;
 pub mod discover;
 pub mod error;
 pub mod guidance;
+pub mod hint;
 pub mod keys;
 pub mod locate;
 pub mod mips;
@@ -19,12 +20,12 @@ pub use cache::{CachedLookup, LookupCache, app_dir};
 pub use config::{Curve, KeyType, VaultConfig, VaultConfigMember};
 pub use discover::{
     ClawbackCheck, ClawbackGuess, DEFAULT_TIMELOCK_CANDIDATES, DiscoveredCustodyPath, FoundVault,
-    ReconstructedVault, check_clawback, reconstruct, reconstruct_config,
+    ReconstructedVault, check_clawback, confirm_hinted_config, reconstruct, reconstruct_config,
 };
 pub use error::Error;
 pub use guidance::{
-    CACHE_LOADED, CLAWBACK_SECS_HELP, KnownLauncher, LOOKUP_CAN_RECOVER, LookupGap,
-    OPTIONAL_CONFIRM_HELP, fallback_guidance, reconstruct_success_guidance,
+    CACHE_LOADED, CLAWBACK_SECS_HELP, KnownLauncher, LOOKUP_CAN_RECOVER, LOOKUP_FROM_HINT,
+    LookupGap, OPTIONAL_CONFIRM_HELP, fallback_guidance, reconstruct_success_guidance,
 };
 pub use keys::{GeneratedMnemonic, KeyPair, MnemonicWordCount};
 pub use locate::{
@@ -37,6 +38,7 @@ pub use recovery::{
 };
 pub use vault::{CustodyPath, VaultInternals, VaultKeys, VaultMemberKey};
 pub use workflow::{
-    LookupReport, StartWorkflow, finish as finish_workflow, inspect as inspect_workflow,
-    lookup as lookup_workflow, rebuild_for_start, resolve_found, start as start_workflow,
+    LookupReport, PreparedStart, StartWorkflow, finish as finish_workflow,
+    inspect as inspect_workflow, lookup as lookup_workflow, prepare_start, rebuild_for_start,
+    resolve_found, start as start_workflow,
 };
