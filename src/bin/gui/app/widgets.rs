@@ -53,10 +53,7 @@ impl App {
             });
             ui.label(format!("Network: {}", self.network.as_str()));
             if let Some(entry) = self.cached_vault() {
-                let launcher = entry
-                    .launcher_id()
-                    .map(hex::encode)
-                    .unwrap_or_default();
+                let launcher = entry.launcher_id().map(hex::encode).unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label("Launcher:");
                     ui.monospace(format!("0x{}…", &launcher[..8.min(launcher.len())]));
