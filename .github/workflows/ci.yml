@@ -54,7 +54,6 @@ jobs:
     # needs contents:write (softprops/action-gh-release updates the release).
     permissions:
       contents: write
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -72,18 +71,11 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: windows-x86_64
-            # Azure Artifact Signing federated credential subject is
-            # repo:<org>/<repo>:environment:windows-code-signing
-            sign-environment: windows-code-signing
           - name: macos-universal
             os: macos-latest
             target: universal-apple-darwin
             artifact: macos-universal
             universal: true
-    # Forks have no windows-code-signing environment. An empty name means no environment.
-    environment: ${{ github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' && matrix.sign-environment || '' }}
-    env:
-      SIGN_RELEASES: ${{ github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -150,19 +142,62 @@ jobs:
             cp "$TARGET_DIR/chia-vault-recover-gui${EXT}" "dist/chia-vault-recover-gui-${{ matrix.artifact }}${EXT}"
           fi
 
-      - name: Skip code signing on forks
-        if: github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover' && (matrix.universal || matrix.sign-environment)
-        run: echo "Skipping code signing on ${{ github.repository }}. Release artifacts from forks are unsigned."
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: chia-vault-recover-${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+      # Official macOS and Windows release assets are uploaded by the sign job.
+      # Forks have no signing job, so they publish every platform from here.
+      - name: Upload release assets
+        if: github.event_name == 'release' && (github.repository != 'Chia-Network/chia-vault-recover' || runner.os == 'Linux')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sign:
+    name: Sign (${{ matrix.os }})
+    needs: build
+    if: github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release'
+    runs-on: ${{ matrix.runs-on }}
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            runs-on: macos-latest
+            artifact: macos-universal
+          - os: windows
+            runs-on: windows-latest
+            artifact: windows-x86_64
+            # Federated credential subject:
+            # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
+            environment: windows-code-signing
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: chia-vault-recover-${{ matrix.artifact }}
+          path: dist
 
       - name: Vault login
-        if: env.SIGN_RELEASES == 'true' && (matrix.universal || matrix.sign-environment)
         uses: Chia-Network/actions/vault/login@main
         with:
           vault_url: ${{ secrets.VAULT_URL }}
           role_name: github-chia-vault-recover
 
       - name: Read Apple signing secrets
-        if: env.SIGN_RELEASES == 'true' && matrix.universal
+        if: matrix.os == 'macos'
         uses: hashicorp/vault-action@v4
         with:
           url: ${{ secrets.VAULT_URL }}
@@ -174,53 +209,12 @@ jobs:
             secret/data/code-signing/apple notarize_password | APPLE_NOTARIZE_PASSWORD ;
             secret/data/code-signing/apple team_id | APPLE_TEAM_ID ;
 
-      - name: Delete keychain if it already exists
-        if: env.SIGN_RELEASES == 'true' && matrix.universal
-        run: security delete-keychain signing_temp.keychain || true
-
-      - name: Import Apple app signing certificate
-        if: env.SIGN_RELEASES == 'true' && matrix.universal
-        run: |
-          if [ -z "$APPLE_DEV_ID_APP" ] || [ -z "$APPLE_DEV_ID_APP_PASS" ]; then
-            echo "Release builds require Vault secrets secret/data/code-signing/apple dev_id_app and dev_id_app_pass." >&2
-            exit 1
-          fi
-          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
-          echo "$APPLE_DEV_ID_APP" | base64 --decode > "$RUNNER_TEMP/apple-dev-id-app.p12"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" signing_temp.keychain
-          security set-keychain-settings -lut 21600 signing_temp.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" signing_temp.keychain
-          security import "$RUNNER_TEMP/apple-dev-id-app.p12" -f pkcs12 -k signing_temp.keychain -P "$APPLE_DEV_ID_APP_PASS" -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" signing_temp.keychain
-          security list-keychains -d user -s signing_temp.keychain
-          rm -f "$RUNNER_TEMP/apple-dev-id-app.p12"
-
       - name: Sign and notarize macOS binaries
-        if: env.SIGN_RELEASES == 'true' && matrix.universal
-        run: |
-          if [ -z "$APPLE_NOTARIZE_USERNAME" ] || [ -z "$APPLE_NOTARIZE_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
-            echo "Release builds require Vault secrets secret/data/code-signing/apple notarize_username, notarize_password, and team_id." >&2
-            exit 1
-          fi
-          SIGNING_IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
-          if [ -z "$SIGNING_IDENTITY" ]; then
-            echo "No Developer ID Application identity in signing_temp.keychain." >&2
-            exit 1
-          fi
-          for bin in dist/chia-vault-recover-macos-universal dist/chia-vault-recover-gui-macos-universal; do
-            codesign --force --timestamp --options runtime --entitlements build-scripts/macos/entitlements.plist --sign "$SIGNING_IDENTITY" "$bin"
-            codesign --verify --strict --verbose=2 "$bin"
-          done
-          ditto -c -k dist "$RUNNER_TEMP/macos-notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/macos-notarize.zip" --apple-id "$APPLE_NOTARIZE_USERNAME" --password "$APPLE_NOTARIZE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
-          rm -f "$RUNNER_TEMP/macos-notarize.zip"
-
-      - name: Delete signing keychain
-        if: always() && env.SIGN_RELEASES == 'true' && matrix.universal
-        run: security delete-keychain signing_temp.keychain || true
+        if: matrix.os == 'macos'
+        run: bash build-scripts/macos/sign-release.sh "${{ matrix.artifact }}"
 
       - name: Read Azure signing secrets
-        if: env.SIGN_RELEASES == 'true' && matrix.sign-environment
+        if: matrix.os == 'windows'
         uses: hashicorp/vault-action@v4
         with:
           url: ${{ secrets.VAULT_URL }}
@@ -229,43 +223,12 @@ jobs:
             secret/data/code-signing/azure tenant_id | AZURE_SIGNING_TENANT_ID ;
             secret/data/code-signing/azure client_id | AZURE_SIGNING_CLIENT_ID ;
 
-      - name: Check Azure signing secrets
-        id: azure_signing
-        if: env.SIGN_RELEASES == 'true' && matrix.sign-environment
-        shell: bash
-        run: |
-          if [ -z "$AZURE_SIGNING_TENANT_ID" ] || [ -z "$AZURE_SIGNING_CLIENT_ID" ]; then
-            echo "Release builds require Vault secrets secret/data/code-signing/azure tenant_id and client_id." >&2
-            exit 1
-          fi
-          {
-            echo "tenant_id<<EOF"
-            echo "$AZURE_SIGNING_TENANT_ID"
-            echo "EOF"
-            echo "client_id<<EOF"
-            echo "$AZURE_SIGNING_CLIENT_ID"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Sign Windows binaries
-        if: env.SIGN_RELEASES == 'true' && matrix.sign-environment
-        uses: Chia-Network/actions/sign/azure-windows@main
-        with:
-          azure_tenant_id: ${{ steps.azure_signing.outputs.tenant_id }}
-          azure_client_id: ${{ steps.azure_signing.outputs.client_id }}
-          file: |
-            ${{ github.workspace }}/dist/chia-vault-recover-windows-x86_64.exe
-            ${{ github.workspace }}/dist/chia-vault-recover-gui-windows-x86_64.exe
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: ./build-scripts/windows/sign-release.ps1 -Artifact "${{ matrix.artifact }}"
 
-      - name: Upload CI artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: chia-vault-recover-${{ matrix.artifact }}
-          path: dist/*
-          if-no-files-found: error
-
-      - name: Upload release assets
-        if: github.event_name == 'release'
+      - name: Upload signed release assets
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
