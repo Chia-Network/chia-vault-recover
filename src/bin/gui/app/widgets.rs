@@ -53,12 +53,12 @@ impl App {
             });
             ui.label(format!("Network: {}", self.network.as_str()));
             if let Some(entry) = self.cached_vault() {
-                let launcher = hex::encode(entry.found.launcher_id);
+                let launcher = entry.launcher_id().map(hex::encode).unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label("Launcher:");
                     ui.monospace(format!("0x{}…", &launcher[..8.min(launcher.len())]));
                 });
-                ui.label(clawback_label(entry.clawback));
+                ui.label(clawback_label(entry.lookup.clawback()));
             } else if let Some(secs) = self.waiting_session().and_then(|s| s.clawback_secs) {
                 ui.label(format!("Clawback: {secs}s"));
             }

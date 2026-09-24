@@ -3,8 +3,9 @@
 use std::path::Path;
 
 use chia_vault_recover::LookupGap;
+use chia_vault_recover::cache::VaultLookup;
 use chia_vault_recover::config::VaultConfig;
-use chia_vault_recover::discover::{ClawbackCheck, FoundVault, check_clawback};
+use chia_vault_recover::discover::{ClawbackCheck, check_clawback, confirm_hinted_config};
 use chia_vault_recover::error::Result;
 use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
@@ -17,25 +18,33 @@ use crate::session::GuiSession;
 use super::{App, Phase, runtime};
 
 impl App {
-    pub(super) fn apply_found(&mut self, found: FoundVault, network: Network) {
-        let launcher = hex::encode(found.launcher_id);
-        let source = found.launcher_source.clone();
+    pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network) {
+        let secs = lookup.clawback().secs();
+        let summary = match &lookup {
+            VaultLookup::Hinted(config) => {
+                format!("Launcher {} from the on-chain hint.", config.launcher_id)
+            }
+            VaultLookup::Found(found, _) => format!(
+                "Launcher 0x{} from {}.",
+                hex::encode(found.launcher_id),
+                found.launcher_source
+            ),
+        };
         let address = self.vault_address.trim().to_string();
         GuiSession::clear();
         self.generated_recovery_mnemonic = None;
-        match self.cache.persist_found(&address, network, found) {
+        match self.cache.persist(&address, network, lookup) {
             Ok(_) => {
                 self.network = network;
+                if let Some(secs) = secs {
+                    self.clawback_secs = secs.to_string();
+                }
                 self.phase = Phase::Start;
                 self.set_ok(format!(
-                    "Launcher 0x{launcher} from {source}. Lookup saved. You can close the app and come back to Start, or continue now."
+                    "{summary} Lookup saved. You can close the app and come back to Start, or continue now."
                 ));
             }
-            Err(e) => {
-                self.set_err(format!(
-                    "Launcher 0x{launcher} from {source}. Could not save lookup cache: {e}"
-                ));
-            }
+            Err(e) => self.set_err(format!("{summary} Could not save lookup cache: {e}")),
         }
     }
 
@@ -46,7 +55,7 @@ impl App {
             None => String::new(),
         };
         self.set_err(format!(
-            "Lookup needs a self-send or vault-config.{launcher} {}",
+            "Lookup needs a self-send so Cloud Wallet can publish the recovery hint.{launcher} {}",
             gap.headline()
         ));
         self.phase = Phase::Fallback(gap);
@@ -65,28 +74,12 @@ impl App {
             ));
         }
         let (client, network) = client_for_vault(vault, self.network, &self.backend())?;
-        let report = runtime().block_on(workflow::lookup(&client, vault))?;
+        let extra = self.parsed_clawback()?.into_iter().collect::<Vec<_>>();
+        let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
         match report {
-            LookupReport::Found(found) => self.apply_found(found, network),
+            LookupReport::Ready(lookup) => self.apply_lookup(lookup, network),
             LookupReport::NeedFallback(gap) => self.apply_fallback(gap, network),
         }
-        Ok(())
-    }
-
-    pub(super) fn load_existing_config(&mut self) {
-        let result = self.load_existing_config_inner();
-        self.report("Load config error", result);
-    }
-
-    fn load_existing_config_inner(&mut self) -> Result<()> {
-        let config = VaultConfig::load(&self.config_path)?;
-        GuiSession::clear();
-        self.detail.clear();
-        self.phase = Phase::Start;
-        self.set_ok(format!(
-            "Loaded {}. launcher {}. Inspect, then Start recovery.",
-            self.config_path, config.launcher_id
-        ));
         Ok(())
     }
 
@@ -101,14 +94,24 @@ impl App {
                 "look up the vault before checking clawback",
             ));
         };
-        let found = entry.found.clone();
         let address = entry.receive_address.clone();
+        let layout = entry.lookup.clone();
         let words = self.recovery_mnemonic.trim();
-        let check = check_clawback(
-            &found,
-            if words.is_empty() { None } else { Some(words) },
-            self.parsed_clawback()?,
-        )?;
+        let phrase = if words.is_empty() { None } else { Some(words) };
+        let typed = self.parsed_clawback()?;
+        let found = match layout {
+            VaultLookup::Hinted(config) => {
+                confirm_hinted_config(&config, phrase, typed)?;
+                let secs = config.recovery.clawback_timelock;
+                self.clawback_secs = secs.to_string();
+                self.set_ok(format!(
+                    "Clawback {secs}s comes from the on-chain hint. The recovery phrase was not written to disk. You can Start recovery when ready."
+                ));
+                return Ok(());
+            }
+            VaultLookup::Found(found, _) => found,
+        };
+        let check = check_clawback(&found, phrase, typed)?;
         self.cache.persist_guess(&address, check.guess())?;
         let message = match check {
             ClawbackCheck::Hint(secs) => {
@@ -211,22 +214,19 @@ impl App {
             ))
         };
         let start = if self.cached_vault().is_some() {
-            let rebuilt = workflow::rebuild_for_start(
+            let prepared = workflow::prepare_start(
                 &mut self.cache,
                 self.vault_address.trim(),
                 recovery_mnemonic,
                 typed_clawback,
             )?;
-            self.clawback_secs = rebuilt.config.recovery.clawback_timelock.to_string();
-            rebuilt.config.save(&lookup_out)?;
+            self.clawback_secs = prepared.config().recovery.clawback_timelock.to_string();
+            prepared.config().save(&lookup_out)?;
             self.config_path = lookup_out.display().to_string();
-            push_start(&rebuilt.config)?
-        } else if self.config_on_disk() {
-            let config = VaultConfig::load(&self.config_path)?;
-            push_start(&config)?
+            push_start(prepared.config())?
         } else {
             return Err(chia_vault_recover::Error::msg(
-                "look up the vault or load a vault-config before Start recovery",
+                "look up the vault before Start recovery",
             ));
         };
         self.post_recovery_path = out.display().to_string();

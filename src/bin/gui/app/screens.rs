@@ -3,7 +3,7 @@
 use chia_vault_recover::guidance::{CLAWBACK_SECS_HELP, OPTIONAL_CONFIRM_HELP, fallback_guidance};
 use eframe::egui;
 
-use crate::theme::{self, DANGER, muted, muted_small, primary_button, secondary_button};
+use crate::theme::{self, DANGER, muted, primary_button, secondary_button};
 
 use super::{App, Phase};
 
@@ -38,15 +38,6 @@ impl App {
         ui.collapsing("Advanced", |ui| {
             ui.label("Full node URL (optional; empty = coinset):");
             ui.text_edit_singleline(&mut self.full_node_url);
-            ui.add_space(6.0);
-            ui.label("Already have a vault-config JSON?");
-            ui.label(muted_small(
-                "Only needed if lookup says the chain does not yet show this vault’s layout.",
-            ));
-            Self::path_row(ui, &mut self.config_path);
-            if secondary_button(ui, "Load config").clicked() {
-                self.load_existing_config();
-            }
         });
     }
 
@@ -62,17 +53,10 @@ impl App {
             ui.colored_label(DANGER, headline);
             ui.label(detail);
             ui.add_space(6.0);
-            ui.label("Preferred: send any amount from the vault back to the same Receive address, wait for confirmation, then look up again.");
+            ui.label("Send any amount from the vault back to the same Receive address, wait for confirmation, then look up again. That spend publishes the recovery hint.");
             ui.add_space(4.0);
             if primary_button(ui, "Look up again").clicked() {
                 self.run_lookup();
-            }
-            ui.add_space(4.0);
-            if secondary_button(ui, "Load vault-config JSON…").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_file()
-            {
-                self.config_path = path.display().to_string();
-                self.load_existing_config();
             }
         });
         ui.collapsing("Details", |ui| {
@@ -87,9 +71,7 @@ impl App {
         let can_start = self.can_start();
         theme::card_frame(ui).show(ui, |ui| {
             if !can_start {
-                ui.label(muted(
-                    "Look up a vault or load a vault-config JSON before starting recovery.",
-                ));
+                ui.label(muted("Look up a vault before starting recovery."));
                 ui.add_space(6.0);
             } else if self.cached_vault().is_some() {
                 ui.label(muted(
@@ -142,7 +124,7 @@ impl App {
             );
 
             ui.collapsing("Config paths", |ui| {
-                ui.label("Vault config (written at Start, or loaded JSON):");
+                ui.label("Vault config (written at Start):");
                 Self::path_row(ui, &mut self.config_path);
                 ui.label("Post-recovery config:");
                 Self::path_row(ui, &mut self.post_recovery_path);

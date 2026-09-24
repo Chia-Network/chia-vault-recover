@@ -12,7 +12,8 @@ use clvm_utils::TreeHash;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    VaultConfigMember, config_members_from_keys, keys_from_config_members, parse_bytes32,
+    VaultConfig, VaultConfigMember, config_members_from_keys, keys_from_config_members,
+    parse_bytes32,
 };
 use crate::discover::{ClawbackGuess, DiscoveredCustodyPath, FoundVault};
 use crate::error::{Error, Result};
@@ -37,42 +38,66 @@ pub fn app_dir() -> PathBuf {
     home_dir().join(".chia-vault-recover")
 }
 
-/// The last successful lookup, plus an optional clawback guess.
+/// A successful lookup. The clawback guess exists only for a custody-spend vault.
+#[derive(Debug, Clone)]
+pub enum VaultLookup {
+    Hinted(VaultConfig),
+    Found(FoundVault, ClawbackGuess),
+}
+
+impl VaultLookup {
+    pub fn launcher_id(&self) -> Result<Bytes32> {
+        match self {
+            Self::Hinted(config) => config.launcher_id_bytes(),
+            Self::Found(found, _) => Ok(found.launcher_id),
+        }
+    }
+
+    /// Seconds to show. A hint uses the config. A custody spend uses its guess.
+    pub fn clawback(&self) -> ClawbackGuess {
+        match self {
+            Self::Hinted(config) => ClawbackGuess::Known(config.recovery.clawback_timelock),
+            Self::Found(_, guess) => *guess,
+        }
+    }
+
+    fn replace_found(self, found: FoundVault) -> Self {
+        let guess = match &self {
+            Self::Found(existing, guess) if existing.launcher_id == found.launcher_id => *guess,
+            _ => ClawbackGuess::Unknown,
+        };
+        Self::Found(found, guess)
+    }
+}
+
+/// The last successful lookup.
 #[derive(Debug, Clone)]
 pub struct CachedLookup {
     pub receive_address: String,
     pub network: Network,
-    pub found: FoundVault,
-    pub clawback: ClawbackGuess,
+    pub lookup: VaultLookup,
 }
 
 impl CachedLookup {
-    pub fn new(address: &str, network: Network, found: FoundVault) -> Self {
+    pub fn new(address: &str, network: Network, lookup: VaultLookup) -> Self {
         Self {
             receive_address: address.trim().to_string(),
             network,
-            found,
-            clawback: ClawbackGuess::Unknown,
+            lookup,
         }
     }
 
-    /// Replace chain facts. Keeps a clawback guess only when the launcher is unchanged.
+    pub fn launcher_id(&self) -> Result<Bytes32> {
+        self.lookup.launcher_id()
+    }
+
+    /// Replace a custody-spend lookup. Keeps a clawback guess only when the launcher is unchanged.
     pub fn replace_found(self, address: &str, network: Network, found: FoundVault) -> Self {
-        let clawback = if self.found.launcher_id == found.launcher_id {
-            self.clawback
-        } else {
-            ClawbackGuess::Unknown
-        };
         Self {
             receive_address: address.trim().to_string(),
             network,
-            found,
-            clawback,
+            lookup: self.lookup.replace_found(found),
         }
-    }
-
-    pub fn with_clawback(self, clawback: ClawbackGuess) -> Self {
-        Self { clawback, ..self }
     }
 
     fn matches_address(&self, address: &str) -> bool {
@@ -96,23 +121,39 @@ pub struct LookupCache {
 struct CacheFile {
     receive_address: String,
     network: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     launcher_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     launcher_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     custody_hash: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     custody_members: Vec<VaultConfigMember>,
+    #[serde(default, skip_serializing_if = "CoinRecord::is_blank")]
     current_coin: CoinRecord,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ancestor_puzzle_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hinted_config: Option<VaultConfig>,
     #[serde(default, skip_serializing_if = "ClawbackGuess::is_unknown")]
     clawback: ClawbackGuess,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CoinRecord {
+    #[serde(default)]
     parent_coin_info: String,
+    #[serde(default)]
     puzzle_hash: String,
+    #[serde(default)]
     amount: u64,
+}
+
+impl CoinRecord {
+    fn is_blank(&self) -> bool {
+        self.parent_coin_info.is_empty() && self.puzzle_hash.is_empty()
+    }
 }
 
 impl LookupCache {
@@ -171,28 +212,38 @@ impl LookupCache {
             .ok_or_else(|| Error::msg("no cached lookup for this address; look up the vault first"))
     }
 
-    /// Bind identity. Keeps a clawback guess when the launcher is unchanged.
-    pub fn persist_found(
+    /// Store a successful lookup. A new custody spend keeps a clawback guess when the launcher is unchanged.
+    pub fn persist(
         &mut self,
         address: &str,
         network: Network,
-        found: FoundVault,
+        lookup: VaultLookup,
     ) -> Result<CachedLookup> {
-        let entry = match self.matching(address) {
-            Some(existing) => existing.clone().replace_found(address, network, found),
-            None => CachedLookup::new(address, network, found),
+        let entry = match (&lookup, self.matching(address)) {
+            (VaultLookup::Found(found, _), Some(existing)) => {
+                existing
+                    .clone()
+                    .replace_found(address, network, found.clone())
+            }
+            _ => CachedLookup::new(address, network, lookup),
         };
         self.store(entry.clone())?;
         Ok(entry)
     }
 
-    /// Update clawback on the matching entry. Will not create or rebind a vault.
+    /// Update the clawback guess on a cached custody spend.
     pub fn persist_guess(
         &mut self,
         address: &str,
         clawback: ClawbackGuess,
     ) -> Result<CachedLookup> {
-        let entry = self.require(address)?.with_clawback(clawback);
+        let mut entry = self.require(address)?;
+        let VaultLookup::Found(found, _) = entry.lookup else {
+            return Err(Error::msg(
+                "cached lookup is an on-chain hint; its clawback comes from that layout",
+            ));
+        };
+        entry.lookup = VaultLookup::Found(found, clawback);
         self.store(entry.clone())?;
         Ok(entry)
     }
@@ -215,28 +266,44 @@ fn hex_id(id: &Bytes32) -> String {
 
 impl CacheFile {
     fn from_cached(entry: &CachedLookup) -> Self {
-        Self {
+        let base = Self {
             receive_address: entry.receive_address.clone(),
             network: entry.network.as_str().to_string(),
-            launcher_id: hex_id(&entry.found.launcher_id),
-            launcher_source: entry.found.launcher_source.clone(),
-            custody_hash: format!("0x{}", hex::encode(entry.found.custody.custody_hash)),
-            custody_members: config_members_from_keys(
-                &entry.found.custody.members,
-                &entry.found.custody.vault_launcher_ids,
-            ),
+            launcher_id: String::new(),
+            launcher_source: String::new(),
+            custody_hash: String::new(),
+            custody_members: Vec::new(),
             current_coin: CoinRecord {
-                parent_coin_info: hex_id(&entry.found.current_coin.parent_coin_info),
-                puzzle_hash: hex_id(&entry.found.current_coin.puzzle_hash),
-                amount: entry.found.current_coin.amount,
+                parent_coin_info: String::new(),
+                puzzle_hash: String::new(),
+                amount: 0,
             },
-            ancestor_puzzle_hashes: entry
-                .found
-                .ancestor_puzzle_hashes
-                .iter()
-                .map(hex_id)
-                .collect(),
-            clawback: entry.clawback,
+            ancestor_puzzle_hashes: Vec::new(),
+            hinted_config: None,
+            clawback: ClawbackGuess::Unknown,
+        };
+        match &entry.lookup {
+            VaultLookup::Hinted(config) => Self {
+                hinted_config: Some(config.clone()),
+                ..base
+            },
+            VaultLookup::Found(found, guess) => Self {
+                clawback: *guess,
+                launcher_id: hex_id(&found.launcher_id),
+                launcher_source: found.launcher_source.clone(),
+                custody_hash: format!("0x{}", hex::encode(found.custody.custody_hash)),
+                custody_members: config_members_from_keys(
+                    &found.custody.members,
+                    &found.custody.vault_launcher_ids,
+                ),
+                current_coin: CoinRecord {
+                    parent_coin_info: hex_id(&found.current_coin.parent_coin_info),
+                    puzzle_hash: hex_id(&found.current_coin.puzzle_hash),
+                    amount: found.current_coin.amount,
+                },
+                ancestor_puzzle_hashes: found.ancestor_puzzle_hashes.iter().map(hex_id).collect(),
+                ..base
+            },
         }
     }
 
@@ -244,31 +311,40 @@ impl CacheFile {
         let network = Network::parse(&self.network).ok_or_else(|| {
             Error::msg(format!("lookup cache has unknown network {}", self.network))
         })?;
+        if let Some(config) = self.hinted_config {
+            return Ok(CachedLookup::new(
+                &self.receive_address,
+                network,
+                VaultLookup::Hinted(config),
+            ));
+        }
         let (members, vault_launcher_ids) = keys_from_config_members(&self.custody_members)?;
         let mut ancestor_puzzle_hashes = Vec::new();
         for ph in &self.ancestor_puzzle_hashes {
             ancestor_puzzle_hashes.push(parse_bytes32(ph)?);
         }
-        Ok(CachedLookup {
-            receive_address: self.receive_address,
+        Ok(CachedLookup::new(
+            &self.receive_address,
             network,
-            found: FoundVault {
-                launcher_id: parse_bytes32(&self.launcher_id)?,
-                launcher_source: self.launcher_source,
-                custody: DiscoveredCustodyPath {
-                    custody_hash: TreeHash::from(parse_bytes32(&self.custody_hash)?),
-                    members,
-                    vault_launcher_ids,
+            VaultLookup::Found(
+                FoundVault {
+                    launcher_id: parse_bytes32(&self.launcher_id)?,
+                    launcher_source: self.launcher_source,
+                    custody: DiscoveredCustodyPath {
+                        custody_hash: TreeHash::from(parse_bytes32(&self.custody_hash)?),
+                        members,
+                        vault_launcher_ids,
+                    },
+                    current_coin: Coin::new(
+                        parse_bytes32(&self.current_coin.parent_coin_info)?,
+                        parse_bytes32(&self.current_coin.puzzle_hash)?,
+                        self.current_coin.amount,
+                    ),
+                    ancestor_puzzle_hashes,
                 },
-                current_coin: Coin::new(
-                    parse_bytes32(&self.current_coin.parent_coin_info)?,
-                    parse_bytes32(&self.current_coin.puzzle_hash)?,
-                    self.current_coin.amount,
-                ),
-                ancestor_puzzle_hashes,
-            },
-            clawback: self.clawback,
-        })
+                self.clawback,
+            ),
+        ))
     }
 }
 
@@ -309,7 +385,11 @@ mod tests {
         let path = temp_path();
         let mut cache = LookupCache::open_at(&path);
         cache
-            .store(CachedLookup::new("XCH1ABC", Network::Mainnet, found(0xaa)))
+            .store(CachedLookup::new(
+                "XCH1ABC",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            ))
             .unwrap();
         drop(cache);
 
@@ -317,8 +397,8 @@ mod tests {
         let entry = loaded.matching("xch1abc").expect("cached");
         assert_eq!(entry.receive_address, "XCH1ABC");
         assert_eq!(entry.network, Network::Mainnet);
-        assert_eq!(entry.found.launcher_id, Bytes32::new([0xaa; 32]));
-        assert_eq!(entry.clawback, ClawbackGuess::Unknown);
+        assert_eq!(entry.launcher_id().unwrap(), Bytes32::new([0xaa; 32]));
+        assert_eq!(entry.lookup.clawback(), ClawbackGuess::Unknown);
         assert!(!fs::read_to_string(&path).unwrap().contains("mnemonic"));
         let _ = fs::remove_file(path);
     }
@@ -328,13 +408,17 @@ mod tests {
         let path = temp_path();
         let mut cache = LookupCache::open_at(&path);
         cache
-            .store(CachedLookup::new("xch1aaa", Network::Mainnet, found(0xaa)))
+            .store(CachedLookup::new(
+                "xch1aaa",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            ))
             .unwrap();
         cache
             .store(CachedLookup::new(
                 "txch1bbb",
                 Network::Testnet11,
-                found(0xbb),
+                VaultLookup::Found(found(0xbb), ClawbackGuess::Unknown),
             ))
             .unwrap();
         let current = cache.current().unwrap();
@@ -354,16 +438,24 @@ mod tests {
         let path = temp_path();
         let mut cache = LookupCache::open_at(&path);
         cache
-            .persist_found("xch1abc", Network::Mainnet, found(0xaa))
+            .persist(
+                "xch1abc",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            )
             .unwrap();
         cache
             .persist_guess("xch1abc", ClawbackGuess::Known(43_200))
             .unwrap();
         cache
-            .persist_found("xch1abc", Network::Mainnet, found(0xaa))
+            .persist(
+                "xch1abc",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            )
             .unwrap();
         assert_eq!(
-            cache.current().unwrap().clawback,
+            cache.current().unwrap().lookup.clawback(),
             ClawbackGuess::Known(43_200)
         );
         let _ = fs::remove_file(path);
@@ -374,7 +466,11 @@ mod tests {
         let path = temp_path();
         let mut cache = LookupCache::open_at(&path);
         cache
-            .persist_found("xch1abc", Network::Mainnet, found(0xaa))
+            .persist(
+                "xch1abc",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            )
             .unwrap();
         let err = cache
             .persist_guess("xch1other", ClawbackGuess::Hint(1))
@@ -387,15 +483,21 @@ mod tests {
 
     #[test]
     fn replace_found_keeps_clawback_for_same_launcher() {
-        let kept = CachedLookup::new("xch1abc", Network::Mainnet, found(0xaa))
-            .with_clawback(ClawbackGuess::Known(43_200))
-            .replace_found("xch1abc", Network::Mainnet, found(0xaa));
-        assert_eq!(kept.clawback, ClawbackGuess::Known(43_200));
+        let kept = CachedLookup::new(
+            "xch1abc",
+            Network::Mainnet,
+            VaultLookup::Found(found(0xaa), ClawbackGuess::Known(43_200)),
+        )
+        .replace_found("xch1abc", Network::Mainnet, found(0xaa));
+        assert_eq!(kept.lookup.clawback(), ClawbackGuess::Known(43_200));
 
-        let cleared = CachedLookup::new("xch1abc", Network::Mainnet, found(0xaa))
-            .with_clawback(ClawbackGuess::Known(43_200))
-            .replace_found("xch1abc", Network::Mainnet, found(0xbb));
-        assert_eq!(cleared.clawback, ClawbackGuess::Unknown);
+        let cleared = CachedLookup::new(
+            "xch1abc",
+            Network::Mainnet,
+            VaultLookup::Found(found(0xaa), ClawbackGuess::Known(43_200)),
+        )
+        .replace_found("xch1abc", Network::Mainnet, found(0xbb));
+        assert_eq!(cleared.lookup.clawback(), ClawbackGuess::Unknown);
     }
 
     #[test]

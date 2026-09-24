@@ -1,10 +1,11 @@
-//! Reconstruct vault custody from a previous on-chain spend.
+//! Reconstruct vault custody when the on-chain CHIP-0043 hint is absent.
 //!
-//! Cloud Wallet never hints the full vault config on-chain. A custody spend of the
-//! current 1-of-2 inner puzzle *does* reveal that path: the One-of-N member puzzle
-//! hashes to `custody_hash`, and a 1-of-1 member also reveals the public key.
-//! Combined with the recovery seed and clawback timelock (known or tried from
-//! common Cloud Wallet values) we can rebuild a config that matches the singleton.
+//! Cloud Wallet now attaches that hint to the vault singleton. Prefer it (see
+//! [`crate::hint`]). A custody spend of the current 1-of-2 inner puzzle still
+//! reveals the custody path: the One-of-N member puzzle hashes to `custody_hash`,
+//! and a 1-of-1 member also reveals the public key. Combined with the recovery
+//! seed and clawback timelock (known or tried from common Cloud Wallet values)
+//! we can rebuild a config that matches the singleton.
 
 use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_puzzles::{FORCE_1_OF_2_W_RESTRICTED_VARIABLE_HASH, ONE_OF_N_HASH, RESTRICTIONS_HASH};
@@ -97,7 +98,7 @@ impl DiscoveredCustodyPath {
     }
 }
 
-/// Chain facts from a successful lookup. No mnemonic, no rebuilt config.
+/// Chain facts from a custody-spend lookup. No mnemonic and no hinted config.
 #[derive(Debug, Clone)]
 pub struct FoundVault {
     pub launcher_id: Bytes32,
@@ -258,6 +259,44 @@ impl ClawbackCheck {
             }
         }
     }
+}
+
+pub fn recovery_phrase_matches(config: &VaultConfig, mnemonic: &str) -> Result<()> {
+    let key = key_from_mnemonic(mnemonic)?;
+    let expected = public_key_to_hex(&key.public_key);
+    let ok = config.recovery.members.iter().any(|member| match member {
+        VaultConfigMember::PublicKey {
+            public_key, curve, ..
+        } => *curve == Curve::Bls12_381 && public_key.eq_ignore_ascii_case(&expected),
+        VaultConfigMember::Vault { .. } => false,
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::msg(
+            "recovery phrase does not match a recovery key in the on-chain hint",
+        ))
+    }
+}
+
+/// Accept a hinted layout. The phrase is checked when present. A typed clawback must match the hint.
+pub fn confirm_hinted_config(
+    config: &VaultConfig,
+    recovery_mnemonic: Option<&str>,
+    clawback_secs: Option<u64>,
+) -> Result<()> {
+    if let Some(phrase) = recovery_mnemonic.map(str::trim).filter(|s| !s.is_empty()) {
+        recovery_phrase_matches(config, phrase)?;
+    }
+    if let Some(secs) = clawback_secs
+        && secs != config.recovery.clawback_timelock
+    {
+        return Err(Error::msg(format!(
+            "on-chain hint clawback is {}s, not {secs}s",
+            config.recovery.clawback_timelock
+        )));
+    }
+    Ok(())
 }
 
 pub fn check_clawback(

@@ -43,12 +43,12 @@ impl LookupGap {
                  (or from a parent vault spend)."
             }
             Self::SingletonNeverSpent(_) => {
-                "An unspent eve singleton does not reveal the custody path. \
-                 You need one send from the vault, or a vault-config JSON."
+                "An unspent eve singleton has no Cloud Wallet recovery hint yet. \
+                 One send from the vault publishes that hint."
             }
             Self::NoCustodySpend(_) => {
-                "Recovery-only spends are not enough. A send that uses the vault’s \
-                 passkey or Chia Signer App (custody) publishes the layout this tool needs."
+                "This vault has no Cloud Wallet recovery hint and no custody spend. \
+                 A send that uses the vault’s passkey or Chia Signer App publishes the hint."
             }
         }
     }
@@ -61,39 +61,41 @@ impl LookupGap {
     }
 }
 
-/// What to do when chain lookup cannot replace `vault-config-*.json`.
+/// What to do when the chain has no recovery hint and no custody spend.
 pub fn fallback_guidance(gap: &LookupGap) -> String {
     format!("{}\n{}\n\n{}", gap.headline(), gap.detail(), FALLBACK_STEPS)
 }
 
 pub const FALLBACK_STEPS: &str = "\
-A vault-config JSON is required unless the vault has already published its layout on chain.
+Recovery uses the on-chain hint Cloud Wallet writes onto the vault singleton.
 
 If you can still open this vault at https://vault.chia.net:
 
-1. Preferred — send any amount from the vault back to the same Receive address \
-(or any address you control). A self-send is enough. Cloud Wallet spends the vault \
-singleton with your passkey or the Chia Signer App, which publishes the launcher \
-id and custody path. Wait until that transaction confirms, then look up the same \
-address again.
+Send any amount from the vault back to the same Receive address (or any address \
+you control). A self-send is enough. Cloud Wallet spends the vault singleton with \
+your passkey or the Chia Signer App, which publishes the recovery hint. Wait \
+until that transaction confirms, then look up the same address again.
 
-2. Or download the public vault-config JSON without sending: while logged in, \
-open DevTools → Console (macOS: Option-Command-J; Windows/Linux: Ctrl+Shift+J), \
-paste scripts/download-vault-config.js, and press Enter. Then run \
-`chia-vault-recover inspect --config vault-config-….json`.
+If you cannot access Cloud Wallet and the hint is not on chain, this tool cannot \
+recover the vault from the address alone.";
 
-If you cannot access Cloud Wallet, you need a vault-config-*.json you saved earlier.";
+pub const RECONSTRUCT_SUCCESS: &str =
+    "Vault layout rebuilt from the previous custody spend and recovery phrase.";
 
-pub const LOOKUP_SUCCESS_NO_JSON: &str =
-    "Vault layout rebuilt from chain. You do not need a vault-config-*.json download.";
+/// Address-only lookup succeeded from the on-chain hint.
+pub const LOOKUP_FROM_HINT: &str = "\
+This vault can be recovered from the on-chain hint. The public layout and \
+clawback timelock were read from the Cloud Wallet memo. The lookup is saved \
+on disk. The recovery phrase is only needed to Start recovery, and it is never \
+written to disk.";
 
-/// Address-only lookup succeeded. Recovery words are not needed until Start.
+/// Address-only lookup succeeded from a custody spend, without the hint.
 pub const LOOKUP_CAN_RECOVER: &str = "\
-This vault can be recovered. The lookup is saved on disk, so you can close the \
-app and come back later without searching the chain again. You do not need a \
-vault-config-*.json download. Optionally enter the clawback window and/or \
-recovery phrase now to check the clawback — or skip and do that later when you \
-Start recovery. The recovery phrase is never written to disk.";
+This vault can be recovered from a previous custody spend. The lookup is saved \
+on disk, so you can close the app and come back without searching the chain \
+again. Optionally enter the clawback window and/or recovery phrase now to \
+check the clawback — or skip and do that when you Start recovery. The recovery \
+phrase is never written to disk.";
 
 /// Restarted with a saved lookup.
 pub const CACHE_LOADED: &str = "\
@@ -109,9 +111,10 @@ when you Start recovery. The recovery phrase is never saved to disk.";
 
 /// Optional current-vault clawback seconds (Start only).
 pub const CLAWBACK_SECS_HELP: &str = "\
-If you know this vault’s clawback timelock in seconds, enter it. Otherwise leave \
-it empty; the app tries a saved hint (if any), then common Cloud Wallet values \
-(including 43200 / 12 hours) until the reconstructed spend matches the chain.";
+If the on-chain hint includes this vault’s clawback timelock, that value is used. \
+Otherwise enter it in seconds, or leave it empty. The app then tries a saved hint \
+(if any), then common Cloud Wallet values (including 43200 / 12 hours) until the \
+reconstructed spend matches the chain.";
 
 pub fn reconstruct_success_guidance(matches_current: bool) -> String {
     let note = if matches_current {
@@ -119,7 +122,7 @@ pub fn reconstruct_success_guidance(matches_current: bool) -> String {
     } else {
         "Reconstructed config matches a previous singleton state (vault may be in RECOVERY)."
     };
-    format!("{LOOKUP_SUCCESS_NO_JSON} {note}")
+    format!("{RECONSTRUCT_SUCCESS} {note}")
 }
 
 #[cfg(test)]
@@ -134,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_mentions_self_send_and_script() {
+    fn fallback_mentions_self_send_not_a_download() {
         for gap in [
             LookupGap::LauncherNotFound,
             LookupGap::SingletonNeverSpent(launcher()),
@@ -142,8 +145,10 @@ mod tests {
         ] {
             let text = fallback_guidance(&gap);
             assert!(text.contains("self-send"), "{gap:?}");
-            assert!(text.contains("download-vault-config.js"), "{gap:?}");
+            assert!(text.contains("on-chain hint"), "{gap:?}");
             assert!(text.contains("vault.chia.net"), "{gap:?}");
+            assert!(!text.contains("download"), "{gap:?}");
+            assert!(!text.contains("vault-config"), "{gap:?}");
         }
     }
 

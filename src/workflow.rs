@@ -6,14 +6,16 @@ use chia_protocol::Coin;
 use chia_puzzle_types::Proof;
 use clvm_utils::TreeHash;
 
-use crate::cache::LookupCache;
+use crate::cache::{LookupCache, VaultLookup};
 use crate::chain::ChainClient;
 use crate::config::VaultConfig;
 use crate::discover::{
-    ClawbackGuess, FoundVault, ReconstructedVault, custody_from_vault_spend, reconstruct,
+    ClawbackGuess, DEFAULT_TIMELOCK_CANDIDATES, FoundVault, ReconstructedVault,
+    confirm_hinted_config, custody_from_vault_spend, reconstruct,
 };
 use crate::error::{Error, Result};
 use crate::guidance::{KnownLauncher, LookupGap};
+use crate::hint::hinted_config_from_spend;
 use crate::keys::MnemonicWordCount;
 use crate::locate::{parse_vault_locator, resolve_launcher_id};
 use crate::network::Network;
@@ -184,59 +186,97 @@ pub async fn finish(
 
 /// Result of looking up a vault from its receive address (or launcher id).
 ///
-/// This is chain facts only. Rebuild the public layout at Start with
-/// [`crate::discover::reconstruct`], then [`start`].
+/// A hint is a finished public layout. A found vault still needs
+/// [`crate::discover::reconstruct`] at Start.
 #[derive(Debug, Clone)]
 pub enum LookupReport {
-    Found(FoundVault),
+    Ready(VaultLookup),
     NeedFallback(LookupGap),
 }
 
-/// Rebuild the public layout from the cached vault and persist the verified clawback.
-pub fn rebuild_for_start(
+/// Layout ready to sign, either from the hint or from custody reconstruction.
+#[derive(Debug, Clone)]
+pub enum PreparedStart {
+    Hinted(VaultConfig),
+    Reconstructed(Box<ReconstructedVault>),
+}
+
+impl PreparedStart {
+    pub fn config(&self) -> &VaultConfig {
+        match self {
+            Self::Hinted(config) => config,
+            Self::Reconstructed(rebuilt) => &rebuilt.config,
+        }
+    }
+}
+
+/// Start from the cached hint, or reconstruct when the cache holds a custody spend.
+pub fn prepare_start(
     cache: &mut LookupCache,
     address: &str,
     recovery_mnemonic: &str,
     typed_clawback: Option<u64>,
-) -> Result<ReconstructedVault> {
-    let entry = cache.require(address)?;
-    let rebuilt = reconstruct(
-        &entry.found,
-        recovery_mnemonic,
-        entry.clawback.with_typed(typed_clawback),
-    )?;
-    cache.persist_guess(
-        address,
-        ClawbackGuess::Known(rebuilt.config.recovery.clawback_timelock),
-    )?;
-    Ok(rebuilt)
+) -> Result<PreparedStart> {
+    match cache.require(address)?.lookup {
+        VaultLookup::Hinted(config) => {
+            confirm_hinted_config(&config, Some(recovery_mnemonic), typed_clawback)?;
+            Ok(PreparedStart::Hinted(config))
+        }
+        VaultLookup::Found(found, clawback) => {
+            let rebuilt = reconstruct(
+                &found,
+                recovery_mnemonic,
+                clawback.with_typed(typed_clawback),
+            )?;
+            cache.persist_guess(
+                address,
+                ClawbackGuess::Known(rebuilt.config.recovery.clawback_timelock),
+            )?;
+            Ok(PreparedStart::Reconstructed(Box::new(rebuilt)))
+        }
+    }
 }
 
-/// Use a cached found vault when the address matches; otherwise look up and persist.
+/// Use a cached lookup when the address matches; otherwise look up and persist.
 pub async fn resolve_found(
     client: &ChainClient,
     cache: &mut LookupCache,
     vault: &str,
     network: Network,
+    extra_timelocks: &[u64],
 ) -> Result<LookupReport> {
     if let Some(cached) = cache.matching(vault) {
-        return Ok(LookupReport::Found(cached.found.clone()));
+        return Ok(LookupReport::Ready(cached.lookup.clone()));
     }
-    let report = lookup(client, vault).await?;
-    if let LookupReport::Found(found) = &report {
-        cache.persist_found(vault, network, found.clone())?;
-    }
+    let report = lookup(client, vault, extra_timelocks).await?;
+    persist_report(cache, vault, network, &report)?;
     Ok(report)
 }
 
-/// Address-first lookup: resolve launcher and a prior custody spend.
-pub async fn lookup(client: &ChainClient, vault: &str) -> Result<LookupReport> {
+/// Address-first lookup. The parent spend is the only hint source.
+///
+/// `extra_timelocks` are tried before the common Cloud Wallet values. Seconds
+/// outside that set are not recovered from the hint.
+pub async fn lookup(
+    client: &ChainClient,
+    vault: &str,
+    extra_timelocks: &[u64],
+) -> Result<LookupReport> {
     let locator = parse_vault_locator(vault)?;
     let Some(resolved) = resolve_launcher_id(client, &locator).await? else {
         return Ok(LookupReport::NeedFallback(LookupGap::LauncherNotFound));
     };
 
     let (spent, current) = client.walk_singleton_chain(resolved.launcher_id).await?;
+    let ancestor_puzzle_hashes: Vec<chia_protocol::Bytes32> =
+        spent.iter().map(|r| r.coin.puzzle_hash).collect();
+    let candidates = timelock_candidates(extra_timelocks);
+
+    if let Some(config) =
+        hinted_config_from_parent(client, resolved.launcher_id, &current, &candidates).await?
+    {
+        return Ok(LookupReport::Ready(VaultLookup::Hinted(config)));
+    }
 
     let mut custody = None;
     for record in spent.iter().rev() {
@@ -256,8 +296,59 @@ pub async fn lookup(client: &ChainClient, vault: &str) -> Result<LookupReport> {
         resolved.launcher_id,
         resolved.source,
         current.coin,
-        spent.iter().map(|r| r.coin.puzzle_hash).collect(),
+        ancestor_puzzle_hashes,
         custody,
+    ))
+}
+
+fn persist_report(
+    cache: &mut LookupCache,
+    vault: &str,
+    network: Network,
+    report: &LookupReport,
+) -> Result<()> {
+    if let LookupReport::Ready(lookup) = report {
+        cache.persist(vault, network, lookup.clone())?;
+    }
+    Ok(())
+}
+
+fn timelock_candidates(extra: &[u64]) -> Vec<u64> {
+    let mut out = extra.to_vec();
+    for &secs in DEFAULT_TIMELOCK_CANDIDATES {
+        if !out.contains(&secs) {
+            out.push(secs);
+        }
+    }
+    out
+}
+
+async fn hinted_config_from_parent(
+    client: &ChainClient,
+    launcher_id: chia_protocol::Bytes32,
+    current: &chia_sdk_coinset::CoinRecord,
+    timelock_candidates: &[u64],
+) -> Result<Option<VaultConfig>> {
+    let Some(parent) = client
+        .get_coin_record(current.coin.parent_coin_info)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if !parent.spent {
+        return Ok(None);
+    }
+    let Some(spend) = client
+        .get_spend(parent.coin.coin_id(), parent.spent_block_index)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(hinted_config_from_spend(
+        &spend,
+        launcher_id,
+        current.coin.puzzle_hash,
+        timelock_candidates,
     ))
 }
 
@@ -275,13 +366,16 @@ pub(crate) fn classify_lookup(
         }));
     }
     match custody {
-        Some(custody) => LookupReport::Found(FoundVault {
-            launcher_id,
-            launcher_source,
-            custody,
-            current_coin,
-            ancestor_puzzle_hashes,
-        }),
+        Some(custody) => LookupReport::Ready(VaultLookup::Found(
+            FoundVault {
+                launcher_id,
+                launcher_source,
+                custody,
+                current_coin,
+                ancestor_puzzle_hashes,
+            },
+            ClawbackGuess::Unknown,
+        )),
         None => LookupReport::NeedFallback(LookupGap::NoCustodySpend(KnownLauncher {
             id: launcher_id,
             source: launcher_source,
@@ -336,15 +430,15 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_for_start_requires_cached_vault() {
+    fn prepare_start_requires_cached_vault() {
         let path = std::env::temp_dir().join(format!(
             "cvr-workflow-unbound-{}-{}.json",
             std::process::id(),
-            "rebuild"
+            "prepare"
         ));
         let _ = std::fs::remove_file(&path);
         let mut cache = LookupCache::open_at(&path);
-        let err = rebuild_for_start(&mut cache, "xch1abc", "abandon abandon", None).unwrap_err();
+        let err = prepare_start(&mut cache, "xch1abc", "abandon abandon", None).unwrap_err();
         assert!(err.to_string().contains("look up"));
         let _ = std::fs::remove_file(path);
     }
@@ -358,7 +452,7 @@ mod tests {
             vec![Bytes32::new([0x04; 32])],
             Some(custody()),
         ) {
-            LookupReport::Found(found) => {
+            LookupReport::Ready(VaultLookup::Found(found, _)) => {
                 assert_eq!(found.launcher_source, "address xch1…");
                 assert!(!found.custody.members_complete());
             }
