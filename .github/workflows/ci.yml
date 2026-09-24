@@ -199,7 +199,7 @@ jobs:
         id: apple-signing
         shell: bash
         env:
-          APPLE_SIGNING_ENABLED: ${{ vars.ENABLE_APPLE_SIGNING }}
+          APPLE_SIGNING_ENABLED: "true"
           APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
           APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
           APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
@@ -235,7 +235,7 @@ jobs:
         id: windows-signing
         shell: bash
         env:
-          WINDOWS_SIGNING_ENABLED: ${{ vars.ENABLE_WINDOWS_SIGNING }}
+          WINDOWS_SIGNING_ENABLED: "true"
           AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
           AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
         run: |
