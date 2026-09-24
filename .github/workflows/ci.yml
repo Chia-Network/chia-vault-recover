@@ -177,12 +177,6 @@ jobs:
             artifact: macos-universal
             shell: bash
             sign: build-scripts/macos/sign-release.sh
-            vault-secrets: |
-              secret/data/code-signing/apple dev_id_app | APPLE_DEV_ID_APP ;
-              secret/data/code-signing/apple dev_id_app_pass | APPLE_DEV_ID_APP_PASS ;
-              secret/data/code-signing/apple notarize_username | APPLE_NOTARIZE_USERNAME ;
-              secret/data/code-signing/apple notarize_password | APPLE_NOTARIZE_PASSWORD ;
-              secret/data/code-signing/apple team_id | APPLE_TEAM_ID ;
           - os: windows
             runs-on: windows-latest
             artifact: windows-x86_64
@@ -191,9 +185,6 @@ jobs:
             # Federated credential subject:
             # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
             environment: windows-code-signing
-            vault-secrets: |
-              secret/data/code-signing/azure tenant_id | AZURE_SIGNING_TENANT_ID ;
-              secret/data/code-signing/azure client_id | AZURE_SIGNING_CLIENT_ID ;
     steps:
       - uses: actions/checkout@v7
 
@@ -203,24 +194,84 @@ jobs:
           name: chia-vault-recover-${{ matrix.artifact }}
           path: dist
 
-      - name: Vault login
-        uses: Chia-Network/actions/vault/login@main
-        with:
-          vault_url: ${{ secrets.VAULT_URL }}
-          role_name: github-chia-vault-recover
+      - name: Check for Apple signing credentials
+        if: matrix.os == 'macos'
+        id: apple-signing
+        shell: bash
+        env:
+          APPLE_SIGNING_ENABLED: ${{ vars.ENABLE_APPLE_SIGNING }}
+          APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
+          APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
+          APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
+          APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ "$APPLE_SIGNING_ENABLED" != "true" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          configured=0
+          for value in \
+            "$APPLE_DEV_ID_APP" \
+            "$APPLE_DEV_ID_APP_PASS" \
+            "$APPLE_NOTARIZE_USERNAME" \
+            "$APPLE_NOTARIZE_PASSWORD" \
+            "$APPLE_TEAM_ID"; do
+            if [[ -n "$value" ]]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [[ "$configured" -eq 5 ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$configured" -eq 0 ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Apple signing is partially configured; all five Apple secrets are required"
+            exit 1
+          fi
 
-      - name: Read signing secrets
-        uses: hashicorp/vault-action@v4
-        with:
-          url: ${{ secrets.VAULT_URL }}
-          token: ${{ env.VAULT_TOKEN }}
-          secrets: ${{ matrix.vault-secrets }}
+      - name: Check for Windows signing credentials
+        if: matrix.os == 'windows'
+        id: windows-signing
+        shell: bash
+        env:
+          WINDOWS_SIGNING_ENABLED: ${{ vars.ENABLE_WINDOWS_SIGNING }}
+          AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+        run: |
+          if [[ "$WINDOWS_SIGNING_ENABLED" != "true" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            configured=0
+            for value in "$AZURE_SIGNING_CLIENT_ID" "$AZURE_SIGNING_TENANT_ID"; do
+              if [[ -n "$value" ]]; then
+                configured=$((configured + 1))
+              fi
+            done
+            if [[ "$configured" -eq 2 ]]; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+            elif [[ "$configured" -eq 0 ]]; then
+              echo "available=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Windows signing is partially configured; both Azure signing secrets are required"
+              exit 1
+            fi
+          fi
 
       - name: Sign binaries
+        if: steps.apple-signing.outputs.available == 'true' || steps.windows-signing.outputs.available == 'true'
         shell: ${{ matrix.shell }}
+        env:
+          APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
+          APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
+          APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
+          APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
         run: ${{ matrix.sign }} ${{ matrix.artifact }}
 
-      - name: Upload signed release assets
+      - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
