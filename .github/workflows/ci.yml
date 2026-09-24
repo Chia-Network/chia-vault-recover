@@ -175,12 +175,25 @@ jobs:
           - os: macos
             runs-on: macos-latest
             artifact: macos-universal
+            shell: bash
+            sign: build-scripts/macos/sign-release.sh
+            vault-secrets: |
+              secret/data/code-signing/apple dev_id_app | APPLE_DEV_ID_APP ;
+              secret/data/code-signing/apple dev_id_app_pass | APPLE_DEV_ID_APP_PASS ;
+              secret/data/code-signing/apple notarize_username | APPLE_NOTARIZE_USERNAME ;
+              secret/data/code-signing/apple notarize_password | APPLE_NOTARIZE_PASSWORD ;
+              secret/data/code-signing/apple team_id | APPLE_TEAM_ID ;
           - os: windows
             runs-on: windows-latest
             artifact: windows-x86_64
+            shell: pwsh
+            sign: ./build-scripts/windows/sign-release.ps1 -Artifact
             # Federated credential subject:
             # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
             environment: windows-code-signing
+            vault-secrets: |
+              secret/data/code-signing/azure tenant_id | AZURE_SIGNING_TENANT_ID ;
+              secret/data/code-signing/azure client_id | AZURE_SIGNING_CLIENT_ID ;
     steps:
       - uses: actions/checkout@v7
 
@@ -196,37 +209,16 @@ jobs:
           vault_url: ${{ secrets.VAULT_URL }}
           role_name: github-chia-vault-recover
 
-      - name: Read Apple signing secrets
-        if: matrix.os == 'macos'
+      - name: Read signing secrets
         uses: hashicorp/vault-action@v4
         with:
           url: ${{ secrets.VAULT_URL }}
           token: ${{ env.VAULT_TOKEN }}
-          secrets: |
-            secret/data/code-signing/apple dev_id_app | APPLE_DEV_ID_APP ;
-            secret/data/code-signing/apple dev_id_app_pass | APPLE_DEV_ID_APP_PASS ;
-            secret/data/code-signing/apple notarize_username | APPLE_NOTARIZE_USERNAME ;
-            secret/data/code-signing/apple notarize_password | APPLE_NOTARIZE_PASSWORD ;
-            secret/data/code-signing/apple team_id | APPLE_TEAM_ID ;
+          secrets: ${{ matrix.vault-secrets }}
 
-      - name: Sign and notarize macOS binaries
-        if: matrix.os == 'macos'
-        run: bash build-scripts/macos/sign-release.sh "${{ matrix.artifact }}"
-
-      - name: Read Azure signing secrets
-        if: matrix.os == 'windows'
-        uses: hashicorp/vault-action@v4
-        with:
-          url: ${{ secrets.VAULT_URL }}
-          token: ${{ env.VAULT_TOKEN }}
-          secrets: |
-            secret/data/code-signing/azure tenant_id | AZURE_SIGNING_TENANT_ID ;
-            secret/data/code-signing/azure client_id | AZURE_SIGNING_CLIENT_ID ;
-
-      - name: Sign Windows binaries
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: ./build-scripts/windows/sign-release.ps1 -Artifact "${{ matrix.artifact }}"
+      - name: Sign binaries
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.sign }} ${{ matrix.artifact }}
 
       - name: Upload signed release assets
         uses: softprops/action-gh-release@v3
