@@ -139,7 +139,7 @@ struct CacheFile {
     clawback: ClawbackGuess,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CoinRecord {
     #[serde(default)]
@@ -148,16 +148,6 @@ struct CoinRecord {
     puzzle_hash: String,
     #[serde(default)]
     amount: u64,
-}
-
-impl Default for CoinRecord {
-    fn default() -> Self {
-        Self {
-            parent_coin_info: String::new(),
-            puzzle_hash: String::new(),
-            amount: 0,
-        }
-    }
 }
 
 impl CoinRecord {

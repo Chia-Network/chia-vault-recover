@@ -55,7 +55,7 @@ impl App {
             if let Some(entry) = self.cached_vault() {
                 let launcher = entry
                     .launcher_id()
-                    .map(|id| hex::encode(id))
+                    .map(hex::encode)
                     .unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label("Launcher:");

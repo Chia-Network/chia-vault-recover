@@ -198,7 +198,7 @@ pub enum LookupReport {
 #[derive(Debug, Clone)]
 pub enum PreparedStart {
     Hinted(VaultConfig),
-    Reconstructed(ReconstructedVault),
+    Reconstructed(Box<ReconstructedVault>),
 }
 
 impl PreparedStart {
@@ -232,7 +232,7 @@ pub fn prepare_start(
                 address,
                 ClawbackGuess::Known(rebuilt.config.recovery.clawback_timelock),
             )?;
-            Ok(PreparedStart::Reconstructed(rebuilt))
+            Ok(PreparedStart::Reconstructed(Box::new(rebuilt)))
         }
     }
 }
