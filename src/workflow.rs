@@ -210,30 +210,6 @@ impl PreparedStart {
     }
 }
 
-/// Rebuild the public layout from a cached custody-spend vault and persist the verified clawback.
-pub fn rebuild_for_start(
-    cache: &mut LookupCache,
-    address: &str,
-    recovery_mnemonic: &str,
-    typed_clawback: Option<u64>,
-) -> Result<ReconstructedVault> {
-    let VaultLookup::Found(found, clawback) = cache.require(address)?.lookup else {
-        return Err(Error::msg(
-            "cached lookup is an on-chain hint; start from that layout",
-        ));
-    };
-    let rebuilt = reconstruct(
-        &found,
-        recovery_mnemonic,
-        clawback.with_typed(typed_clawback),
-    )?;
-    cache.persist_guess(
-        address,
-        ClawbackGuess::Known(rebuilt.config.recovery.clawback_timelock),
-    )?;
-    Ok(rebuilt)
-}
-
 /// Start from the cached hint, or reconstruct when the cache holds a custody spend.
 pub fn prepare_start(
     cache: &mut LookupCache,
@@ -246,12 +222,18 @@ pub fn prepare_start(
             confirm_hinted_config(&config, Some(recovery_mnemonic), typed_clawback)?;
             Ok(PreparedStart::Hinted(config))
         }
-        VaultLookup::Found(_, _) => Ok(PreparedStart::Reconstructed(rebuild_for_start(
-            cache,
-            address,
-            recovery_mnemonic,
-            typed_clawback,
-        )?)),
+        VaultLookup::Found(found, clawback) => {
+            let rebuilt = reconstruct(
+                &found,
+                recovery_mnemonic,
+                clawback.with_typed(typed_clawback),
+            )?;
+            cache.persist_guess(
+                address,
+                ClawbackGuess::Known(rebuilt.config.recovery.clawback_timelock),
+            )?;
+            Ok(PreparedStart::Reconstructed(rebuilt))
+        }
     }
 }
 
@@ -448,15 +430,15 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_for_start_requires_cached_vault() {
+    fn prepare_start_requires_cached_vault() {
         let path = std::env::temp_dir().join(format!(
             "cvr-workflow-unbound-{}-{}.json",
             std::process::id(),
-            "rebuild"
+            "prepare"
         ));
         let _ = std::fs::remove_file(&path);
         let mut cache = LookupCache::open_at(&path);
-        let err = rebuild_for_start(&mut cache, "xch1abc", "abandon abandon", None).unwrap_err();
+        let err = prepare_start(&mut cache, "xch1abc", "abandon abandon", None).unwrap_err();
         assert!(err.to_string().contains("look up"));
         let _ = std::fs::remove_file(path);
     }
