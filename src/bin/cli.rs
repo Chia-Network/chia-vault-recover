@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use chia_vault_recover::cache::LookupCache;
+use chia_vault_recover::cache::{LookupCache, VaultLookup};
 use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::config::VaultConfig;
 use chia_vault_recover::discover::{
@@ -173,67 +173,36 @@ async fn main() -> Result<()> {
             let extra = clawback_secs.into_iter().collect::<Vec<_>>();
             let report = workflow::lookup(&client, &vault, &extra).await?;
             match report {
-                LookupReport::Hinted(config) => {
-                    print_hinted(&config, network);
-                    let mut cache = LookupCache::open();
-                    cache.persist_hinted(&vault, network, config.clone())?;
-                    println!("lookup cache: {}", cache.path().display());
-                    let words = optional_mnemonic(recovery_mnemonic, recovery_mnemonic_file)?;
-                    if clawback_secs.is_some() || words.is_some() {
-                        match confirm_hinted_config(&config, words.as_deref(), clawback_secs) {
-                            Ok(()) => println!(
-                                "verified clawback_timelock_secs: {}",
-                                config.recovery.clawback_timelock
-                            ),
-                            Err(e) => println!("clawback check: {e}"),
-                        }
-                    }
-                    println!("{LOOKUP_FROM_HINT}");
-                    println!(
-                        "When you are ready: chia-vault-recover start --vault <address> \
-                         --recovery-mnemonic-file … --new-custody-mnemonic-file …"
-                    );
-                }
-                LookupReport::Found(found) => {
-                    print_found(&found, network);
-                    let mut cache = LookupCache::open();
-                    cache.persist_found(&vault, network, found.clone())?;
-                    println!("lookup cache: {}", cache.path().display());
-                    let words = optional_mnemonic(recovery_mnemonic, recovery_mnemonic_file)?;
-                    if clawback_secs.is_some() || words.is_some() {
-                        match check_clawback(&found, words.as_deref(), clawback_secs) {
-                            Ok(check) => {
-                                cache.persist_guess(&vault, check.guess())?;
-                                match check {
-                                    ClawbackCheck::Hint(secs) => {
-                                        println!(
-                                            "saved clawback {secs}s as a hint (not verified without the recovery phrase)"
-                                        );
-                                    }
-                                    ClawbackCheck::Verified(rebuilt) => {
-                                        println!(
-                                            "verified clawback_timelock_secs: {}",
-                                            rebuilt.config.recovery.clawback_timelock
-                                        );
-                                        println!(
-                                            "{}",
-                                            reconstruct_success_guidance(rebuilt.matches_current)
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => println!("clawback check: {e}"),
-                        }
-                    }
-                    println!("{LOOKUP_CAN_RECOVER}");
-                    println!(
-                        "When you are ready: chia-vault-recover start --vault <address> \
-                         --recovery-mnemonic-file … --new-custody-mnemonic-file …"
-                    );
-                }
                 LookupReport::NeedFallback(gap) => {
                     print_fallback(network, &gap);
                     std::process::exit(2);
+                }
+                LookupReport::Ready(lookup) => {
+                    print_lookup(&lookup, network);
+                    let mut cache = LookupCache::open();
+                    cache.persist(&vault, network, lookup.clone())?;
+                    println!("lookup cache: {}", cache.path().display());
+                    let words = optional_mnemonic(recovery_mnemonic, recovery_mnemonic_file)?;
+                    if clawback_secs.is_some() || words.is_some() {
+                        confirm_saved_lookup(
+                            &mut cache,
+                            &vault,
+                            &lookup,
+                            words.as_deref(),
+                            clawback_secs,
+                        );
+                    }
+                    println!(
+                        "{}",
+                        match &lookup {
+                            VaultLookup::Hinted(_) => LOOKUP_FROM_HINT,
+                            VaultLookup::Found(_, _) => LOOKUP_CAN_RECOVER,
+                        }
+                    );
+                    println!(
+                        "When you are ready: chia-vault-recover start --vault <address> \
+                         --recovery-mnemonic-file … --new-custody-mnemonic-file …"
+                    );
                 }
             }
         }
@@ -393,7 +362,55 @@ fn require_layout(network: Network, report: LookupReport) -> Result<()> {
             print_fallback(network, &gap);
             bail!("cannot start recovery until lookup finds the vault layout");
         }
-        LookupReport::Hinted(_) | LookupReport::Found(_) => Ok(()),
+        LookupReport::Ready(_) => Ok(()),
+    }
+}
+
+fn print_lookup(lookup: &VaultLookup, network: Network) {
+    match lookup {
+        VaultLookup::Hinted(config) => print_hinted(config, network),
+        VaultLookup::Found(found, _) => print_found(found, network),
+    }
+}
+
+fn confirm_saved_lookup(
+    cache: &mut LookupCache,
+    vault: &str,
+    lookup: &VaultLookup,
+    words: Option<&str>,
+    clawback_secs: Option<u64>,
+) {
+    match lookup {
+        VaultLookup::Hinted(config) => match confirm_hinted_config(config, words, clawback_secs) {
+            Ok(()) => println!(
+                "verified clawback_timelock_secs: {}",
+                config.recovery.clawback_timelock
+            ),
+            Err(e) => println!("clawback check: {e}"),
+        },
+        VaultLookup::Found(found, _) => match check_clawback(found, words, clawback_secs) {
+            Ok(check) => {
+                if let Err(e) = cache.persist_guess(vault, check.guess()) {
+                    println!("clawback check: {e}");
+                    return;
+                }
+                match check {
+                    ClawbackCheck::Hint(secs) => {
+                        println!(
+                            "saved clawback {secs}s as a hint (not verified without the recovery phrase)"
+                        );
+                    }
+                    ClawbackCheck::Verified(rebuilt) => {
+                        println!(
+                            "verified clawback_timelock_secs: {}",
+                            rebuilt.config.recovery.clawback_timelock
+                        );
+                        println!("{}", reconstruct_success_guidance(rebuilt.matches_current));
+                    }
+                }
+            }
+            Err(e) => println!("clawback check: {e}"),
+        },
     }
 }
 

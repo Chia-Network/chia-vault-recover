@@ -6,12 +6,12 @@ use chia_protocol::Coin;
 use chia_puzzle_types::Proof;
 use clvm_utils::TreeHash;
 
-use crate::cache::LookupCache;
+use crate::cache::{LookupCache, VaultLookup};
 use crate::chain::ChainClient;
 use crate::config::VaultConfig;
 use crate::discover::{
-    ClawbackGuess, DEFAULT_TIMELOCK_CANDIDATES, FoundVault,
-    ReconstructedVault, confirm_hinted_config, custody_from_vault_spend, reconstruct,
+    ClawbackGuess, DEFAULT_TIMELOCK_CANDIDATES, FoundVault, ReconstructedVault,
+    confirm_hinted_config, custody_from_vault_spend, reconstruct,
 };
 use crate::error::{Error, Result};
 use crate::guidance::{KnownLauncher, LookupGap};
@@ -190,8 +190,7 @@ pub async fn finish(
 /// [`crate::discover::reconstruct`] at Start.
 #[derive(Debug, Clone)]
 pub enum LookupReport {
-    Hinted(VaultConfig),
-    Found(FoundVault),
+    Ready(VaultLookup),
     NeedFallback(LookupGap),
 }
 
@@ -218,11 +217,15 @@ pub fn rebuild_for_start(
     recovery_mnemonic: &str,
     typed_clawback: Option<u64>,
 ) -> Result<ReconstructedVault> {
-    let entry = cache.require_found(address)?;
+    let VaultLookup::Found(found, clawback) = cache.require(address)?.lookup else {
+        return Err(Error::msg(
+            "cached lookup is an on-chain hint; start from that layout",
+        ));
+    };
     let rebuilt = reconstruct(
-        &entry.found,
+        &found,
         recovery_mnemonic,
-        entry.clawback.with_typed(typed_clawback),
+        clawback.with_typed(typed_clawback),
     )?;
     cache.persist_guess(
         address,
@@ -238,15 +241,17 @@ pub fn prepare_start(
     recovery_mnemonic: &str,
     typed_clawback: Option<u64>,
 ) -> Result<PreparedStart> {
-    let entry = cache.require(address)?;
-    match entry.layout {
-        crate::cache::CachedLayout::Hinted(config) => {
+    match cache.require(address)?.lookup {
+        VaultLookup::Hinted(config) => {
             confirm_hinted_config(&config, Some(recovery_mnemonic), typed_clawback)?;
             Ok(PreparedStart::Hinted(config))
         }
-        crate::cache::CachedLayout::Found(_) => Ok(PreparedStart::Reconstructed(
-            rebuild_for_start(cache, address, recovery_mnemonic, typed_clawback)?,
-        )),
+        VaultLookup::Found(_, _) => Ok(PreparedStart::Reconstructed(rebuild_for_start(
+            cache,
+            address,
+            recovery_mnemonic,
+            typed_clawback,
+        )?)),
     }
 }
 
@@ -259,10 +264,7 @@ pub async fn resolve_found(
     extra_timelocks: &[u64],
 ) -> Result<LookupReport> {
     if let Some(cached) = cache.matching(vault) {
-        return Ok(match &cached.layout {
-            crate::cache::CachedLayout::Hinted(config) => LookupReport::Hinted(config.clone()),
-            crate::cache::CachedLayout::Found(found) => LookupReport::Found(found.clone()),
-        });
+        return Ok(LookupReport::Ready(cached.lookup.clone()));
     }
     let report = lookup(client, vault, extra_timelocks).await?;
     persist_report(cache, vault, network, &report)?;
@@ -291,7 +293,7 @@ pub async fn lookup(
     if let Some(config) =
         hinted_config_from_parent(client, resolved.launcher_id, &current, &candidates).await?
     {
-        return Ok(LookupReport::Hinted(config));
+        return Ok(LookupReport::Ready(VaultLookup::Hinted(config)));
     }
 
     let mut custody = None;
@@ -323,14 +325,8 @@ fn persist_report(
     network: Network,
     report: &LookupReport,
 ) -> Result<()> {
-    match report {
-        LookupReport::Hinted(config) => {
-            cache.persist_hinted(vault, network, config.clone())?;
-        }
-        LookupReport::Found(found) => {
-            cache.persist_found(vault, network, found.clone())?;
-        }
-        LookupReport::NeedFallback(_) => {}
+    if let LookupReport::Ready(lookup) = report {
+        cache.persist(vault, network, lookup.clone())?;
     }
     Ok(())
 }
@@ -388,13 +384,16 @@ pub(crate) fn classify_lookup(
         }));
     }
     match custody {
-        Some(custody) => LookupReport::Found(FoundVault {
-            launcher_id,
-            launcher_source,
-            custody,
-            current_coin,
-            ancestor_puzzle_hashes,
-        }),
+        Some(custody) => LookupReport::Ready(VaultLookup::Found(
+            FoundVault {
+                launcher_id,
+                launcher_source,
+                custody,
+                current_coin,
+                ancestor_puzzle_hashes,
+            },
+            ClawbackGuess::Unknown,
+        )),
         None => LookupReport::NeedFallback(LookupGap::NoCustodySpend(KnownLauncher {
             id: launcher_id,
             source: launcher_source,
@@ -471,7 +470,7 @@ mod tests {
             vec![Bytes32::new([0x04; 32])],
             Some(custody()),
         ) {
-            LookupReport::Found(found) => {
+            LookupReport::Ready(VaultLookup::Found(found, _)) => {
                 assert_eq!(found.launcher_source, "address xch1…");
                 assert!(!found.custody.members_complete());
             }

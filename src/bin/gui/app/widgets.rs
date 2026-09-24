@@ -61,7 +61,7 @@ impl App {
                     ui.label("Launcher:");
                     ui.monospace(format!("0x{}…", &launcher[..8.min(launcher.len())]));
                 });
-                ui.label(clawback_label(entry.clawback_display()));
+                ui.label(clawback_label(entry.lookup.clawback()));
             } else if let Some(secs) = self.waiting_session().and_then(|s| s.clawback_secs) {
                 ui.label(format!("Clawback: {secs}s"));
             }

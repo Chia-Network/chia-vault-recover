@@ -149,7 +149,7 @@ impl App {
 
         if let Some(entry) = self.cache.current().cloned() {
             self.vault_address = entry.receive_address.clone();
-            if let Some(secs) = entry.clawback_display().secs() {
+            if let Some(secs) = entry.lookup.clawback().secs() {
                 self.clawback_secs = secs.to_string();
             }
             self.network = entry.network;
