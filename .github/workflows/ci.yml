@@ -10,6 +10,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # Incremental compilation and sccache cache the same objects.
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 jobs:
   lint:
@@ -20,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install Linux GUI/build deps
         run: |
           sudo apt-get update
@@ -38,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: |
@@ -81,9 +85,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.universal && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.name }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Install Linux deps (native)
         if: runner.os == 'Linux' && !matrix.cross
@@ -175,13 +177,11 @@ jobs:
           - os: macos
             runs-on: macos-latest
             artifact: macos-universal
-            shell: bash
-            sign: build-scripts/macos/sign-release.sh
+            sign: bash build-scripts/macos/sign-release.sh
           - os: windows
             runs-on: windows-latest
             artifact: windows-x86_64
-            shell: pwsh
-            sign: ./build-scripts/windows/sign-release.ps1 -Artifact
+            sign: pwsh -File ./build-scripts/windows/sign-release.ps1 -Artifact
             # Federated credential subject:
             # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
             environment: windows-code-signing
@@ -260,7 +260,7 @@ jobs:
 
       - name: Sign binaries
         if: steps.apple-signing.outputs.available == 'true' || steps.windows-signing.outputs.available == 'true'
-        shell: ${{ matrix.shell }}
+        shell: bash
         env:
           APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
           APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
