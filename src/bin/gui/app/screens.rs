@@ -24,9 +24,8 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.vault_address)
                     .desired_width(f32::INFINITY)
-                    .hint_text("xch1… or txch1…"),
+                    .hint_text("xch1… (mainnet) or txch1… (testnet11)"),
             );
-            self.network_toggle(ui);
 
             ui.add_space(4.0);
             if primary_button(ui, "Look up vault").clicked() {
@@ -79,7 +78,7 @@ impl App {
                 ));
             }
 
-            ui.label("Cloud Wallet recovery passphrase");
+            ui.label("Cloud Wallet recovery phrase (12 or 24 words)");
             ui.add(
                 egui::TextEdit::multiline(&mut self.recovery_mnemonic)
                     .desired_rows(2)
@@ -106,13 +105,13 @@ impl App {
             });
 
             ui.add_space(4.0);
-            ui.label("New custody mnemonic (required)");
+            ui.label("New custody phrase (12 or 24 words, required)");
             ui.add(
                 egui::TextEdit::multiline(&mut self.new_custody_mnemonic)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY),
             );
-            ui.label("New recovery mnemonic (optional — leave empty to auto-generate)");
+            ui.label("New recovery phrase (12 or 24 words, optional — leave empty to auto-generate)");
             ui.add(
                 egui::TextEdit::multiline(&mut self.new_recovery_mnemonic)
                     .desired_rows(2)
@@ -120,7 +119,7 @@ impl App {
             );
             ui.checkbox(
                 &mut self.generate_12_words,
-                "Generate 12-word mnemonics (default 24)",
+                "Generate a 12-word recovery phrase (default 24)",
             );
 
             ui.collapsing("Config paths", |ui| {
@@ -162,12 +161,12 @@ impl App {
                 ui.add_space(8.0);
                 ui.colored_label(
                     DANGER,
-                    "SAVE THIS NEW RECOVERY MNEMONIC (not written to config):",
+                    "SAVE THIS NEW RECOVERY PHRASE (not written to config):",
                 );
                 ui.monospace(&words);
-                if secondary_button(ui, "Copy recovery mnemonic").clicked() {
+                if secondary_button(ui, "Copy recovery phrase").clicked() {
                     ui.ctx().copy_text(words);
-                    self.set_ok("Copied recovery mnemonic to clipboard.");
+                    self.set_ok("Copied recovery phrase to clipboard.");
                 }
             }
 
@@ -196,7 +195,7 @@ impl App {
         theme::card_frame(ui).show(ui, |ui| {
             ui.colored_label(theme::CHIA_GREEN, "Recovery complete.");
             ui.label(
-                "Vault custody is now the new BLS key. Keep the new recovery mnemonic safe if one was generated.",
+                "Vault custody is now the new BLS key. Keep the new recovery phrase safe if one was generated.",
             );
             if secondary_button(ui, "Look up another vault").clicked() {
                 self.reset_to_lookup();

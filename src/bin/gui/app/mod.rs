@@ -31,7 +31,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 const LOOKUP_SUBTITLE: &str =
     "Paste the Cloud Wallet Receive address. This check does not need the recovery phrase.";
 const START_SUBTITLE: &str =
-    "Enter the recovery phrase and a new custody mnemonic, then start delayed recovery.";
+    "Enter the recovery phrase and a new custody phrase, then start delayed recovery.";
 const WAIT_SUBTITLE: &str =
     "Wait for the clawback window, then finish. You can close the app and come back.";
 const DONE_SUBTITLE: &str = "Recovery finished. Custody is now the new BLS key.";
@@ -189,13 +189,11 @@ impl App {
     fn chain_client(&self) -> Result<(ChainClient, Network)> {
         let vault = self.receive_address();
         if vault.is_empty() {
-            Ok((
-                ChainClient::new(self.network, &self.backend()),
-                self.network,
-            ))
-        } else {
-            client_for_vault(vault, self.network, &self.backend())
+            return Err(chia_vault_recover::Error::msg(
+                "enter the vault Receive address (xch1… or txch1…) first",
+            ));
         }
+        client_for_vault(vault, &self.backend())
     }
 
     /// Receive address: session owns it while waiting; otherwise the form field.

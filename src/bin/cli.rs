@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use chia_protocol::Bytes32;
 use chia_vault_recover::cache::{LookupCache, VaultLookup};
 use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::config::VaultConfig;
@@ -33,41 +34,40 @@ enum Commands {
     /// Look up a vault from its receive address (start here)
     #[command(visible_alias = "discover", visible_alias = "resolve")]
     Lookup {
-        /// Vault Receive address (`xch1…` / `txch1…`). A hex launcher id also works.
+        /// Vault Receive address. `xch1…` is mainnet and `txch1…` is testnet11.
         #[arg(long, alias = "address", alias = "launcher-id")]
         vault: String,
-        #[arg(long, default_value = "mainnet")]
-        network: NetworkArg,
         #[command(flatten)]
         backend: BackendArgs,
         /// Optional clawback window. Saved as a hint unless a recovery phrase is also given.
         #[arg(long)]
         clawback_secs: Option<u64>,
-        /// Optional. Used only to verify `--clawback-secs` (or discover it). Never written to the cache.
+        /// Optional 12- or 24-word recovery phrase. Used only to verify `--clawback-secs` (or discover it). Never written to the cache.
         #[arg(long, env = "CHIA_VAULT_RECOVERY_MNEMONIC")]
         recovery_mnemonic: Option<String>,
+        /// File containing the 12- or 24-word recovery phrase.
         #[arg(long)]
         recovery_mnemonic_file: Option<PathBuf>,
     },
-    /// Start delayed recovery (signs with the Cloud Wallet recovery phrase)
+    /// Start delayed recovery (signs with the 12- or 24-word Cloud Wallet recovery phrase)
     Start(Box<StartArgs>),
-    /// Finish delayed recovery after the clawback timelock
+    /// Finish delayed recovery after the clawback timelock.
+    ///
+    /// Uses the network saved from the vault Receive address (`xch1…` or `txch1…`).
     Finish {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
         post_recovery_config: PathBuf,
-        #[arg(long, default_value = "mainnet")]
-        network: NetworkArg,
         #[command(flatten)]
         backend: BackendArgs,
     },
-    /// Verify a public vault layout file against the on-chain singleton
+    /// Verify a public vault layout file against the on-chain singleton.
+    ///
+    /// Uses the network saved from the vault Receive address (`xch1…` or `txch1…`).
     Inspect {
         #[arg(long)]
         config: PathBuf,
-        #[arg(long, default_value = "mainnet")]
-        network: NetworkArg,
         #[command(flatten)]
         backend: BackendArgs,
         #[arg(long)]
@@ -77,23 +77,30 @@ enum Commands {
 
 #[derive(Clone, Debug, clap::Args)]
 struct StartArgs {
-    /// Vault Receive address. Looks up the vault and rebuilds layout if `--config` is omitted.
+    /// Vault Receive address (`xch1…` mainnet or `txch1…` testnet11). Looks up the vault if `--config` is omitted.
     #[arg(long, alias = "address")]
     vault: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Cloud Wallet recovery phrase (12 or 24 words).
     #[arg(long, env = "CHIA_VAULT_RECOVERY_MNEMONIC")]
     recovery_mnemonic: Option<String>,
+    /// File containing the Cloud Wallet recovery phrase (12 or 24 words).
     #[arg(long)]
     recovery_mnemonic_file: Option<PathBuf>,
+    /// New custody phrase (12 or 24 words).
     #[arg(long, env = "CHIA_VAULT_NEW_CUSTODY_MNEMONIC")]
     new_custody_mnemonic: Option<String>,
+    /// File containing the new custody phrase (12 or 24 words).
     #[arg(long)]
     new_custody_mnemonic_file: Option<PathBuf>,
+    /// New recovery phrase (12 or 24 words). Leave unset to auto-generate one.
     #[arg(long)]
     new_recovery_mnemonic: Option<String>,
+    /// File containing the new recovery phrase (12 or 24 words).
     #[arg(long)]
     new_recovery_mnemonic_file: Option<PathBuf>,
+    /// Word count for an auto-generated recovery phrase: 12 or 24 (default 24).
     #[arg(long, default_value = "24")]
     word_count: u8,
     #[arg(long)]
@@ -104,8 +111,6 @@ struct StartArgs {
     /// common Cloud Wallet values (including 43200 / 12h).
     #[arg(long)]
     clawback_secs: Option<u64>,
-    #[arg(long, default_value = "mainnet")]
-    network: NetworkArg,
     #[command(flatten)]
     backend: BackendArgs,
     #[arg(long, default_value = "post-recovery-vault-config.json")]
@@ -113,21 +118,6 @@ struct StartArgs {
     /// Where to write the rebuilt public layout when starting from `--vault`.
     #[arg(long, default_value = "vault-config.json")]
     lookup_config: PathBuf,
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-enum NetworkArg {
-    Mainnet,
-    Testnet11,
-}
-
-impl From<NetworkArg> for Network {
-    fn from(value: NetworkArg) -> Self {
-        match value {
-            NetworkArg::Mainnet => Network::Mainnet,
-            NetworkArg::Testnet11 => Network::Testnet11,
-        }
-    }
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -163,13 +153,12 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Lookup {
             vault,
-            network,
             backend,
             clawback_secs,
             recovery_mnemonic,
             recovery_mnemonic_file,
         } => {
-            let (client, network) = client_for(&vault, network, backend)?;
+            let (client, network) = client_for(&vault, backend)?;
             let extra = clawback_secs.into_iter().collect::<Vec<_>>();
             let report = workflow::lookup(&client, &vault, &extra).await?;
             match report {
@@ -219,7 +208,6 @@ async fn main() -> Result<()> {
                 word_count,
                 new_clawback_secs,
                 clawback_secs,
-                network,
                 backend,
                 out_config,
                 lookup_config,
@@ -245,7 +233,7 @@ async fn main() -> Result<()> {
                     bail!("pass --vault <xch1…> or --config <vault-config.json>, not both")
                 }
                 (Some(vault), None) => {
-                    let (client, network) = client_for(&vault, network, backend)?;
+                    let (client, network) = client_for(&vault, backend)?;
                     let mut cache = LookupCache::open();
                     let from_cache = cache.matching(&vault).is_some();
                     let extra = clawback_secs.into_iter().collect::<Vec<_>>();
@@ -277,9 +265,10 @@ async fn main() -> Result<()> {
                     (client, network, prepared.config().clone())
                 }
                 (None, Some(path)) => {
-                    let network = Network::from(network);
+                    let config = VaultConfig::load(&path)?;
+                    let network = network_from_lookup_cache(config.launcher_id_bytes()?)?;
                     let client = ChainClient::new(network, &backend.into_backend()?);
-                    (client, network, VaultConfig::load(&path)?)
+                    (client, network, config)
                 }
                 (None, None) => {
                     bail!("pass --vault <xch1…> (recommended) or --config <vault-config.json>")
@@ -304,24 +293,23 @@ async fn main() -> Result<()> {
         Commands::Finish {
             config,
             post_recovery_config,
-            network,
             backend,
         } => {
-            let network = Network::from(network);
-            let client = ChainClient::new(network, &backend.into_backend()?);
             let config = VaultConfig::load(&config)?;
             let post = VaultConfig::load(&post_recovery_config)?;
+            let network = network_from_lookup_cache(config.launcher_id_bytes()?)?;
+            let client = ChainClient::new(network, &backend.into_backend()?);
             let handle = workflow::finish(&client, &config, &post, network).await?;
             println!("pushed finish recovery spend (handle): {handle}");
         }
         Commands::Inspect {
             config,
-            network,
             backend,
             post_recovery_config,
         } => {
-            let client = ChainClient::new(network.into(), &backend.into_backend()?);
             let config = VaultConfig::load(&config)?;
+            let network = network_from_lookup_cache(config.launcher_id_bytes()?)?;
+            let client = ChainClient::new(network, &backend.into_backend()?);
             let post = post_recovery_config
                 .as_ref()
                 .map(VaultConfig::load)
@@ -347,13 +335,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn client_for(
-    vault: &str,
-    network: NetworkArg,
-    backend: BackendArgs,
-) -> Result<(ChainClient, Network)> {
-    client_for_vault(vault, network.into(), &backend.into_backend()?)
-        .context("invalid --vault (expected xch1…/txch1… Receive address or 0x launcher id)")
+fn client_for(vault: &str, backend: BackendArgs) -> Result<(ChainClient, Network)> {
+    client_for_vault(vault, &backend.into_backend()?)
+        .context("invalid --vault (expected an xch1… mainnet or txch1… testnet11 Receive address)")
+}
+
+/// Network saved when this vault's Receive address was looked up.
+fn network_from_lookup_cache(launcher_id: Bytes32) -> Result<Network> {
+    let cache = LookupCache::open();
+    let Some(entry) = cache.current() else {
+        bail!("no saved lookup; run lookup with the vault Receive address (xch1… or txch1…) first");
+    };
+    if entry.launcher_id()? != launcher_id {
+        bail!(
+            "saved lookup is for a different vault; look up this vault's Receive address (xch1… or txch1…) first"
+        );
+    }
+    Ok(entry.network)
 }
 
 fn require_layout(network: Network, report: LookupReport) -> Result<()> {
@@ -455,7 +453,7 @@ fn print_start_result(out_config: &std::path::Path, result: &StartRecoveryResult
     );
     if let Some(words) = &result.generated_recovery_mnemonic {
         println!();
-        println!("*** SAVE THIS NEW RECOVERY MNEMONIC (shown once, not written to config) ***");
+        println!("*** SAVE THIS NEW RECOVERY PHRASE (shown once, not written to config) ***");
         println!("{words}");
         println!("***");
     }
@@ -509,7 +507,7 @@ fn read_mnemonic(inline: Option<String>, file: Option<PathBuf>, label: &str) -> 
     if let Some(path) = file {
         return Ok(std::fs::read_to_string(path)?.trim().to_string());
     }
-    inline.with_context(|| format!("{label} mnemonic required (--*-mnemonic or --*-mnemonic-file)"))
+    inline.with_context(|| format!("{label} phrase required (--*-mnemonic or --*-mnemonic-file)"))
 }
 
 fn optional_mnemonic(inline: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {

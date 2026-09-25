@@ -73,7 +73,7 @@ impl App {
                 "enter the vault Receive address (xch1… / txch1…) first",
             ));
         }
-        let (client, network) = client_for_vault(vault, self.network, &self.backend())?;
+        let (client, network) = client_for_vault(vault, &self.backend())?;
         let extra = self.parsed_clawback()?.into_iter().collect::<Vec<_>>();
         let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
         match report {
@@ -169,12 +169,12 @@ impl App {
     fn start_inner(&mut self) -> Result<()> {
         if self.recovery_mnemonic.trim().is_empty() {
             return Err(chia_vault_recover::Error::msg(
-                "enter the Cloud Wallet recovery phrase to start recovery",
+                "enter the Cloud Wallet recovery phrase (12 or 24 words) to start recovery",
             ));
         }
         if self.new_custody_mnemonic.trim().is_empty() {
             return Err(chia_vault_recover::Error::msg(
-                "enter a new custody mnemonic to start recovery",
+                "enter a new custody phrase (12 or 24 words) to start recovery",
             ));
         }
         let out = self.resolve_post_path();
