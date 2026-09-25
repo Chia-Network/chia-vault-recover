@@ -11,9 +11,9 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 gui="dist/chia-vault-recover-gui-${artifact}"
 app="dist/Chia Vault Recover.app"
 
-if [ -d "$app" ]; then
-  echo "App bundle already present: $app"
-  exit 0
+if [ -e "$app" ]; then
+  echo "Refusing to replace existing app bundle: $app" >&2
+  exit 1
 fi
 
 if [ ! -f "$gui" ]; then
@@ -32,5 +32,12 @@ ditto "$gui" "$app/Contents/MacOS/chia-vault-recover-gui"
 chmod +x "$app/Contents/MacOS/chia-vault-recover-gui"
 sed "s/__VERSION__/${version}/g" "$root/build-scripts/macos/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
+for key in CFBundleShortVersionString CFBundleVersion; do
+  bundled="$(plutil -extract "$key" raw "$app/Contents/Info.plist")"
+  if [ "$bundled" != "$version" ]; then
+    echo "$key is '$bundled', expected '$version'" >&2
+    exit 1
+  fi
+done
 rm -f "$gui"
 echo "Bundled $app ($version)"

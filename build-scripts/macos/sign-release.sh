@@ -13,23 +13,23 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=keychain.sh
 source "$root/build-scripts/macos/keychain.sh"
 entitlements="$root/build-scripts/macos/entitlements.plist"
-cli="dist/chia-vault-recover-${artifact}"
-app="dist/Chia Vault Recover.app"
+targets=(
+  "dist/chia-vault-recover-${artifact}"
+  "dist/Chia Vault Recover.app"
+)
 
 trap cleanup_developer_id EXIT
 
-if [ ! -f "$cli" ]; then
-  echo "Missing binary to sign: $cli" >&2
-  exit 1
-fi
-if [ ! -d "$app" ]; then
-  echo "Missing app to sign: $app (run package-app.sh first)" >&2
-  exit 1
-fi
+for target in "${targets[@]}"; do
+  if [ ! -e "$target" ]; then
+    echo "Missing code to sign: $target" >&2
+    exit 1
+  fi
+done
 
 import_developer_id
 
-codesign --force --timestamp --options runtime --entitlements "$entitlements" --sign "$IDENTITY" "$cli"
-codesign --verify --strict --verbose=2 "$cli"
-codesign --force --timestamp --options runtime --entitlements "$entitlements" --sign "$IDENTITY" "$app"
-codesign --verify --strict --verbose=2 "$app"
+for target in "${targets[@]}"; do
+  codesign --force --timestamp --options runtime --entitlements "$entitlements" --sign "$IDENTITY" "$target"
+  codesign --verify --strict --verbose=2 "$target"
+done
