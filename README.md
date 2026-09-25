@@ -235,11 +235,11 @@ Every green CI uploads release binaries for:
 - Windows `x86_64`
 - Linux `x86_64` and `aarch64`
 
-GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. macOS is a Developer ID signed and notarized disk image, `chia-vault-recover-macos-universal.dmg`, containing the CLI and GUI. Open the image and run the files inside it. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned.
+GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. Asset names include the version, such as `chia-vault-recover-1.0.0-rc3-macos-universal.dmg`. macOS is a Developer ID signed and notarized disk image containing the CLI and GUI. Open the image and run the files inside it. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned and keep the unversioned artifact names.
 
 ### Forks and local builds
 
-Forks do not receive the Chia signing secrets. Their CI still passes. A fork's GitHub Release uploads an unsigned macOS disk image, `chia-vault-recover-macos-universal.dmg`, plus the Windows and Linux binaries. A local `cargo build --release` is also unsigned. macOS only quarantines files downloaded from the internet, so a binary you built on the same Mac is not blocked.
+Forks do not receive the Chia signing secrets. Their CI still passes. A fork's GitHub Release uploads an unsigned macOS disk image, `chia-vault-recover-<version>-macos-universal.dmg`, plus the Windows and Linux binaries. Those names include the release version too. A local `cargo build --release` is also unsigned. macOS only quarantines files downloaded from the internet, so a binary you built on the same Mac is not blocked.
 
 A pull request's CI artifact zip is the raw Mach-O files, not a disk image. After unzipping that zip, `chmod +x` the binary before running it. A browser download of those loose files opens them in TextEdit.
 
