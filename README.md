@@ -234,7 +234,7 @@ Every green CI uploads release binaries for:
 - Windows `x86_64`
 - Linux `x86_64` and `aarch64`
 
-GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. Asset names include the version, such as `chia-vault-recover-1.0.0-rc5-macos-universal.dmg`. macOS is a Developer ID signed and notarized disk image. Open the image and double-click **Chia Vault Recover**. The CLI beside it is a command-line tool; run that from Terminal. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned and keep the unversioned artifact names.
+GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. Asset names include the version, such as `chia-vault-recover-1.0.0-rc6-macos-universal.dmg`. macOS is a Developer ID signed and notarized disk image. Open the image and double-click **Chia Vault Recover**. The CLI beside it is a command-line tool; run that from Terminal. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned and keep the unversioned artifact names.
 
 ### Forks and local builds
 

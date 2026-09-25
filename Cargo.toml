@@ -1,6 +1,6 @@
 [package]
 name = "chia-vault-recover"
-version = "1.0.0-rc5"
+version = "1.0.0-rc6"
 edition = "2024"
 license = "Apache-2.0"
 description = "Recover a Chia Cloud Wallet vault using a 12- or 24-word recovery phrase"
