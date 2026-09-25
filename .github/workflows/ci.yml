@@ -161,11 +161,7 @@ jobs:
       # Forks have no signing job, so they publish every platform from here.
       - name: Upload release assets
         if: github.event_name == 'release' && (github.repository != 'Chia-Network/chia-vault-recover' || runner.os == 'Linux')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/upload-release-assets
 
   sign:
     name: Sign (${{ matrix.os }})
@@ -293,8 +289,4 @@ jobs:
         run: bash build-scripts/macos/notarize-dmg.sh ${{ matrix.artifact }}
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/upload-release-assets
