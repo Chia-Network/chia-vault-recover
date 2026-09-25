@@ -1,31 +1,36 @@
 #!/usr/bin/env bash
-# Put the macOS CLI and GUI into a disk image so a browser download keeps
-# the executable bit. Loose Mach-O release assets are saved as mode 644 and
-# open in TextEdit.
+# Put the macOS CLI and GUI app into a disk image so a browser download keeps
+# the executable bit and Finder can launch the GUI. Run package-app.sh first.
+# Loose Mach-O release assets are saved as mode 644 and open in TextEdit, and
+# Gatekeeper will not treat them as an app.
 # Usage: package-dmg.sh <artifact-name>
 set -euo pipefail
 
 artifact="${1:?artifact name required}"
 cli="dist/chia-vault-recover-${artifact}"
-gui="dist/chia-vault-recover-gui-${artifact}"
+app="dist/Chia Vault Recover.app"
 dmg="dist/chia-vault-recover-${artifact}.dmg"
 
-for bin in "$cli" "$gui"; do
-  if [ ! -f "$bin" ]; then
-    echo "Missing binary to package: $bin" >&2
-    exit 1
-  fi
-  chmod +x "$bin"
-done
+if [ ! -f "$cli" ]; then
+  echo "Missing binary to package: $cli" >&2
+  exit 1
+fi
+if [ ! -d "$app" ]; then
+  echo "Missing app to package: $app (run package-app.sh first)" >&2
+  exit 1
+fi
+chmod +x "$cli"
 
 stage="$(mktemp -d)"
 cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT
 
-cp "$cli" "$gui" "$stage/"
-chmod +x "$stage/"*
+ditto "$cli" "$stage/$(basename "$cli")"
+ditto "$app" "$stage/Chia Vault Recover.app"
+ln -s /Applications "$stage/Applications"
 
 rm -f "$dmg"
 hdiutil create -volname "Chia Vault Recover" -srcfolder "$stage" -ov -format UDZO "$dmg"
-rm -f "$cli" "$gui"
+rm -f "$cli"
+rm -rf "$app"
 echo "Packaged $dmg"

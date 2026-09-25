@@ -151,11 +151,14 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      # Forks never enter the sign job. Package the macOS release asset here so
-      # the upload is a disk image rather than a raw Mach-O.
+      # Forks never enter the sign job. Bundle the GUI, then package the disk
+      # image, so the upload is not a raw Mach-O. Signing, when it happens, sits
+      # between those two scripts in the sign job.
       - name: Package macOS release disk image
         if: matrix.universal && github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover'
-        run: bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
+        run: |
+          bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
+          bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
 
       # Official macOS and Windows release assets are uploaded by the sign job.
       # Forks have no signing job, so they publish every platform from here.
@@ -259,6 +262,13 @@ jobs:
               exit 1
             fi
           fi
+
+      # Gatekeeper will not launch the signed GUI Mach-O. Bundle it before
+      # the Developer ID signature so the sealed app, not a bare executable,
+      # is what gets notarized inside the disk image.
+      - name: Bundle macOS GUI
+        if: matrix.os == 'macos'
+        run: bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
 
       - name: Sign binaries
         if: steps.apple-signing.outputs.available == 'true' || steps.windows-signing.outputs.available == 'true'

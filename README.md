@@ -235,7 +235,7 @@ Every green CI uploads release binaries for:
 - Windows `x86_64`
 - Linux `x86_64` and `aarch64`
 
-GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. Asset names include the version, such as `chia-vault-recover-1.0.0-rc3-macos-universal.dmg`. macOS is a Developer ID signed and notarized disk image containing the CLI and GUI. Open the image and run the files inside it. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned and keep the unversioned artifact names.
+GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. Asset names include the version, such as `chia-vault-recover-1.0.0-rc4-macos-universal.dmg`. macOS is a Developer ID signed and notarized disk image. Open the image and double-click **Chia Vault Recover**. The CLI beside it is a command-line tool; run that from Terminal. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned and keep the unversioned artifact names.
 
 ### Forks and local builds
 
@@ -243,11 +243,11 @@ Forks do not receive the Chia signing secrets. Their CI still passes. A fork's G
 
 A pull request's CI artifact zip is the raw Mach-O files, not a disk image. After unzipping that zip, `chmod +x` the binary before running it. A browser download of those loose files opens them in TextEdit.
 
-If you downloaded an unsigned macOS disk image or CI binary, opening it shows *Apple could not verify … is free of malware* with **Move to Trash** / **Done**. Windows SmartScreen can show a similar warning for an unsigned `.exe`.
+Gatekeeper on macOS Sequoia and later will not launch a bare executable, including one that is Developer ID signed and sitting on a notarized disk image. Finder reports *Apple could not verify … is free of malware* with **Move to Trash** / **Done**, and `spctl` reports `the code is valid but does not seem to be an app`. Release disk images ship the GUI as `Chia Vault Recover.app`. Control-click → Open does not clear that dialog for a loose binary. 1.0.0-rc4 and earlier macOS assets are loose binaries; run the GUI from Terminal, as below. Windows SmartScreen can show a similar warning for an unsigned `.exe`.
 
-**macOS Settings:** click **Done**, then System Settings → Privacy & Security → scroll to Security → **Open Anyway** for the blocked file. Confirm the next prompt.
+**macOS Settings** for an unsigned app (a fork disk image, or a local build): click **Done**, then System Settings → Privacy & Security → **Open Anyway**.
 
-**macOS Terminal** for a CI artifact binary (use the path where you unpacked the zip):
+**macOS Terminal** for a CI artifact or an older release binary (use the path where the file actually is):
 
 ```bash
 xattr -d com.apple.quarantine chia-vault-recover-gui-macos-universal
@@ -255,4 +255,4 @@ chmod +x chia-vault-recover-gui-macos-universal
 ./chia-vault-recover-gui-macos-universal
 ```
 
-Same `xattr` / `chmod` for `chia-vault-recover-macos-universal`. For a release disk image, open the `.dmg` and run the files inside it; do not `chmod` the image itself. Control-click → Open does not clear the Sequoia/Tahoe dialog.
+Same `xattr` / `chmod` for `chia-vault-recover-macos-universal`. For a current release disk image, open the `.dmg` and double-click `Chia Vault Recover`. Do not `chmod` the image itself.
