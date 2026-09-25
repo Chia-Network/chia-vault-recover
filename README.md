@@ -235,17 +235,19 @@ Every green CI uploads release binaries for:
 - Windows `x86_64`
 - Linux `x86_64` and `aarch64`
 
-GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed binaries: macOS is Developer ID signed and notarized, Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned.
+GitHub Releases published from `Chia-Network/chia-vault-recover` attach signed builds. macOS is a Developer ID signed and notarized disk image, `chia-vault-recover-macos-universal.dmg`, containing the CLI and GUI. Open the image and run the files inside it. A raw Mach-O downloaded from a browser is saved without the executable bit, so Finder opens it in TextEdit. Windows is Azure Artifact Signed. Linux release binaries are not code-signed. Pull request builds are unsigned.
 
 ### Forks and local builds
 
-Forks do not receive the Chia signing secrets. Their CI still passes and uploads unsigned binaries, including on a GitHub Release. A local `cargo build --release` is also unsigned. macOS only quarantines files downloaded from the internet, so a binary you built on the same Mac is not blocked.
+Forks do not receive the Chia signing secrets. Their CI still passes. A fork's GitHub Release uploads an unsigned macOS disk image, `chia-vault-recover-macos-universal.dmg`, plus the Windows and Linux binaries. A local `cargo build --release` is also unsigned. macOS only quarantines files downloaded from the internet, so a binary you built on the same Mac is not blocked.
 
-If you downloaded an unsigned macOS binary (from your fork's CI or release), double-clicking `chia-vault-recover-gui-macos-universal` or the CLI binary shows *Apple could not verify … is free of malware* with **Move to Trash** / **Done**. Windows SmartScreen can show a similar warning for an unsigned `.exe`.
+A pull request's CI artifact zip is the raw Mach-O files, not a disk image. After unzipping that zip, `chmod +x` the binary before running it. A browser download of those loose files opens them in TextEdit.
+
+If you downloaded an unsigned macOS disk image or CI binary, opening it shows *Apple could not verify … is free of malware* with **Move to Trash** / **Done**. Windows SmartScreen can show a similar warning for an unsigned `.exe`.
 
 **macOS Settings:** click **Done**, then System Settings → Privacy & Security → scroll to Security → **Open Anyway** for the blocked file. Confirm the next prompt.
 
-**macOS Terminal** (GUI or CLI; use the path where you saved the download):
+**macOS Terminal** for a CI artifact binary (use the path where you unpacked the zip):
 
 ```bash
 xattr -d com.apple.quarantine chia-vault-recover-gui-macos-universal
@@ -253,4 +255,4 @@ chmod +x chia-vault-recover-gui-macos-universal
 ./chia-vault-recover-gui-macos-universal
 ```
 
-Same `xattr` / `chmod` for `chia-vault-recover-macos-universal`. Control-click → Open does not clear the Sequoia/Tahoe dialog.
+Same `xattr` / `chmod` for `chia-vault-recover-macos-universal`. For a release disk image, open the `.dmg` and run the files inside it; do not `chmod` the image itself. Control-click → Open does not clear the Sequoia/Tahoe dialog.

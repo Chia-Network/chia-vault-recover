@@ -151,6 +151,12 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # Forks never enter the sign job. Package the macOS release asset here so
+      # the upload is a disk image rather than a raw Mach-O.
+      - name: Package macOS release disk image
+        if: matrix.universal && github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover'
+        run: bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
+
       # Official macOS and Windows release assets are uploaded by the sign job.
       # Forks have no signing job, so they publish every platform from here.
       - name: Upload release assets
@@ -270,6 +276,21 @@ jobs:
           AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
         run: ${{ matrix.sign }} ${{ matrix.artifact }}
+
+      - name: Package macOS disk image
+        if: matrix.os == 'macos'
+        run: bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
+
+      - name: Notarize macOS disk image
+        if: matrix.os == 'macos' && steps.apple-signing.outputs.available == 'true'
+        shell: bash
+        env:
+          APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
+          APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
+          APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
+          APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash build-scripts/macos/notarize-dmg.sh ${{ matrix.artifact }}
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
