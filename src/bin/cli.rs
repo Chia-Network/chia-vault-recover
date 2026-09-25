@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use chia_protocol::Bytes32;
 use chia_vault_recover::cache::{LookupCache, VaultLookup};
 use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::config::VaultConfig;
@@ -265,9 +264,29 @@ async fn main() -> Result<()> {
                     (client, network, prepared.config().clone())
                 }
                 (None, Some(path)) => {
-                    let config = VaultConfig::load(&path)?;
-                    let (client, network) =
-                        client_for_cached_launcher(config.launcher_id_bytes()?, backend)?;
+                    let mut config = VaultConfig::load(&path)?;
+                    let address = match config.recorded_receive_address() {
+                        Ok(address) => address.to_string(),
+                        Err(_) => {
+                            let cache = LookupCache::open();
+                            let launcher_id = config.launcher_id_bytes()?;
+                            let Some(entry) = cache.current() else {
+                                bail!(
+                                    "no saved lookup; run lookup with the vault Receive address (xch1… or txch1…) first"
+                                );
+                            };
+                            if entry.launcher_id()? != launcher_id {
+                                bail!(
+                                    "saved lookup is for a different vault; look up this vault's Receive address (xch1… or txch1…) first"
+                                );
+                            }
+                            let address = entry.receive_address.clone();
+                            config.receive_address = Some(address.clone());
+                            config.save(&path)?;
+                            address
+                        }
+                    };
+                    let (client, network) = client_for(&address, backend)?;
                     (client, network, config)
                 }
                 (None, None) => {
@@ -297,8 +316,7 @@ async fn main() -> Result<()> {
         } => {
             let config = VaultConfig::load(&config)?;
             let post = VaultConfig::load(&post_recovery_config)?;
-            let (client, network) =
-                client_for_cached_launcher(config.launcher_id_bytes()?, backend)?;
+            let (client, network) = client_for(config.recorded_receive_address()?, backend)?;
             let handle = workflow::finish(&client, &config, &post, network).await?;
             println!("pushed finish recovery spend (handle): {handle}");
         }
@@ -308,7 +326,7 @@ async fn main() -> Result<()> {
             post_recovery_config,
         } => {
             let config = VaultConfig::load(&config)?;
-            let (client, _) = client_for_cached_launcher(config.launcher_id_bytes()?, backend)?;
+            let (client, _) = client_for(config.recorded_receive_address()?, backend)?;
             let post = post_recovery_config
                 .as_ref()
                 .map(VaultConfig::load)
@@ -337,16 +355,6 @@ async fn main() -> Result<()> {
 fn client_for(vault: &str, backend: BackendArgs) -> Result<(ChainClient, Network)> {
     client_for_vault(vault, &backend.into_backend()?)
         .context("invalid --vault (expected an xch1… mainnet or txch1… testnet11 Receive address)")
-}
-
-/// Client for a config file, using the Receive address saved with that launcher.
-fn client_for_cached_launcher(
-    launcher_id: Bytes32,
-    backend: BackendArgs,
-) -> Result<(ChainClient, Network)> {
-    let cache = LookupCache::open();
-    let address = cache.require_launcher(launcher_id)?.receive_address.clone();
-    client_for(&address, backend)
 }
 
 fn require_layout(network: Network, report: LookupReport) -> Result<()> {

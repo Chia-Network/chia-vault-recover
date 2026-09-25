@@ -207,21 +207,6 @@ impl LookupCache {
         Ok(())
     }
 
-    /// The current lookup when it is this launcher. Network comes from its Receive address.
-    pub fn require_launcher(&self, launcher_id: Bytes32) -> Result<&CachedLookup> {
-        let Some(entry) = self.current() else {
-            return Err(Error::msg(
-                "no saved lookup; run lookup with the vault Receive address (xch1… or txch1…) first",
-            ));
-        };
-        if entry.launcher_id()? != launcher_id {
-            return Err(Error::msg(
-                "saved lookup is for a different vault; look up this vault's Receive address (xch1… or txch1…) first",
-            ));
-        }
-        Ok(entry)
-    }
-
     pub(crate) fn require(&self, address: &str) -> Result<CachedLookup> {
         self.matching(address)
             .cloned()
@@ -416,26 +401,6 @@ mod tests {
         assert_eq!(entry.launcher_id().unwrap(), Bytes32::new([0xaa; 32]));
         assert_eq!(entry.lookup.clawback(), ClawbackGuess::Unknown);
         assert!(!fs::read_to_string(&path).unwrap().contains("mnemonic"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn require_launcher_returns_the_saved_address() {
-        let path = temp_path();
-        let mut cache = LookupCache::open_at(&path);
-        cache
-            .store(CachedLookup::new(
-                "txch1abc",
-                Network::Testnet11,
-                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
-            ))
-            .unwrap();
-        let entry = cache.require_launcher(Bytes32::new([0xaa; 32])).unwrap();
-        assert_eq!(entry.receive_address, "txch1abc");
-        let err = cache
-            .require_launcher(Bytes32::new([0xbb; 32]))
-            .unwrap_err();
-        assert!(err.to_string().contains("different vault"));
         let _ = fs::remove_file(path);
     }
 

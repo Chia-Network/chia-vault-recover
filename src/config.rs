@@ -131,6 +131,10 @@ pub struct VaultConfig {
     pub launcher_id: String,
     pub custody: VaultConfigSide,
     pub recovery: VaultConfigRecovery,
+    /// Receive address that selected the network. Not part of the on-chain layout.
+    /// Written at Start so finish still works after a later lookup replaces the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_address: Option<String>,
 }
 
 impl VaultConfig {
@@ -147,6 +151,19 @@ impl VaultConfig {
 
     pub fn launcher_id_bytes(&self) -> Result<Bytes32> {
         parse_bytes32(&self.launcher_id)
+    }
+
+    /// Receive address written at Start. Finish and inspect use this instead of the lookup cache.
+    pub fn recorded_receive_address(&self) -> Result<&str> {
+        self.receive_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| {
+                Error::msg(
+                    "vault config has no Receive address; run start so the file records xch1… or txch1…",
+                )
+            })
     }
 
     pub fn to_vault_keys(&self) -> Result<VaultKeys> {
@@ -184,6 +201,7 @@ impl VaultConfig {
                     key_type: Some(KeyType::RecoveryPhrase),
                 }],
             },
+            receive_address: None,
         }
     }
 }
@@ -291,6 +309,7 @@ mod tests {
         }"#;
         let config: VaultConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.recovery.clawback_timelock, 43200);
+        assert!(config.receive_address.is_none());
         assert!(matches!(
             config.custody.members[0],
             VaultConfigMember::PublicKey {

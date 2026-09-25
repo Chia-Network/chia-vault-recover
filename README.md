@@ -83,7 +83,7 @@ chia-vault-recover start \
 
 `start --vault` reuses the lookup cache when present (no chain walk). Otherwise it looks up the vault and writes the cache. When the on-chain hint is present, that layout and clawback are used and the recovery phrase only signs. Without the hint, the public layout is rebuilt from the recovery phrase. If you know the current clawback window, pass `--clawback-secs` (for example `43200`). If you omit it, a verified cache value is used; then a user-supplied hint (tried first, then defaults); then common Cloud Wallet values until the reconstructed spend matches the chain. The vault enters RECOVERY (the old passkey or Chia Signer App can still claw back during the window). Run `lookup` again to refresh a stale cache.
 
-`start` writes the public layout to `vault-config.json` (override with `--lookup-config`). `finish` reads that file and uses the network saved with the Receive address (`xch1…` or `txch1…`). Pass `--config` only when you already have the public layout this tool wrote.
+`start` writes the public layout to `vault-config.json` (override with `--lookup-config`), including the Receive address so the network stays `xch1…` or `txch1…` even if a later lookup replaces the cache. `finish` reads that file. Pass `--config` only when you already have the public layout this tool wrote.
 
 #### 4. Wait, then finish
 
