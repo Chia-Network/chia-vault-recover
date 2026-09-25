@@ -144,7 +144,7 @@ Useful flags:
 
 | Flag | Meaning |
 |------|---------|
-| `--vault` | Receive address. `xch1…` is mainnet and `txch1…` is testnet11. Aliases: `--address`, `--launcher-id` |
+| `--vault` | Receive address. `xch1…` is mainnet and `txch1…` is testnet11. Alias: `--address` |
 | `--backend coinset\|rpc` | Default **coinset**; with `rpc` set `--full-node-url` |
 | `--word-count 12\|24` | Length for an auto-generated recovery phrase (default 24) |
 | `--clawback-secs` | On `lookup`, saved as a user hint unless a recovery phrase is also given (then verified). Ignored when the on-chain hint already has the timelock, unless the value disagrees with that hint. On `start --vault` without an on-chain hint, an explicit value is tried alone; if omitted, a verified cache value, then a user hint, then common Cloud Wallet values (including 43200 / 12h) |

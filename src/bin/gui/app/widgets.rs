@@ -1,6 +1,7 @@
 //! Shared wizard widgets and formatting helpers.
 
 use chia_vault_recover::discover::ClawbackGuess;
+use chia_vault_recover::locate::parse_vault_locator;
 use eframe::egui::{self, RichText};
 
 use crate::theme::{self, muted, primary_button, secondary_button};
@@ -50,7 +51,11 @@ impl App {
                 ui.label("Address:");
                 ui.monospace(truncate_middle(address, 20, 12));
             });
-            ui.label(format!("Network: {}", self.network.as_str()));
+            if let Ok(locator) = parse_vault_locator(address)
+                && let Some(network) = locator.inferred_network()
+            {
+                ui.label(format!("Network: {}", network.as_str()));
+            }
             if let Some(entry) = self.cached_vault() {
                 let launcher = entry.launcher_id().map(hex::encode).unwrap_or_default();
                 ui.horizontal(|ui| {

@@ -35,7 +35,7 @@ enum Commands {
     #[command(visible_alias = "discover", visible_alias = "resolve")]
     Lookup {
         /// Vault Receive address. `xch1…` is mainnet and `txch1…` is testnet11.
-        #[arg(long, alias = "address", alias = "launcher-id")]
+        #[arg(long, alias = "address")]
         vault: String,
         #[command(flatten)]
         backend: BackendArgs,
@@ -266,8 +266,8 @@ async fn main() -> Result<()> {
                 }
                 (None, Some(path)) => {
                     let config = VaultConfig::load(&path)?;
-                    let network = network_from_lookup_cache(config.launcher_id_bytes()?)?;
-                    let client = ChainClient::new(network, &backend.into_backend()?);
+                    let (client, network) =
+                        client_for_cached_launcher(config.launcher_id_bytes()?, backend)?;
                     (client, network, config)
                 }
                 (None, None) => {
@@ -297,8 +297,8 @@ async fn main() -> Result<()> {
         } => {
             let config = VaultConfig::load(&config)?;
             let post = VaultConfig::load(&post_recovery_config)?;
-            let network = network_from_lookup_cache(config.launcher_id_bytes()?)?;
-            let client = ChainClient::new(network, &backend.into_backend()?);
+            let (client, network) =
+                client_for_cached_launcher(config.launcher_id_bytes()?, backend)?;
             let handle = workflow::finish(&client, &config, &post, network).await?;
             println!("pushed finish recovery spend (handle): {handle}");
         }
@@ -308,8 +308,7 @@ async fn main() -> Result<()> {
             post_recovery_config,
         } => {
             let config = VaultConfig::load(&config)?;
-            let network = network_from_lookup_cache(config.launcher_id_bytes()?)?;
-            let client = ChainClient::new(network, &backend.into_backend()?);
+            let (client, _) = client_for_cached_launcher(config.launcher_id_bytes()?, backend)?;
             let post = post_recovery_config
                 .as_ref()
                 .map(VaultConfig::load)
@@ -340,18 +339,14 @@ fn client_for(vault: &str, backend: BackendArgs) -> Result<(ChainClient, Network
         .context("invalid --vault (expected an xch1… mainnet or txch1… testnet11 Receive address)")
 }
 
-/// Network saved when this vault's Receive address was looked up.
-fn network_from_lookup_cache(launcher_id: Bytes32) -> Result<Network> {
+/// Client for a config file, using the Receive address saved with that launcher.
+fn client_for_cached_launcher(
+    launcher_id: Bytes32,
+    backend: BackendArgs,
+) -> Result<(ChainClient, Network)> {
     let cache = LookupCache::open();
-    let Some(entry) = cache.current() else {
-        bail!("no saved lookup; run lookup with the vault Receive address (xch1… or txch1…) first");
-    };
-    if entry.launcher_id()? != launcher_id {
-        bail!(
-            "saved lookup is for a different vault; look up this vault's Receive address (xch1… or txch1…) first"
-        );
-    }
-    Ok(entry.network)
+    let address = cache.require_launcher(launcher_id)?.receive_address.clone();
+    client_for(&address, backend)
 }
 
 fn require_layout(network: Network, report: LookupReport) -> Result<()> {

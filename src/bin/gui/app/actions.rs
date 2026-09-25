@@ -35,7 +35,6 @@ impl App {
         self.generated_recovery_mnemonic = None;
         match self.cache.persist(&address, network, lookup) {
             Ok(_) => {
-                self.network = network;
                 if let Some(secs) = secs {
                     self.clawback_secs = secs.to_string();
                 }
@@ -48,8 +47,7 @@ impl App {
         }
     }
 
-    pub(super) fn apply_fallback(&mut self, gap: LookupGap, network: Network) {
-        self.network = network;
+    pub(super) fn apply_fallback(&mut self, gap: LookupGap) {
         let launcher = match gap.known_launcher() {
             Some(known) => format!(" launcher 0x{} ({}).", hex::encode(known.id), known.source),
             None => String::new(),
@@ -78,7 +76,7 @@ impl App {
         let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
         match report {
             LookupReport::Ready(lookup) => self.apply_lookup(lookup, network),
-            LookupReport::NeedFallback(gap) => self.apply_fallback(gap, network),
+            LookupReport::NeedFallback(gap) => self.apply_fallback(gap),
         }
         Ok(())
     }

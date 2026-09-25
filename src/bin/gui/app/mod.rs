@@ -88,7 +88,6 @@ pub struct App {
     new_custody_mnemonic: String,
     new_recovery_mnemonic: String,
     generate_12_words: bool,
-    network: Network,
     full_node_url: String,
     status: Status,
     generated_recovery_mnemonic: Option<String>,
@@ -117,7 +116,6 @@ impl App {
             new_custody_mnemonic: String::new(),
             new_recovery_mnemonic: String::new(),
             generate_12_words: false,
-            network: Network::Mainnet,
             full_node_url: String::new(),
             status: Status::Empty,
             generated_recovery_mnemonic: None,
@@ -135,11 +133,8 @@ impl App {
             && session_files_ready(&session)
             && session_matches_cache(&self.cache, &session.receive_address)
         {
-            // Address/network for chain calls; paths live only on Phase::Wait(session).
+            // Address for chain calls; paths live only on Phase::Wait(session).
             self.vault_address = session.receive_address.clone();
-            if let Some(entry) = self.cache.matching(&session.receive_address) {
-                self.network = entry.network;
-            }
             self.set_ok(
                 "Resumed an in-progress recovery. Wait for the clawback window, then Finish.",
             );
@@ -152,7 +147,6 @@ impl App {
             if let Some(secs) = entry.lookup.clawback().secs() {
                 self.clawback_secs = secs.to_string();
             }
-            self.network = entry.network;
             self.phase = Phase::Start;
             self.set_ok(format!(
                 "Loaded a saved lookup. Chain search was skipped. Cache: {}.",
