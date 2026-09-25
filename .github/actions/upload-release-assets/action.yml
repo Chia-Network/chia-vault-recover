@@ -1,0 +1,12 @@
+name: Upload release assets
+description: Add the release version to dist/* and attach those files to the GitHub Release.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash build-scripts/version-release-names.sh
+    - uses: softprops/action-gh-release@v3
+      with:
+        files: dist/*
+      env:
+        GITHUB_TOKEN: ${{ github.token }}

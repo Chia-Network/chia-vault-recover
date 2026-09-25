@@ -157,20 +157,11 @@ jobs:
         if: matrix.universal && github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover'
         run: bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
 
-      - name: Add the release version to asset names
-        if: github.event_name == 'release' && (github.repository != 'Chia-Network/chia-vault-recover' || runner.os == 'Linux')
-        shell: bash
-        run: bash build-scripts/version-release-names.sh
-
       # Official macOS and Windows release assets are uploaded by the sign job.
       # Forks have no signing job, so they publish every platform from here.
       - name: Upload release assets
         if: github.event_name == 'release' && (github.repository != 'Chia-Network/chia-vault-recover' || runner.os == 'Linux')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/upload-release-assets
 
   sign:
     name: Sign (${{ matrix.os }})
@@ -297,13 +288,5 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash build-scripts/macos/notarize-dmg.sh ${{ matrix.artifact }}
 
-      - name: Add the release version to asset names
-        shell: bash
-        run: bash build-scripts/version-release-names.sh
-
       - name: Upload release assets
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/upload-release-assets
