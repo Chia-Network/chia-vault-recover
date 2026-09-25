@@ -260,6 +260,13 @@ jobs:
             fi
           fi
 
+      # Gatekeeper will not launch the signed GUI Mach-O. Bundle it before
+      # the Developer ID signature so the sealed app, not a bare executable,
+      # is what gets notarized inside the disk image.
+      - name: Bundle macOS GUI
+        if: matrix.os == 'macos'
+        run: bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
+
       - name: Sign binaries
         if: steps.apple-signing.outputs.available == 'true' || steps.windows-signing.outputs.available == 'true'
         shell: bash
