@@ -538,6 +538,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes",
+ "serde",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "bip39"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4559bb9225f8401dcea601cf8dc9ed81ea0dadd9cf7755fdefdd93ef7961e19e"
+dependencies = [
+ "bitcoin_hashes",
  "rand 0.8.8",
  "rand_core 0.6.4",
  "serde",
@@ -935,7 +946,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33d22cc417877a290eff196fe851cfc1175a5432166f8d9bedeb9f55e010bc76"
 dependencies = [
  "bigdecimal",
- "bip39",
+ "bip39 2.2.2",
  "chia-bls 0.36.1",
  "chia-consensus",
  "chia-protocol",
@@ -988,7 +999,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117394d011b2424785f2a3405241302637ef57946e48541ebd03dc81f2360e89"
 dependencies = [
  "anyhow",
- "bip39",
+ "bip39 2.2.2",
  "chia-bls 0.36.1",
  "chia-consensus",
  "chia-protocol",
@@ -1134,7 +1145,7 @@ version = "1.0.0-rc2"
 dependencies = [
  "anyhow",
  "bech32",
- "bip39",
+ "bip39 3.0.0",
  "chia-bls 0.36.1",
  "chia-consensus",
  "chia-protocol",
