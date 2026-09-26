@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use chia_vault_recover::address::parse_receive_address;
 use chia_vault_recover::cache::{LookupCache, VaultLookup};
 use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::config::VaultConfig;
@@ -280,7 +281,12 @@ async fn main() -> Result<()> {
                                     "saved lookup is for a different vault; look up this vault's Receive address (xch1… or txch1…) first"
                                 );
                             }
-                            let address = entry.receive_address.clone();
+                            let address = parse_receive_address(&entry.receive_address)
+                                .map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "saved lookup has no Receive address; run lookup with the vault Receive address (xch1… or txch1…) first"
+                                    )
+                                })?;
                             config.receive_address = Some(address.clone());
                             config.save(&path)?;
                             address
