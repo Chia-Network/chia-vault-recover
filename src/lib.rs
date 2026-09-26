@@ -1,4 +1,4 @@
-//! Recover a Chia Cloud Wallet vault with a BLS recovery passphrase.
+//! Recover a Chia Cloud Wallet vault with a 12- or 24-word recovery phrase.
 
 pub mod address;
 pub mod cache;

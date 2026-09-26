@@ -91,6 +91,7 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
                 key_type: Some(chia_vault_recover::config::KeyType::RecoveryPhrase),
             }],
         },
+        receive_address: None,
     };
 
     let report = inspect_vault(&config, Some(vault.coin), None)?;

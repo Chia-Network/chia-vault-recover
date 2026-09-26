@@ -95,6 +95,7 @@ pub fn config_from_mips_memo(
             clawback_timelock: timelock,
             members: recovery_members,
         },
+        receive_address: None,
     })
 }
 

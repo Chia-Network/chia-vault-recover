@@ -6,6 +6,7 @@ use std::path::Path;
 use chia_protocol::Bytes32;
 use serde::{Deserialize, Serialize};
 
+use crate::address::validate_receive_address;
 use crate::error::{Error, Result};
 use crate::keys::{KeyPair, parse_bls_public_key, parse_hex_bytes, public_key_to_hex};
 use crate::vault::{CustodyPath, VaultKeys, VaultMemberKey};
@@ -131,6 +132,10 @@ pub struct VaultConfig {
     pub launcher_id: String,
     pub custody: VaultConfigSide,
     pub recovery: VaultConfigRecovery,
+    /// Receive address that selected the network. Not part of the on-chain layout.
+    /// Written at Start so finish still works after a later lookup replaces the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_address: Option<String>,
 }
 
 impl VaultConfig {
@@ -147,6 +152,22 @@ impl VaultConfig {
 
     pub fn launcher_id_bytes(&self) -> Result<Bytes32> {
         parse_bytes32(&self.launcher_id)
+    }
+
+    /// Receive address written at Start. Finish and inspect use this instead of the lookup cache.
+    pub fn recorded_receive_address(&self) -> Result<&str> {
+        let address = self
+            .receive_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| {
+                Error::msg(
+                    "vault config has no Receive address; run start so the file records xch1… or txch1…",
+                )
+            })?;
+        validate_receive_address(address)?;
+        Ok(address)
     }
 
     pub fn to_vault_keys(&self) -> Result<VaultKeys> {
@@ -184,6 +205,7 @@ impl VaultConfig {
                     key_type: Some(KeyType::RecoveryPhrase),
                 }],
             },
+            receive_address: None,
         }
     }
 }
@@ -291,6 +313,7 @@ mod tests {
         }"#;
         let config: VaultConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.recovery.clawback_timelock, 43200);
+        assert!(config.receive_address.is_none());
         assert!(matches!(
             config.custody.members[0],
             VaultConfigMember::PublicKey {
@@ -298,5 +321,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn recorded_receive_address_rejects_hex_launcher_id() {
+        use crate::keys::{MnemonicWordCount, generate_mnemonic};
+
+        let custody = generate_mnemonic(MnemonicWordCount::Words12).unwrap();
+        let recovery = generate_mnemonic(MnemonicWordCount::Words12).unwrap();
+        let mut config = VaultConfig::from_bls_pair(
+            Bytes32::new([0x11; 32]),
+            &custody.key_pair,
+            &recovery.key_pair,
+            43_200,
+        );
+        config.receive_address = Some(format!("0x{}", hex::encode([0x22; 32])));
+        assert!(config.recorded_receive_address().is_err());
     }
 }
