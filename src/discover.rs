@@ -206,6 +206,7 @@ pub fn reconstruct_config(
                 key_type: Some(KeyType::RecoveryPhrase),
             }],
         },
+        receive_address: None,
     })
 }
 

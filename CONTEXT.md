@@ -13,23 +13,31 @@ The bech32m `xch1…` / `txch1…` address shown in Cloud Wallet. It does not co
 _Avoid_: wallet address (ambiguous)
 
 **Recovery phrase**:
-The BIP39 words Cloud Wallet issued for delayed recovery. Never written to the lookup cache.
-_Avoid_: 24 words (length varies), seed (overloaded)
+The 12- or 24-word BIP39 phrase Cloud Wallet issued for delayed recovery. Never written to the lookup cache.
+_Avoid_: passphrase, mnemonic, seed (overloaded)
+
+**Custody phrase**:
+A 12- or 24-word BIP39 phrase that becomes the post-recovery spend key.
+_Avoid_: mnemonic, passphrase
+
+**New recovery phrase**:
+A 12- or 24-word BIP39 phrase for the recovery branch after rekey. Generated (24 words by default) when the user does not supply one.
+_Avoid_: mnemonic, passphrase
 
 **Clawback timelock**:
 The delay, in seconds, during which old custody can still cancel a started recovery.
 _Avoid_: timeout, wait period
 
 **Lookup**:
-Resolving a Receive address to the launcher and a prior custody spend. Does not need the recovery phrase.
-_Avoid_: discover, scan (CLI aliases only)
+Resolving a Receive address to the launcher and the on-chain recovery hint, or to a prior custody spend when that hint is absent. Does not need the recovery phrase.
+_Avoid_: discover, resolve (CLI aliases only)
 
 **Found vault**:
 The public chain facts from a successful lookup: launcher, custody path, current coin, ancestor puzzle hashes. No recovery phrase and no clawback timelock.
 _Avoid_: vault-config (that file also has clawback and recovery pubkey)
 
 **Lookup cache**:
-The last found vault on disk, shared by GUI and CLI, so a later run can skip lookup.
+The last successful lookup on disk (hinted layout or found vault), shared by GUI and CLI, so a later run can skip lookup.
 _Avoid_: vault-config, session, save file
 
 **On-chain recovery hint**:

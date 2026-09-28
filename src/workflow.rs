@@ -144,7 +144,7 @@ pub async fn start(client: &ChainClient, params: StartWorkflow<'_>) -> Result<St
         ));
     }
 
-    let result = start_recovery(StartRecoveryParams {
+    let mut result = start_recovery(StartRecoveryParams {
         config: params.config,
         vault_coin: resolved.coin,
         lineage_proof: resolved.proof,
@@ -156,6 +156,7 @@ pub async fn start(client: &ChainClient, params: StartWorkflow<'_>) -> Result<St
         network: params.network,
     })?;
 
+    result.post_recovery_config.receive_address = params.config.receive_address.clone();
     result.post_recovery_config.save(params.out_config)?;
     client.push_tx(&result.spend_bundle).await?;
     Ok(result)
@@ -217,13 +218,15 @@ pub fn prepare_start(
     recovery_mnemonic: &str,
     typed_clawback: Option<u64>,
 ) -> Result<PreparedStart> {
+    let recorded = Some(address.trim().to_string());
     match cache.require(address)?.lookup {
-        VaultLookup::Hinted(config) => {
+        VaultLookup::Hinted(mut config) => {
             confirm_hinted_config(&config, Some(recovery_mnemonic), typed_clawback)?;
+            config.receive_address = recorded;
             Ok(PreparedStart::Hinted(config))
         }
         VaultLookup::Found(found, clawback) => {
-            let rebuilt = reconstruct(
+            let mut rebuilt = reconstruct(
                 &found,
                 recovery_mnemonic,
                 clawback.with_typed(typed_clawback),
@@ -232,6 +235,7 @@ pub fn prepare_start(
                 address,
                 ClawbackGuess::Known(rebuilt.config.recovery.clawback_timelock),
             )?;
+            rebuilt.config.receive_address = recorded;
             Ok(PreparedStart::Reconstructed(Box::new(rebuilt)))
         }
     }

@@ -56,7 +56,7 @@ pub struct StartRecoveryParams<'a> {
 pub struct StartRecoveryResult {
     pub spend_bundle: SpendBundle,
     pub post_recovery_config: VaultConfig,
-    /// Generated recovery mnemonic when the caller did not supply one. Show once; do not write to config.
+    /// Generated recovery phrase when the caller did not supply one. Show once; do not write to config.
     pub generated_recovery_mnemonic: Option<String>,
     pub recovery_state_puzzle_hash: Bytes32,
     pub clawback_timelock: u64,
@@ -236,7 +236,7 @@ fn ensure_recovery_key_matches(keys: &VaultKeys, pk: &BlsPublicKey) -> Result<()
         }
     }
     Err(Error::msg(
-        "recovery mnemonic public key does not match any BLS recovery member in the vault config",
+        "recovery phrase public key does not match any BLS recovery member in the vault config",
     ))
 }
 

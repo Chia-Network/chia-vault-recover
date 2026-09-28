@@ -78,11 +78,6 @@ pub fn muted(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).weak()
 }
 
-/// Small secondary hint text.
-pub fn muted_small(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text).small().weak()
-}
-
 /// Filled primary action (Start / Finish / Look up).
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(

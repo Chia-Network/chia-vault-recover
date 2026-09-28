@@ -11,7 +11,7 @@ use clvmr::NodePtr;
 use crate::address::{decode_address, network_from_address_prefix};
 use crate::chain::ChainClient;
 use crate::config::parse_bytes32;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mips::{CloudWalletP2, alloc_spend};
 use crate::network::{Backend, Network};
 
@@ -56,13 +56,13 @@ impl VaultLocator {
     }
 }
 
-pub fn client_for_vault(
-    vault: &str,
-    fallback_network: Network,
-    backend: &Backend,
-) -> Result<(ChainClient, Network)> {
+pub fn client_for_vault(vault: &str, backend: &Backend) -> Result<(ChainClient, Network)> {
     let locator = parse_vault_locator(vault)?;
-    let network = locator.inferred_network().unwrap_or(fallback_network);
+    let network = locator.inferred_network().ok_or_else(|| {
+        Error::msg(
+            "pass the vault Receive address (xch1… for mainnet, or txch1… for testnet11) so the network is known",
+        )
+    })?;
     Ok((ChainClient::new(network, backend), network))
 }
 
@@ -274,5 +274,25 @@ mod tests {
         let addr = encode_address(ph, "txch").unwrap();
         let locator = parse_vault_locator(&addr).unwrap();
         assert_eq!(locator.inferred_network(), Some(Network::Testnet11));
+    }
+
+    #[test]
+    fn client_for_address_uses_prefix() {
+        let ph = Bytes32::new([0x11; 32]);
+        let mainnet = encode_address(ph, "xch").unwrap();
+        let testnet = encode_address(ph, "txch").unwrap();
+        let (_, network) = client_for_vault(&mainnet, &Backend::coinset()).unwrap();
+        assert_eq!(network, Network::Mainnet);
+        let (_, network) = client_for_vault(&testnet, &Backend::coinset()).unwrap();
+        assert_eq!(network, Network::Testnet11);
+    }
+
+    #[test]
+    fn client_for_launcher_id_needs_an_address() {
+        let id = format!("0x{}", hex::encode([0x22; 32]));
+        match client_for_vault(&id, &Backend::coinset()) {
+            Err(err) => assert!(err.to_string().contains("txch1")),
+            Ok(_) => panic!("a launcher id does not select a network"),
+        }
     }
 }

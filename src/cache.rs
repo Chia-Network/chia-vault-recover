@@ -1,7 +1,8 @@
 //! On-disk lookup cache shared by the GUI and CLI.
 //!
-//! One current found vault. The recovery phrase is never written. A clawback
-//! guess is stored only when the user supplies one. Missing or unreadable files
+//! One current lookup. The recovery phrase is never written. A hinted layout
+//! stores the clawback from the on-chain memo. A custody-spend lookup stores a
+//! clawback guess only when the user supplies one. Missing or unreadable files
 //! are treated as empty.
 
 use std::fs;

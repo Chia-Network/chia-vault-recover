@@ -34,6 +34,27 @@ pub fn network_from_address_prefix(hrp: &str) -> Option<Network> {
     }
 }
 
+const RECEIVE_ADDRESS_HELP: &str =
+    "expected vault Receive address (xch1… for mainnet, or txch1… for testnet11)";
+
+/// Validate a vault Receive address (`xch1…` / `txch1…`). Hex launcher ids are rejected.
+pub fn validate_receive_address(input: &str) -> Result<()> {
+    let input = input.trim();
+    let lower = input.to_ascii_lowercase();
+    if !lower.starts_with("xch1") && !lower.starts_with("txch1") {
+        return Err(Error::msg(RECEIVE_ADDRESS_HELP));
+    }
+    decode_address(input)?;
+    Ok(())
+}
+
+/// Parse and return a trimmed Receive address. Hex launcher ids are rejected.
+pub fn parse_receive_address(input: &str) -> Result<String> {
+    let input = input.trim();
+    validate_receive_address(input)?;
+    Ok(input.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +67,20 @@ mod tests {
         let (hrp, decoded) = decode_address(&addr).unwrap();
         assert_eq!(hrp, "xch");
         assert_eq!(decoded, ph);
+    }
+
+    #[test]
+    fn receive_address_rejects_launcher_id() {
+        let id = format!("0x{}", hex::encode([0x22; 32]));
+        assert!(parse_receive_address(&id).is_err());
+    }
+
+    #[test]
+    fn receive_address_accepts_xch_and_txch() {
+        let ph = Bytes32::new([0xcd; 32]);
+        let mainnet = encode_address(ph, "xch").unwrap();
+        let testnet = encode_address(ph, "txch").unwrap();
+        assert_eq!(parse_receive_address(&mainnet).unwrap(), mainnet);
+        assert_eq!(parse_receive_address(&testnet).unwrap(), testnet);
     }
 }

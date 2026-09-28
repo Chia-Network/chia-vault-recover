@@ -35,7 +35,6 @@ impl App {
         self.generated_recovery_mnemonic = None;
         match self.cache.persist(&address, network, lookup) {
             Ok(_) => {
-                self.network = network;
                 if let Some(secs) = secs {
                     self.clawback_secs = secs.to_string();
                 }
@@ -48,8 +47,7 @@ impl App {
         }
     }
 
-    pub(super) fn apply_fallback(&mut self, gap: LookupGap, network: Network) {
-        self.network = network;
+    pub(super) fn apply_fallback(&mut self, gap: LookupGap) {
         let launcher = match gap.known_launcher() {
             Some(known) => format!(" launcher 0x{} ({}).", hex::encode(known.id), known.source),
             None => String::new(),
@@ -73,12 +71,12 @@ impl App {
                 "enter the vault Receive address (xch1… / txch1…) first",
             ));
         }
-        let (client, network) = client_for_vault(vault, self.network, &self.backend())?;
+        let (client, network) = client_for_vault(vault, &self.backend())?;
         let extra = self.parsed_clawback()?.into_iter().collect::<Vec<_>>();
         let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
         match report {
             LookupReport::Ready(lookup) => self.apply_lookup(lookup, network),
-            LookupReport::NeedFallback(gap) => self.apply_fallback(gap, network),
+            LookupReport::NeedFallback(gap) => self.apply_fallback(gap),
         }
         Ok(())
     }
@@ -169,12 +167,12 @@ impl App {
     fn start_inner(&mut self) -> Result<()> {
         if self.recovery_mnemonic.trim().is_empty() {
             return Err(chia_vault_recover::Error::msg(
-                "enter the Cloud Wallet recovery phrase to start recovery",
+                "enter the Cloud Wallet recovery phrase (12 or 24 words) to start recovery",
             ));
         }
         if self.new_custody_mnemonic.trim().is_empty() {
             return Err(chia_vault_recover::Error::msg(
-                "enter a new custody mnemonic to start recovery",
+                "enter a new custody phrase (12 or 24 words) to start recovery",
             ));
         }
         let out = self.resolve_post_path();
