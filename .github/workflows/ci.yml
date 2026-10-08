@@ -104,15 +104,26 @@ jobs:
           rustup target add aarch64-unknown-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
-      # Install sccache before rust-cache so RUSTC_WRAPPER resolves while the
-      # cache action runs cargo metadata. Restoring target/ makes unchanged
-      # dependency crates Fresh instead of paying a rustc startup per crate
-      # on a 100% sccache hit.
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache is not on the enterprise action allowlist.
+      # actions/cache is. Restoring target/ makes unchanged dependency crates
+      # Fresh; sccache still covers cache misses. CARGO_INCREMENTAL=0 avoids
+      # the macOS incremental-cache timestamp bug.
+      - name: Rustc cache key
+        id: cargo-cache
+        shell: bash
+        run: |
+          echo "rustc=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
         with:
-          key: ${{ matrix.name }}
-          cache-targets: "true"
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.name }}-${{ steps.cargo-cache.outputs.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.name }}-${{ steps.cargo-cache.outputs.rustc }}-
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
@@ -167,11 +178,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: Swatinem/rust-cache@v2
+      - name: Rustc cache key
+        id: cargo-cache
+        shell: bash
+        run: |
+          echo "rustc=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
         with:
-          key: ${{ matrix.name }}
-          cache-targets: "true"
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.name }}-${{ steps.cargo-cache.outputs.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.name }}-${{ steps.cargo-cache.outputs.rustc }}-
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Build macOS ${{ matrix.target }}
         run: cargo build --release --target ${{ matrix.target }}
       - name: Stage artifacts
