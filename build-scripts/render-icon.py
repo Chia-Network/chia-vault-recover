@@ -21,23 +21,23 @@ ASSETS = ROOT / "assets"
 # Windows explorer sizes. 256 is stored as 0 in the ICO directory entry.
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
-# PNG-backed icns types understood by macOS 11 (the bundle's minimum).
-ICNS_TYPES = {
-    16: "icp4",
-    32: "icp5",
-    64: "icp6",
-    128: "ic07",
-    256: "ic08",
-    512: "ic09",
-    1024: "ic10",
-}
-# Retina variants that repeat a size under another OSType.
-ICNS_RETINA = {
-    32: "ic11",  # 16x16@2x
-    64: "ic12",  # 32x32@2x
-    256: "ic13",  # 128x128@2x
-    512: "ic14",  # 256x256@2x
-}
+# OSTypes that Icon Services actually renders, in the order iconutil writes them.
+# 16px and 32px 1x icons are ARGB (ic04/ic05). PNG in icp4/icp5/icp6 is scrambled
+# in Finder list view, Activity Monitor, and Trash. Retina sizes and 128px+ stay PNG.
+ICNS_PNG = (
+    ("ic07", 128),
+    ("ic08", 256),
+    ("ic09", 512),
+    ("ic10", 1024),
+    ("ic11", 32),  # 16x16@2x
+    ("ic12", 64),  # 32x32@2x
+    ("ic13", 256),  # 128x128@2x
+    ("ic14", 512),  # 256x256@2x
+)
+ICNS_ARGB = (
+    ("ic04", 16),
+    ("ic05", 32),
+)
 
 
 def render(size: int, dest: Path) -> None:
@@ -128,17 +128,95 @@ def write_ico(images: dict[int, Image.Image], dest: Path) -> None:
     dest.write_bytes(header + directory + payload)
 
 
-def write_icns(pngs: dict[int, bytes], dest: Path) -> None:
+def pack_bits(data: bytes) -> bytes:
+    """ICNS PackBits. A run is 3..130 copies; shorter repeats stay literal."""
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        run = 1
+        while i + run < n and data[i + run] == data[i] and run < 130:
+            run += 1
+        if run >= 3:
+            out.append(0x80 | (run - 3))
+            out.append(data[i])
+            i += run
+            continue
+        literal = bytearray()
+        while i < n and len(literal) < 128:
+            ahead = 1
+            while i + ahead < n and data[i + ahead] == data[i] and ahead < 3:
+                ahead += 1
+            if ahead >= 3:
+                break
+            literal.append(data[i])
+            i += 1
+        out.append(len(literal) - 1)
+        out.extend(literal)
+    return bytes(out)
+
+
+def unpack_bits(data: bytes) -> bytes:
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        control = data[i]
+        if control < 0x80:
+            count = control + 1
+            out.extend(data[i + 1 : i + 1 + count])
+            i += 1 + count
+        else:
+            out.extend([data[i + 1]] * (control - 0x7D))
+            i += 2
+    return bytes(out)
+
+
+def encode_argb(im: Image.Image) -> bytes:
+    """Straight (non-premultiplied) A, R, G, B channels, each PackBits-compressed."""
+    im = im.convert("RGBA")
+    width, height = im.size
+    if width != height:
+        raise ValueError(f"ARGB icon must be square, got {width}x{height}")
+    raw = im.tobytes()
+    channels = [pack_bits(raw[index::4]) for index in (3, 0, 1, 2)]
+    return b"ARGB" + b"".join(channels)
+
+
+def decode_argb(payload: bytes, size: int) -> Image.Image:
+    if not payload.startswith(b"ARGB"):
+        raise ValueError("ARGB payload is missing its magic")
+    raw = unpack_bits(payload[4:])
+    count = size * size
+    if len(raw) != count * 4:
+        raise ValueError(f"ARGB decoded to {len(raw)} bytes, expected {count * 4}")
+    alpha = raw[:count]
+    red = raw[count : count * 2]
+    green = raw[count * 2 : count * 3]
+    blue = raw[count * 3 :]
+    im = Image.new("RGBA", (size, size))
+    im.putdata(
+        [(red[i], green[i], blue[i], alpha[i]) for i in range(count)]
+    )
+    return im
+
+
+def write_icns(pngs: dict[int, bytes], images: dict[int, Image.Image], dest: Path) -> None:
     chunks = bytearray()
 
-    def add(ostype: str, png: bytes) -> None:
+    def add(ostype: str, payload: bytes) -> None:
         chunks.extend(ostype.encode("ascii"))
-        chunks.extend(struct.pack(">I", 8 + len(png)))
-        chunks.extend(png)
+        chunks.extend(struct.pack(">I", 8 + len(payload)))
+        chunks.extend(payload)
 
-    for size, ostype in ICNS_TYPES.items():
-        add(ostype, pngs[size])
-    for size, ostype in ICNS_RETINA.items():
+    # iconutil writes the 1x ARGB icons before the PNG sizes.
+    for ostype, size in ICNS_ARGB:
+        payload = encode_argb(images[size])
+        decoded = decode_argb(payload, size).tobytes()
+        source = images[size].convert("RGBA").tobytes()
+        if decoded != source:
+            raise RuntimeError(f"{ostype} ARGB did not round-trip")
+        add(ostype, payload)
+    for ostype, size in ICNS_PNG:
         add(ostype, pngs[size])
     dest.write_bytes(b"icns" + struct.pack(">I", 8 + len(chunks)) + chunks)
 
@@ -148,7 +226,7 @@ def main() -> int:
         print(f"missing {SVG}", file=sys.stderr)
         return 1
     ASSETS.mkdir(parents=True, exist_ok=True)
-    needed = sorted(set(ICO_SIZES) | set(ICNS_TYPES) | {512, 1024})
+    needed = sorted(set(ICO_SIZES) | {size for _, size in ICNS_PNG} | {size for _, size in ICNS_ARGB})
     png_bytes: dict[int, bytes] = {}
     images: dict[int, Image.Image] = {}
     for size in needed:
@@ -160,7 +238,7 @@ def main() -> int:
     master = ASSETS / "icon-1024.png"
     master.write_bytes(png_bytes[1024])
     write_ico(images, ASSETS / "icon.ico")
-    write_icns(png_bytes, ASSETS / "icon.icns")
+    write_icns(png_bytes, images, ASSETS / "icon.icns")
     print(f"wrote {master.name}, icon.ico, icon.icns")
     return 0
 
