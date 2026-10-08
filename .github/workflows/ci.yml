@@ -7,6 +7,12 @@ on:
   release:
     types: [published]
 
+# A new push to a pull request cancels the run it replaces. Push and release
+# runs each get their own group, so they are neither queued nor cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -50,12 +56,13 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev pkg-config
       - run: cargo test --all
 
+  # Release binaries do not need lint or test output. They start with those
+  # jobs. Publishing stays downstream and still waits for every check.
   build:
     name: Build (${{ matrix.name }})
-    needs: [lint, test]
     runs-on: ${{ matrix.os }}
-    # Repo default token is read-only; attaching files to a published release
-    # needs contents:write (softprops/action-gh-release updates the release).
+    # Repo default token is read-only. This is the permission set artifact
+    # upload already uses in this workflow.
     permissions:
       contents: write
     strategy:
@@ -75,17 +82,11 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: windows-x86_64
-          - name: macos-universal
-            os: macos-latest
-            target: universal-apple-darwin
-            artifact: macos-universal
-            universal: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.universal && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
+          targets: ${{ matrix.target }}
 
       - name: Install Linux deps (native)
         if: runner.os == 'Linux' && !matrix.cross
@@ -103,8 +104,18 @@ jobs:
           rustup target add aarch64-unknown-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
+      # Install sccache before rust-cache so RUSTC_WRAPPER resolves while the
+      # cache action runs cargo metadata. Restoring target/ makes unchanged
+      # dependency crates Fresh instead of paying a rustc startup per crate
+      # on a 100% sccache hit.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          cache-targets: "true"
+
       - name: Build (native)
-        if: ${{ !matrix.universal && !matrix.cross }}
+        if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (linux aarch64)
@@ -115,24 +126,7 @@ jobs:
           cargo build --release --target aarch64-unknown-linux-gnu --bin chia-vault-recover-gui || \
             echo "GUI cross-build skipped/failed; CLI artifact still produced"
 
-      - name: Build macOS universal
-        if: matrix.universal
-        run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
-          mkdir -p dist
-          lipo -create \
-            target/aarch64-apple-darwin/release/chia-vault-recover \
-            target/x86_64-apple-darwin/release/chia-vault-recover \
-            -output dist/chia-vault-recover-${{ matrix.artifact }}
-          lipo -create \
-            target/aarch64-apple-darwin/release/chia-vault-recover-gui \
-            target/x86_64-apple-darwin/release/chia-vault-recover-gui \
-            -output dist/chia-vault-recover-gui-${{ matrix.artifact }}
-          chmod +x dist/*
-
-      - name: Stage artifacts (non-universal)
-        if: ${{ !matrix.universal }}
+      - name: Stage artifacts
         shell: bash
         run: |
           mkdir -p dist
@@ -151,25 +145,94 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      # Forks never enter the sign job. Bundle the GUI, then package the disk
-      # image, so the upload is not a raw Mach-O. Signing, when it happens, sits
-      # between those two scripts in the sign job.
-      - name: Package macOS release disk image
-        if: matrix.universal && github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover'
+  # The two Apple architectures used to compile back-to-back on one runner,
+  # and that job was the pull-request critical path. Each arch now has the
+  # full runner. Build (macos-universal) is unchanged as a check name: it
+  # lipos the halves and uploads the same artifact the sign job downloads.
+  build-macos-arch:
+    name: Build (${{ matrix.name }})
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          cache-targets: "true"
+      - name: Build macOS ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage artifacts
         run: |
-          bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
-          bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
+          mkdir -p dist
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          cp "$TARGET_DIR/chia-vault-recover" dist/chia-vault-recover
+          cp "$TARGET_DIR/chia-vault-recover-gui" dist/chia-vault-recover-gui
+          chmod +x dist/*
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: chia-vault-recover-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
 
-      # Official macOS and Windows release assets are uploaded by the sign job.
-      # Forks have no signing job, so they publish every platform from here.
-      - name: Upload release assets
-        if: github.event_name == 'release' && (github.repository != 'Chia-Network/chia-vault-recover' || runner.os == 'Linux')
-        uses: ./.github/actions/upload-release-assets
+  macos-universal:
+    name: Build (macos-universal)
+    needs: build-macos-arch
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download aarch64 build
+        uses: actions/download-artifact@v8
+        with:
+          name: chia-vault-recover-macos-aarch64
+          path: aarch64
+      - name: Download x86_64 build
+        uses: actions/download-artifact@v8
+        with:
+          name: chia-vault-recover-macos-x86_64
+          path: x86_64
+      - name: Lipo universal binaries
+        run: |
+          mkdir -p dist
+          lipo -create \
+            aarch64/chia-vault-recover \
+            x86_64/chia-vault-recover \
+            -output dist/chia-vault-recover-macos-universal
+          lipo -create \
+            aarch64/chia-vault-recover-gui \
+            x86_64/chia-vault-recover-gui \
+            -output dist/chia-vault-recover-gui-macos-universal
+          chmod +x dist/*
+          lipo -info dist/chia-vault-recover-macos-universal
+          lipo -info dist/chia-vault-recover-gui-macos-universal
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: chia-vault-recover-macos-universal
+          path: dist/*
+          if-no-files-found: error
 
+  # Official macOS and Windows release assets are signed, then uploaded here.
+  # Everything else is uploaded by the publish jobs below. All of them wait
+  # until lint, tests, and every build have succeeded.
   sign:
     name: Sign (${{ matrix.os }})
-    needs: build
-    if: github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release'
+    needs: [lint, test, build, macos-universal]
+    if: ${{ success() && github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' }}
     runs-on: ${{ matrix.runs-on }}
     environment: ${{ matrix.environment }}
     permissions:
@@ -298,5 +361,61 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash build-scripts/macos/notarize-dmg.sh ${{ matrix.artifact }}
 
+      - name: Upload release assets
+        uses: ./.github/actions/upload-release-assets
+
+  publish-linux:
+    name: Publish Linux release assets
+    needs: [lint, test, build, macos-universal]
+    if: ${{ success() && github.event_name == 'release' && github.repository == 'Chia-Network/chia-vault-recover' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download Linux build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: chia-vault-recover-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Upload release assets
+        uses: ./.github/actions/upload-release-assets
+
+  # Forks have no signing credentials and no sign job. They still publish
+  # every platform, including a macOS disk image, and only after the same
+  # checks the official release waits for.
+  publish-fork:
+    name: Publish fork release assets (${{ matrix.artifact }})
+    needs: [lint, test, build, macos-universal]
+    if: ${{ success() && github.event_name == 'release' && github.repository != 'Chia-Network/chia-vault-recover' }}
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: linux-x86_64
+            runs-on: ubuntu-latest
+          - artifact: linux-aarch64
+            runs-on: ubuntu-latest
+          - artifact: windows-x86_64
+            runs-on: ubuntu-latest
+          - artifact: macos-universal
+            runs-on: macos-latest
+            package: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: chia-vault-recover-${{ matrix.artifact }}
+          path: dist
+      - name: Package macOS release disk image
+        if: matrix.package
+        run: |
+          bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
+          bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
       - name: Upload release assets
         uses: ./.github/actions/upload-release-assets
