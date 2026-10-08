@@ -8,6 +8,8 @@
   <string>Chia Vault Recover</string>
   <key>CFBundleExecutable</key>
   <string>chia-vault-recover-gui</string>
+  <key>CFBundleIconFile</key>
+  <string>icon</string>
   <key>CFBundleIdentifier</key>
   <string>net.chia.vault-recover</string>
   <key>CFBundleInfoDictionaryVersion</key>

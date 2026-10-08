@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Chia Vault Recover application icon.
+
+  The green sprout is traced from the Chia application icon at
+  packages/gui/src/assets/img/chia.icns in
+  https://github.com/Chia-Network/chia-blockchain-gui
+  (Copyright 2026 Chia Network Inc., Apache License 2.0).
+  The white rounded tile follows that icon. The lock badge is original
+  artwork marking this as the vault recovery tool.
+  Greens are the Chia mark #32A752 and the active green #287E3F.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect x="100" y="101" width="822" height="822" rx="182" fill="#ffffff"/>
+  <g transform="translate(0,1024) scale(0.1,-0.1)" fill="#32A752">
+    <path d="M5250 7063 c-19 -1 -87 -8 -150 -14 -448 -42 -799 -156 -1110 -359
+-532 -349 -881 -842 -1016 -1435 -32 -143 -45 -447 -24 -570 6 -39 14 -92 17
+-118 3 -27 11 -51 18 -53 6 -3 61 28 122 69 447 298 1110 557 2156 842 152 41
+283 75 289 75 21 0 -5 -17 -47 -30 -109 -34 -610 -243 -880 -367 -404 -186
+-1010 -513 -1330 -716 -402 -256 -982 -666 -1295 -916 -52 -42 -130 -103 -173
+-135 -55 -42 -75 -62 -67 -70 8 -8 24 -3 58 17 26 15 141 75 255 133 533 269
+911 421 1132 454 l80 12 85 -89 c457 -480 1175 -667 1912 -497 335 77 675 234
+903 417 550 443 1172 1337 1784 2566 125 250 133 274 104 286 -142 58 -679
+221 -984 299 -657 168 -942 207 -1483 204 -177 0 -337 -3 -356 -5z"/>
+  </g>
+  <g id="vault-lock">
+    <circle cx="730" cy="802" r="104" fill="#287E3F"/>
+    <path d="M690 818 V772 a40 40 0 0 1 80 0 V818" fill="none" stroke="#ffffff" stroke-width="18" stroke-linecap="butt" stroke-linejoin="round"/>
+    <rect x="682" y="800" width="96" height="70" rx="14" fill="#ffffff"/>
+    <circle cx="730" cy="824" r="10" fill="#287E3F"/>
+    <path d="M722.4 830 H737.6 L734.2 854 H725.8 Z" fill="#287E3F"/>
+  </g>
+</svg>
