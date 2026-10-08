@@ -213,21 +213,33 @@ jobs:
   macos-universal:
     name: Build (macos-universal)
     needs: build-macos-arch
+    # A failed or cancelled arch leg must fail this check, not skip it.
+    # Branch protection treats a skipped required check as success, and
+    # Build (macos-aarch64) / Build (macos-x86_64) are new names.
+    if: ${{ always() && !cancelled() }}
     runs-on: macos-latest
     permissions:
       contents: write
     steps:
+      - name: Require both Apple architecture builds
+        if: ${{ needs.build-macos-arch.result != 'success' }}
+        run: |
+          echo "::error::Build (macos-universal) requires both Apple architecture builds to succeed (build-macos-arch result: ${{ needs.build-macos-arch.result }})"
+          exit 1
       - name: Download aarch64 build
+        if: ${{ needs.build-macos-arch.result == 'success' }}
         uses: actions/download-artifact@v8
         with:
           name: chia-vault-recover-macos-aarch64
           path: aarch64
       - name: Download x86_64 build
+        if: ${{ needs.build-macos-arch.result == 'success' }}
         uses: actions/download-artifact@v8
         with:
           name: chia-vault-recover-macos-x86_64
           path: x86_64
       - name: Lipo universal binaries
+        if: ${{ needs.build-macos-arch.result == 'success' }}
         run: |
           mkdir -p dist
           lipo -create \
@@ -242,6 +254,7 @@ jobs:
           lipo -info dist/chia-vault-recover-macos-universal
           lipo -info dist/chia-vault-recover-gui-macos-universal
       - name: Upload CI artifacts
+        if: ${{ needs.build-macos-arch.result == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: chia-vault-recover-macos-universal
