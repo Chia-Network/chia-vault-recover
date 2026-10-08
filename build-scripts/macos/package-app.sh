@@ -27,9 +27,16 @@ if [ -z "$version" ]; then
   exit 1
 fi
 
-mkdir -p "$app/Contents/MacOS"
+icon_src="$root/assets/icon.icns"
+if [ ! -f "$icon_src" ]; then
+  echo "Missing app icon: $icon_src" >&2
+  exit 1
+fi
+
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 ditto "$gui" "$app/Contents/MacOS/chia-vault-recover-gui"
 chmod +x "$app/Contents/MacOS/chia-vault-recover-gui"
+ditto "$icon_src" "$app/Contents/Resources/icon.icns"
 sed "s/__VERSION__/${version}/g" "$root/build-scripts/macos/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 for key in CFBundleShortVersionString CFBundleVersion; do
@@ -39,5 +46,10 @@ for key in CFBundleShortVersionString CFBundleVersion; do
     exit 1
   fi
 done
+icon_name="$(plutil -extract CFBundleIconFile raw "$app/Contents/Info.plist")"
+if [ "$icon_name" != "icon" ] || [ ! -f "$app/Contents/Resources/icon.icns" ]; then
+  echo "App bundle is missing icon.icns (CFBundleIconFile='$icon_name')" >&2
+  exit 1
+fi
 rm -f "$gui"
 echo "Bundled $app ($version)"
