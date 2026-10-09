@@ -16,8 +16,33 @@ use chia_sdk_types::{
 use chia_secp::{K1PublicKey, R1PublicKey};
 use clvm_utils::{ToTreeHash, TreeHash};
 use clvmr::NodePtr;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::puzzles::{FORCE_SINGLETON_RECREATION_HASH, ForceSingletonRecreationMod};
+
+/// Cloud Wallet `VaultPuzzleVersion`. Upgraded vaults add a force-singleton-recreation wrapper
+/// to the READY recovery branch, so the same keys hash to a different puzzle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VaultPuzzleVersion {
+    #[default]
+    Legacy,
+    ForceSingletonRecreation,
+}
+
+impl VaultPuzzleVersion {
+    /// Every version, tried in turn when the chain is the only source of truth.
+    pub const ALL: [Self; 2] = [Self::ForceSingletonRecreation, Self::Legacy];
+
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+
+    fn forces_singleton_recreation(self) -> bool {
+        self == Self::ForceSingletonRecreation
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum VaultMemberKey {
@@ -60,6 +85,7 @@ pub struct RecoverySignerSet {
 pub struct VaultKeys {
     pub custody: CustodyPath,
     pub recovery: RecoverySignerSet,
+    pub puzzle_version: VaultPuzzleVersion,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +97,7 @@ pub struct VaultInternals {
     pub recovery_hash: TreeHash,
     pub recovery_restrictions: Vec<Restriction>,
     pub clawback_timelock: u64,
+    pub puzzle_version: VaultPuzzleVersion,
 }
 
 /// Hashes for the intermediate RECOVERY-state vault (no spend allocated).
@@ -82,7 +109,8 @@ pub struct RecoveryStateHashes {
 
 pub fn get_vault_internals(launcher_id: Bytes32, keys: &VaultKeys) -> Result<VaultInternals> {
     let custody_hash = keys.custody.hash()?;
-    let (recovery_hash, recovery_restrictions) = ready_recovery_hash(custody_hash, &keys.recovery)?;
+    let (recovery_hash, recovery_restrictions) =
+        ready_recovery_hash(custody_hash, &keys.recovery, keys.puzzle_version)?;
 
     let inner_puzzle_hash = top_level_hash(custody_hash, recovery_hash);
     let full_puzzle_hash = SingletonArgs::curry_tree_hash(launcher_id, inner_puzzle_hash).into();
@@ -95,6 +123,7 @@ pub fn get_vault_internals(launcher_id: Bytes32, keys: &VaultKeys) -> Result<Vau
         recovery_hash,
         recovery_restrictions,
         clawback_timelock: keys.recovery.clawback_timelock,
+        puzzle_version: keys.puzzle_version,
     })
 }
 
@@ -111,6 +140,7 @@ pub fn recovery_state_hashes(
         post_recovery_inner,
         keys.recovery.clawback_timelock,
         amount,
+        keys.puzzle_version,
     )?;
     let finish_delegated_puzzle_hash = ctx.tree_hash(finish.puzzle);
     recovery_state_from_finish_hash(launcher_id, keys, finish_delegated_puzzle_hash)
@@ -145,6 +175,7 @@ fn recovery_state_from_finish_hash(
             recovery_hash,
             recovery_restrictions: Vec::new(),
             clawback_timelock: timelock,
+            puzzle_version: keys.puzzle_version,
         },
         finish_delegated_puzzle_hash,
     })
@@ -163,21 +194,27 @@ pub fn recovery_state_with_finish_spend(
         post_recovery_inner,
         keys.recovery.clawback_timelock,
         amount,
+        keys.puzzle_version,
     )?;
     let finish_ph = ctx.tree_hash(finish.puzzle);
     let hashes = recovery_state_from_finish_hash(launcher_id, keys, finish_ph)?;
     Ok((hashes, finish))
 }
 
+/// Finish-member delegated spend. Upgraded vaults also assert the coin amount, as Cloud Wallet does.
 pub fn finish_delegated_spend(
     ctx: &mut SpendContext,
     post_recovery_inner: TreeHash,
     timelock: u64,
     amount: u64,
+    puzzle_version: VaultPuzzleVersion,
 ) -> Result<Spend> {
-    let conditions = Conditions::new()
+    let mut conditions = Conditions::new()
         .create_coin(post_recovery_inner.into(), amount, Memos::None)
         .assert_seconds_relative(timelock);
+    if puzzle_version.forces_singleton_recreation() {
+        conditions = conditions.assert_my_amount(amount);
+    }
     Ok(ctx.delegated_spend(conditions)?)
 }
 
@@ -186,7 +223,11 @@ pub fn prevent_vault_side_effect_opcodes() -> [u16; 4] {
     [60, 62, 66, 67]
 }
 
-pub fn recovery_restrictions(custody_hash: TreeHash, clawback_timelock: u64) -> Vec<Restriction> {
+pub fn recovery_restrictions(
+    custody_hash: TreeHash,
+    clawback_timelock: u64,
+    puzzle_version: VaultPuzzleVersion,
+) -> Vec<Restriction> {
     let mut restrictions = vec![force_1_of_2_restriction(custody_hash, clawback_timelock)];
     for opcode in prevent_vault_side_effect_opcodes() {
         restrictions.push(Restriction {
@@ -198,6 +239,12 @@ pub fn recovery_restrictions(custody_hash: TreeHash, clawback_timelock: u64) -> 
         kind: RestrictionKind::DelegatedPuzzleWrapper,
         puzzle_hash: PREVENT_MULTIPLE_CREATE_COINS_HASH.into(),
     });
+    if puzzle_version.forces_singleton_recreation() {
+        restrictions.push(Restriction {
+            kind: RestrictionKind::DelegatedPuzzleWrapper,
+            puzzle_hash: FORCE_SINGLETON_RECREATION_HASH.into(),
+        });
+    }
     restrictions
 }
 
@@ -215,14 +262,15 @@ fn force_1_of_2_restriction(custody_hash: TreeHash, clawback_timelock: u64) -> R
     }
 }
 
-/// Insert Force1of2 + prevent-side-effects restriction spends from the same typed constructors
-/// used for puzzle hashes (no reverse hash lookup).
+/// Insert Force1of2 + prevent-side-effects (+ force-singleton-recreation on upgraded vaults)
+/// restriction spends from the same typed constructors used for puzzle hashes (no reverse hash lookup).
 pub fn insert_recovery_restriction_spends(
     ctx: &mut SpendContext,
     mips: &mut chia_sdk_driver::MipsSpend,
     custody_hash: TreeHash,
     clawback_timelock: u64,
     finish_delegated_puzzle_hash: TreeHash,
+    puzzle_version: VaultPuzzleVersion,
 ) -> Result<()> {
     let force = Force1of2RestrictedVariable::new(
         custody_hash.into(),
@@ -254,6 +302,15 @@ pub fn insert_recovery_restriction_spends(
     mips.restrictions
         .insert(multi_ph, Spend::new(puzzle, solution));
 
+    if puzzle_version.forces_singleton_recreation() {
+        let puzzle = ctx.alloc_mod::<ForceSingletonRecreationMod>()?;
+        let solution = ctx.alloc(&NodePtr::NIL)?;
+        mips.restrictions.insert(
+            FORCE_SINGLETON_RECREATION_HASH.into(),
+            Spend::new(puzzle, solution),
+        );
+    }
+
     Ok(())
 }
 
@@ -275,8 +332,10 @@ fn custody_member_hash(custody: &SignerSet) -> Result<TreeHash> {
 fn ready_recovery_hash(
     custody_hash: TreeHash,
     recovery: &RecoverySignerSet,
+    puzzle_version: VaultPuzzleVersion,
 ) -> Result<(TreeHash, Vec<Restriction>)> {
-    let restrictions = recovery_restrictions(custody_hash, recovery.clawback_timelock);
+    let restrictions =
+        recovery_restrictions(custody_hash, recovery.clawback_timelock, puzzle_version);
     let mut bare_hashes = member_hashes(&recovery.set, true)?;
     sort_hashes(&mut bare_hashes);
 

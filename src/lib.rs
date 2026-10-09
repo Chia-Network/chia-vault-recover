@@ -12,6 +12,7 @@ pub mod keys;
 pub mod locate;
 pub mod mips;
 pub mod network;
+pub mod puzzles;
 pub mod recovery;
 pub mod vault;
 pub mod workflow;
@@ -36,7 +37,7 @@ pub use recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
     finish_recovery, inspect_vault, start_recovery,
 };
-pub use vault::{CustodyPath, VaultInternals, VaultKeys, VaultMemberKey};
+pub use vault::{CustodyPath, VaultInternals, VaultKeys, VaultMemberKey, VaultPuzzleVersion};
 pub use workflow::{
     LookupReport, PreparedStart, StartWorkflow, finish as finish_workflow,
     inspect as inspect_workflow, lookup as lookup_workflow, prepare_start, resolve_found,

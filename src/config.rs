@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::address::validate_receive_address;
 use crate::error::{Error, Result};
 use crate::keys::{KeyPair, parse_bls_public_key, parse_hex_bytes, public_key_to_hex};
-use crate::vault::{CustodyPath, VaultKeys, VaultMemberKey};
+use crate::vault::{CustodyPath, VaultKeys, VaultMemberKey, VaultPuzzleVersion};
 
 /// Public-key / nested-vault members in Cloud Wallet config shape.
 pub fn config_members_from_keys(
@@ -136,6 +136,9 @@ pub struct VaultConfig {
     /// Written at Start so finish still works after a later lookup replaces the cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receive_address: Option<String>,
+    /// Cloud Wallet vault puzzle version. Absent means LEGACY (older config files and caches).
+    #[serde(default, skip_serializing_if = "VaultPuzzleVersion::is_legacy")]
+    pub puzzle_version: VaultPuzzleVersion,
 }
 
 impl VaultConfig {
@@ -174,6 +177,7 @@ impl VaultConfig {
         Ok(VaultKeys {
             custody: side_to_custody(&self.custody)?,
             recovery: recovery_to_signers(&self.recovery)?,
+            puzzle_version: self.puzzle_version,
         })
     }
 
@@ -184,6 +188,7 @@ impl VaultConfig {
         custody: &KeyPair,
         recovery: &KeyPair,
         clawback_timelock: u64,
+        puzzle_version: VaultPuzzleVersion,
     ) -> Self {
         Self {
             launcher_id: format!("0x{}", hex::encode(launcher_id)),
@@ -206,6 +211,7 @@ impl VaultConfig {
                 }],
             },
             receive_address: None,
+            puzzle_version,
         }
     }
 }
@@ -334,6 +340,7 @@ mod tests {
             &custody.key_pair,
             &recovery.key_pair,
             43_200,
+            VaultPuzzleVersion::Legacy,
         );
         config.receive_address = Some(format!("0x{}", hex::encode([0x22; 32])));
         assert!(config.recorded_receive_address().is_err());

@@ -43,6 +43,7 @@ clvmr = "0.16"
 eframe = { version = "0.36", default-features = true }
 egui = "0.36"
 hex = "0.4"
+hex-literal = "1.1"
 rand = "0.10"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -52,7 +53,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 chia-sdk-test = "0.36"
-hex-literal = "1.1"
 rstest = "0.27"
 
 [build-dependencies]

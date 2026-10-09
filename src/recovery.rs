@@ -4,10 +4,13 @@ use chia_bls::{PublicKey as BlsPublicKey, SecretKey, sign};
 use chia_protocol::{Bytes32, Coin, SpendBundle};
 use chia_puzzle_types::{Memos, Proof};
 use chia_sdk_driver::{
-    InnerPuzzleSpend, MipsSpend, Spend, SpendContext, Vault, VaultInfo,
-    calculate_vault_start_recovery_message,
+    InnerPuzzleSpend, MipsSpend, Restriction, RestrictionKind, Spend, SpendContext, Vault,
+    VaultInfo,
 };
-use chia_sdk_types::{Conditions, Mod, puzzles::BlsMember, puzzles::Timelock};
+use chia_sdk_types::{
+    Conditions, Mod,
+    puzzles::{AddDelegatedPuzzleWrapper, BlsMember, Timelock},
+};
 use clvm_utils::TreeHash;
 use clvmr::NodePtr;
 
@@ -16,8 +19,8 @@ use crate::error::{Error, Result};
 use crate::keys::{MnemonicWordCount, generate_mnemonic, key_from_mnemonic};
 use crate::network::Network;
 use crate::vault::{
-    VaultKeys, VaultMemberKey, get_vault_internals, insert_recovery_restriction_spends,
-    recovery_state_hashes, recovery_state_with_finish_spend,
+    VaultKeys, VaultMemberKey, VaultPuzzleVersion, get_vault_internals,
+    insert_recovery_restriction_spends, recovery_state_hashes, recovery_state_with_finish_spend,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,8 +154,14 @@ pub fn start_recovery(params: StartRecoveryParams<'_>) -> Result<StartRecoveryRe
     let clawback = params
         .new_clawback_timelock
         .unwrap_or(current_keys.recovery.clawback_timelock);
-    let post_recovery_config =
-        VaultConfig::from_bls_pair(launcher_id, &custody_key, &recovery_pair, clawback);
+    // Keep the source vault's puzzle version so recovery does not drop Cloud Wallet's upgrade.
+    let post_recovery_config = VaultConfig::from_bls_pair(
+        launcher_id,
+        &custody_key,
+        &recovery_pair,
+        clawback,
+        current_keys.puzzle_version,
+    );
     let post_ready = get_vault_internals(launcher_id, &post_recovery_config.to_vault_keys()?)?;
 
     let mut ctx = SpendContext::new();
@@ -249,11 +258,15 @@ fn build_start_spend_bundle(
     recovery_sk: &SecretKey,
     network: Network,
 ) -> Result<SpendBundle> {
-    let conditions = Conditions::new().create_coin(
+    let mut conditions = Conditions::new().create_coin(
         recovery_state.inner_puzzle_hash.into(),
         vault.coin.amount,
         Memos::None,
     );
+    // Force-singleton-recreation needs ASSERT_MY_AMOUNT equal to the odd CREATE_COIN amount.
+    if ready.puzzle_version == VaultPuzzleVersion::ForceSingletonRecreation {
+        conditions = conditions.assert_my_amount(vault.coin.amount);
+    }
     let delegated = ctx.delegated_spend(conditions)?;
     let delegated_ph = ctx.tree_hash(delegated.puzzle);
 
@@ -284,12 +297,12 @@ fn build_start_spend_bundle(
         ready.custody_hash,
         ready.clawback_timelock,
         finish_delegated_puzzle_hash,
+        ready.puzzle_version,
     )?;
 
-    let message = calculate_vault_start_recovery_message(
-        delegated_ph.into(),
-        ready.custody_hash.into(),
-        ready.clawback_timelock,
+    let message = start_recovery_message(
+        delegated_ph,
+        &ready.recovery_restrictions,
         vault.coin.coin_id(),
         Bytes32::new(network.genesis_challenge()),
     );
@@ -297,6 +310,34 @@ fn build_start_spend_bundle(
 
     vault.spend(ctx, &mips)?;
     Ok(SpendBundle::new(ctx.take(), signature))
+}
+
+/// BLS message for the recovery member: the delegated puzzle hash wrapped by every delegated
+/// puzzle wrapper on the READY recovery branch, then the coin id and genesis challenge.
+///
+/// `calculate_vault_start_recovery_message` hardcodes the legacy wrapper stack, so it signs
+/// the wrong hash for upgraded vaults.
+fn start_recovery_message(
+    delegated_puzzle_hash: TreeHash,
+    recovery_restrictions: &[Restriction],
+    vault_coin_id: Bytes32,
+    genesis_challenge: Bytes32,
+) -> Vec<u8> {
+    let mut wrapped = delegated_puzzle_hash;
+    for restriction in recovery_restrictions
+        .iter()
+        .rev()
+        .filter(|r| matches!(r.kind, RestrictionKind::DelegatedPuzzleWrapper))
+    {
+        wrapped =
+            AddDelegatedPuzzleWrapper::new(restriction.puzzle_hash, wrapped).curry_tree_hash();
+    }
+    [
+        wrapped.to_bytes(),
+        vault_coin_id.to_bytes(),
+        genesis_challenge.to_bytes(),
+    ]
+    .concat()
 }
 
 fn build_finish_spend_bundle(
@@ -364,6 +405,7 @@ mod key_match_tests {
                 },
                 clawback_timelock: 1,
             },
+            puzzle_version: crate::vault::VaultPuzzleVersion::Legacy,
         };
         let wrong = key_from_mnemonic(
             "legal winner thank year wave sausage worth useful legal winner thank yellow",
@@ -371,5 +413,37 @@ mod key_match_tests {
         .unwrap();
         assert!(ensure_recovery_key_matches(&keys, &wrong.public_key).is_err());
         assert!(ensure_recovery_key_matches(&keys, &right.public_key).is_ok());
+    }
+
+    #[test]
+    fn legacy_start_message_matches_sdk() {
+        let custody_hash = TreeHash::new([0x11; 32]);
+        let delegated = TreeHash::new([0x22; 32]);
+        let coin_id = Bytes32::new([0x33; 32]);
+        let genesis = Bytes32::new(Network::Testnet11.genesis_challenge());
+        let restrictions = crate::vault::recovery_restrictions(
+            custody_hash,
+            43_200,
+            crate::vault::VaultPuzzleVersion::Legacy,
+        );
+        let ours = start_recovery_message(delegated, &restrictions, coin_id, genesis);
+        let sdk = chia_sdk_driver::calculate_vault_start_recovery_message(
+            delegated.into(),
+            custody_hash.into(),
+            43_200,
+            coin_id,
+            genesis,
+        );
+        assert_eq!(ours, sdk.to_vec());
+
+        let upgraded = crate::vault::recovery_restrictions(
+            custody_hash,
+            43_200,
+            crate::vault::VaultPuzzleVersion::ForceSingletonRecreation,
+        );
+        assert_ne!(
+            start_recovery_message(delegated, &upgraded, coin_id, genesis),
+            sdk.to_vec()
+        );
     }
 }

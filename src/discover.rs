@@ -29,7 +29,9 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::keys::{key_from_mnemonic, public_key_to_hex};
 use crate::mips::{alloc_spend, peel_index_wrapper, peel_vault_mips};
-use crate::vault::{CustodyPath, SignerSet, VaultMemberKey, get_vault_internals};
+use crate::vault::{
+    CustodyPath, SignerSet, VaultMemberKey, VaultPuzzleVersion, get_vault_internals,
+};
 
 /// Common Cloud Wallet / test timelocks, tried when the user does not pass one.
 pub const DEFAULT_TIMELOCK_CANDIDATES: &[u64] = &[
@@ -173,6 +175,7 @@ pub fn reconstruct_config(
     custody: &DiscoveredCustodyPath,
     recovery_mnemonic: &str,
     clawback_timelock: u64,
+    puzzle_version: VaultPuzzleVersion,
 ) -> Result<VaultConfig> {
     if custody.members_complete() {
         let computed = CustodyPath::Signers(SignerSet {
@@ -207,6 +210,7 @@ pub fn reconstruct_config(
             }],
         },
         receive_address: None,
+        puzzle_version,
     })
 }
 
@@ -217,23 +221,26 @@ pub fn reconstruct(
 ) -> Result<ReconstructedVault> {
     let candidates = clawback.candidates();
     for &timelock in &candidates {
-        let config = reconstruct_config(
-            found.launcher_id,
-            &found.custody,
-            recovery_mnemonic,
-            timelock,
-        )?;
-        let ready_match = config_matches_puzzle_hash(&config, found.current_coin.puzzle_hash)?;
-        let ancestor_match = found
-            .ancestor_puzzle_hashes
-            .iter()
-            .any(|ph| config_matches_puzzle_hash(&config, *ph).unwrap_or(false));
-        if ready_match || ancestor_match {
-            return Ok(ReconstructedVault {
-                found: found.clone(),
-                config,
-                matches_current: ready_match,
-            });
+        for puzzle_version in VaultPuzzleVersion::ALL {
+            let config = reconstruct_config(
+                found.launcher_id,
+                &found.custody,
+                recovery_mnemonic,
+                timelock,
+                puzzle_version,
+            )?;
+            let ready_match = config_matches_puzzle_hash(&config, found.current_coin.puzzle_hash)?;
+            let ancestor_match = found
+                .ancestor_puzzle_hashes
+                .iter()
+                .any(|ph| config_matches_puzzle_hash(&config, *ph).unwrap_or(false));
+            if ready_match || ancestor_match {
+                return Ok(ReconstructedVault {
+                    found: found.clone(),
+                    config,
+                    matches_current: ready_match,
+                });
+            }
         }
     }
 
@@ -532,6 +539,7 @@ mod tests {
             &hash_only,
             &recovery.words,
             43_200,
+            VaultPuzzleVersion::Legacy,
         )
         .unwrap();
         assert!(config.custody.members.is_empty());

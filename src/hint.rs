@@ -18,7 +18,7 @@ use clvm_utils::ToTreeHash;
 use clvmr::{Allocator, NodePtr, ObjectType, SExp};
 
 use crate::config::{VaultConfig, VaultConfigRecovery, VaultConfigSide, config_members_from_keys};
-use crate::vault::{VaultMemberKey, get_vault_internals};
+use crate::vault::{VaultMemberKey, VaultPuzzleVersion, get_vault_internals};
 
 const CHIP_NAMESPACE: &[u8] = b"CHIP-0043";
 
@@ -42,14 +42,21 @@ pub fn hinted_config_from_spend(
         else {
             continue;
         };
-        let Ok(keys) = config.to_vault_keys() else {
-            continue;
-        };
-        let Ok(internals) = get_vault_internals(launcher_id, &keys) else {
-            continue;
-        };
-        if internals.full_puzzle_hash == full_puzzle_hash {
-            return Some(config);
+        // The memo layout is the same for every puzzle version; the chain decides which one it is.
+        for puzzle_version in VaultPuzzleVersion::ALL {
+            let config = VaultConfig {
+                puzzle_version,
+                ..config.clone()
+            };
+            let Ok(keys) = config.to_vault_keys() else {
+                continue;
+            };
+            let Ok(internals) = get_vault_internals(launcher_id, &keys) else {
+                continue;
+            };
+            if internals.full_puzzle_hash == full_puzzle_hash {
+                return Some(config);
+            }
         }
     }
     None
@@ -96,6 +103,7 @@ pub fn config_from_mips_memo(
             members: recovery_members,
         },
         receive_address: None,
+        puzzle_version: VaultPuzzleVersion::Legacy,
     })
 }
 
@@ -133,8 +141,8 @@ fn recovery_timelock(
     inner: &InnerPuzzleMemo,
     timelock_candidates: &[u64],
 ) -> Option<u64> {
-    // `enforce_delegated_puzzle_wrappers` stores wrapper inner memos, not
-    // `WrapperMemo` pairs, so `RestrictionMemo::parse` does not see them.
+    // `enforce_delegated_puzzle_wrappers` memos are a list of wrapper memos, so
+    // `RestrictionMemo::parse` does not see them.
     for restriction in &inner.restrictions {
         let Ok(memos) = Vec::<NodePtr>::from_clvm(allocator, restriction.memo) else {
             continue;
@@ -152,14 +160,67 @@ fn timelock_from_wrapper_memos(
     timelock_candidates: &[u64],
 ) -> Option<u64> {
     for ptr in memos {
-        if let Ok(force) = Force1of2RestrictedVariableMemo::from_clvm(allocator, *ptr)
-            && let Some(secs) =
-                timelock_for_list_hash(force.member_validator_list_hash, timelock_candidates)
-        {
-            return Some(secs);
+        // Older Cloud Wallet memos list bare wrapper memos; newer ones list
+        // `(puzzle_hash memo)` wrapper entries.
+        let inner = wrapper_entry_memo(allocator, *ptr);
+        for memo in [Some(*ptr), inner].into_iter().flatten() {
+            if let Some(secs) = force_1_of_2_timelock(allocator, memo, timelock_candidates) {
+                return Some(secs);
+            }
         }
     }
     None
+}
+
+/// The memo of a `(puzzle_hash memo)` wrapper entry.
+fn wrapper_entry_memo(allocator: &Allocator, ptr: NodePtr) -> Option<NodePtr> {
+    let (_puzzle_hash, (memo, ())) = <(Bytes32, (NodePtr, ()))>::from_clvm(allocator, ptr).ok()?;
+    Some(memo)
+}
+
+/// Force1of2 memo that reveals its member validators instead of committing to their list hash.
+#[derive(Debug, Clone, FromClvm)]
+#[clvm(list)]
+struct RevealedForce1of2Memo<T> {
+    // Positional fields of the list; only the restrictions are read.
+    _left_side_subtree_hash: Bytes32,
+    _nonce: usize,
+    restrictions: Vec<RevealedRestrictionMemo<T>>,
+}
+
+#[derive(Debug, Clone, FromClvm)]
+#[clvm(list)]
+struct RevealedRestrictionMemo<T> {
+    member_condition_validator: bool,
+    puzzle_hash: Bytes32,
+    memo: T,
+}
+
+fn force_1_of_2_timelock(
+    allocator: &Allocator,
+    memo: NodePtr,
+    timelock_candidates: &[u64],
+) -> Option<u64> {
+    if let Ok(force) = Force1of2RestrictedVariableMemo::from_clvm(allocator, memo) {
+        return timelock_for_list_hash(force.member_validator_list_hash, timelock_candidates);
+    }
+    let force = RevealedForce1of2Memo::<NodePtr>::from_clvm(allocator, memo).ok()?;
+    let [timelock] = force.restrictions.as_slice() else {
+        return None;
+    };
+    if !timelock.member_condition_validator {
+        return None;
+    }
+    let target = clvm_utils::TreeHash::from(timelock.puzzle_hash);
+    if let Ok(secs) = u64::from_clvm(allocator, timelock.memo)
+        && Timelock::new(secs).curry_tree_hash() == target
+    {
+        return Some(secs);
+    }
+    timelock_candidates
+        .iter()
+        .copied()
+        .find(|&secs| Timelock::new(secs).curry_tree_hash() == target)
 }
 
 fn timelock_for_list_hash(hash: Bytes32, timelock_candidates: &[u64]) -> Option<u64> {
@@ -255,16 +316,22 @@ fn one_member(allocator: &Allocator, member: &MemberMemo) -> Option<MemoMember> 
 mod tests {
     use chia_bls::SecretKey;
     use chia_protocol::{Bytes32, Coin, CoinSpend};
+    use chia_puzzle_types::singleton::SingletonArgs;
+    use chia_puzzles::PREVENT_MULTIPLE_CREATE_COINS_HASH;
     use chia_sdk_driver::{
         InnerPuzzleMemo, MemberMemo, MemoKind, MipsMemo, MofNMemo, RestrictionMemo, SpendContext,
         WrapperMemo,
     };
     use chia_sdk_test::K1Pair;
     use chia_sdk_types::Mod;
+    use chia_sdk_types::puzzles::{
+        EnforceDelegatedPuzzleWrappers, Force1of2RestrictedVariable, PreventConditionOpcode,
+    };
     use clvm_utils::ToTreeHash;
     use clvmr::NodePtr;
 
     use super::*;
+    use crate::puzzles::FORCE_SINGLETON_RECREATION_HASH;
     use crate::vault::prevent_vault_side_effect_opcodes;
 
     fn cloud_wallet_memo(
@@ -307,6 +374,94 @@ mod tests {
         }
         wrappers.push(WrapperMemo::prevent_multiple_create_coins());
         RestrictionMemo::enforce_delegated_puzzle_wrappers(ctx, &wrappers).unwrap()
+    }
+
+    /// Current Cloud Wallet memo: `(puzzle_hash memo)` wrapper entries, a Force1of2 memo that
+    /// reveals its timelock, and force-singleton-recreation on upgraded vaults.
+    fn revealed_cloud_wallet_memo(
+        ctx: &mut SpendContext,
+        custody: chia_secp::K1PublicKey,
+        recovery: chia_bls::PublicKey,
+        timelock: u64,
+        puzzle_version: VaultPuzzleVersion,
+    ) -> MipsMemo {
+        let custody_member = MemberMemo::k1(ctx, custody, true, true).unwrap();
+        let custody_inner = InnerPuzzleMemo::new(0, vec![], MemoKind::Member(custody_member));
+        let custody_hash = custody_inner.inner_puzzle_hash(false);
+
+        let timelock_hash: Bytes32 = Timelock::new(timelock).curry_tree_hash().into();
+        let force_hash: Bytes32 = Force1of2RestrictedVariable::new(
+            custody_hash.into(),
+            0,
+            vec![Timelock::new(timelock).curry_tree_hash()]
+                .tree_hash()
+                .into(),
+            ().tree_hash().into(),
+        )
+        .curry_tree_hash()
+        .into();
+        let force_memo = ctx
+            .alloc(&(
+                Bytes32::from(custody_hash),
+                (0, (vec![(true, (timelock_hash, (timelock, ())))], ())),
+            ))
+            .unwrap();
+
+        let mut entries = vec![(force_hash, force_memo)];
+        for opcode in prevent_vault_side_effect_opcodes() {
+            let ph = PreventConditionOpcode::new(opcode).curry_tree_hash().into();
+            entries.push((ph, ctx.alloc(&opcode).unwrap()));
+        }
+        entries.push((PREVENT_MULTIPLE_CREATE_COINS_HASH.into(), NodePtr::NIL));
+        if puzzle_version == VaultPuzzleVersion::ForceSingletonRecreation {
+            entries.push((FORCE_SINGLETON_RECREATION_HASH.into(), NodePtr::NIL));
+        }
+        let stack: Vec<clvm_utils::TreeHash> = entries.iter().map(|(ph, _)| (*ph).into()).collect();
+        let entry_memos: Vec<(Bytes32, (NodePtr, ()))> = entries
+            .iter()
+            .map(|(ph, memo)| (*ph, (*memo, ())))
+            .collect();
+        let restriction = RestrictionMemo::new(
+            false,
+            EnforceDelegatedPuzzleWrappers::new(&stack)
+                .curry_tree_hash()
+                .into(),
+            ctx.alloc(&entry_memos).unwrap(),
+        );
+
+        let recovery_member = MemberMemo::bls(ctx, recovery, false, false, true).unwrap();
+        let recovery_inner =
+            InnerPuzzleMemo::new(0, vec![restriction], MemoKind::Member(recovery_member));
+        MipsMemo::new(InnerPuzzleMemo::new(
+            0,
+            vec![],
+            MemoKind::MofN(MofNMemo::new(1, vec![custody_inner, recovery_inner])),
+        ))
+    }
+
+    #[rstest::rstest]
+    #[case::legacy(VaultPuzzleVersion::Legacy)]
+    #[case::force_singleton_recreation(VaultPuzzleVersion::ForceSingletonRecreation)]
+    fn revealed_memo_selects_puzzle_version_from_chain(#[case] puzzle_version: VaultPuzzleVersion) {
+        let mut ctx = SpendContext::new();
+        let custody = K1Pair::default();
+        let recovery = SecretKey::from_seed(&[5; 32]).public_key();
+        let launcher = Bytes32::new([0x66; 32]);
+        let memo =
+            revealed_cloud_wallet_memo(&mut ctx, custody.pk, recovery, 43_200, puzzle_version);
+
+        // The revealed timelock is read without needing it in the candidates.
+        let config = config_from_mips_memo(&ctx, launcher, &memo, &[]).expect("hint");
+        assert_eq!(config.recovery.clawback_timelock, 43_200);
+
+        let on_chain = SingletonArgs::curry_tree_hash(launcher, memo.inner_puzzle_hash()).into();
+        let solution = ctx.serialize(&vec![memo]).unwrap();
+        let puzzle = ctx.serialize(&NodePtr::NIL).unwrap();
+        let spend = CoinSpend::new(Coin::new(Bytes32::default(), on_chain, 1), puzzle, solution);
+        let parsed = hinted_config_from_spend(&spend, launcher, on_chain, &[]).expect("hint");
+        assert_eq!(parsed.puzzle_version, puzzle_version);
+        let internals = get_vault_internals(launcher, &parsed.to_vault_keys().unwrap()).unwrap();
+        assert_eq!(internals.full_puzzle_hash, on_chain);
     }
 
     #[test]

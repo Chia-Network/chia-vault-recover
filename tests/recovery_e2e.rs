@@ -6,6 +6,7 @@ use chia_sdk_driver::{InnerPuzzleSpend, Launcher, MipsSpend, SpendContext, Stand
 use chia_sdk_test::{K1Pair, Simulator};
 use chia_sdk_types::Conditions;
 use clvm_utils::TreeHash;
+use rstest::rstest;
 
 use chia_vault_recover::config::VaultConfig;
 use chia_vault_recover::discover::{
@@ -21,8 +22,8 @@ use chia_vault_recover::recovery::{
     start_recovery,
 };
 use chia_vault_recover::vault::{
-    CustodyPath, RecoverySignerSet, SignerSet, VaultKeys, VaultMemberKey, get_vault_internals,
-    recovery_state_hashes,
+    CustodyPath, RecoverySignerSet, SignerSet, VaultKeys, VaultMemberKey, VaultPuzzleVersion,
+    get_vault_internals, recovery_state_hashes,
 };
 
 fn mint_vault(
@@ -39,8 +40,12 @@ fn mint_vault(
     Ok(vault)
 }
 
-#[test]
-fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
+#[rstest]
+#[case::legacy(VaultPuzzleVersion::Legacy)]
+#[case::force_singleton_recreation(VaultPuzzleVersion::ForceSingletonRecreation)]
+fn delayed_recovery_bls_phrase_to_new_bls_custody(
+    #[case] puzzle_version: VaultPuzzleVersion,
+) -> anyhow::Result<()> {
     let mut sim = Simulator::new();
     let ctx = &mut SpendContext::new();
 
@@ -62,6 +67,7 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
             },
             clawback_timelock: 10,
         },
+        puzzle_version,
     };
 
     let prelim = get_vault_internals(chia_protocol::Bytes32::default(), &keys)?;
@@ -92,6 +98,7 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
             }],
         },
         receive_address: None,
+        puzzle_version,
     };
 
     let report = inspect_vault(&config, Some(vault.coin), None)?;
@@ -111,14 +118,13 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
     })?;
 
     assert!(start.generated_recovery_mnemonic.is_some());
+    assert_eq!(start.post_recovery_config.puzzle_version, puzzle_version);
     let serialized = serde_json::to_string(&start.post_recovery_config)?;
     assert!(!serialized.contains(&new_custody.words));
     assert!(!serialized.contains(start.generated_recovery_mnemonic.as_ref().unwrap()));
 
-    sim.spend_coins(
-        start.spend_bundle.coin_spends.clone(),
-        std::slice::from_ref(&recovery.key_pair.secret_key),
-    )?;
+    // Push the bundle as built, so its own aggregated signature is checked.
+    sim.new_transaction(start.spend_bundle.clone())?;
 
     let post_keys = start.post_recovery_config.to_vault_keys()?;
     let post_ready = get_vault_internals(launcher_id, &post_keys)?;
@@ -182,8 +188,12 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn discover_custody_from_previous_spend() -> anyhow::Result<()> {
+#[rstest]
+#[case::legacy(VaultPuzzleVersion::Legacy)]
+#[case::force_singleton_recreation(VaultPuzzleVersion::ForceSingletonRecreation)]
+fn discover_custody_from_previous_spend(
+    #[case] puzzle_version: VaultPuzzleVersion,
+) -> anyhow::Result<()> {
     let mut sim = Simulator::new();
     let ctx = &mut SpendContext::new();
 
@@ -205,6 +215,7 @@ fn discover_custody_from_previous_spend() -> anyhow::Result<()> {
             },
             clawback_timelock: 10,
         },
+        puzzle_version,
     };
 
     let prelim = get_vault_internals(chia_protocol::Bytes32::default(), &keys)?;
@@ -254,7 +265,8 @@ fn discover_custody_from_previous_spend() -> anyhow::Result<()> {
         path.members
     );
 
-    let reconstructed = reconstruct_config(launcher_id, &path, &recovery_words, 10)?;
+    let reconstructed =
+        reconstruct_config(launcher_id, &path, &recovery_words, 10, puzzle_version)?;
     let reconstructed_keys = reconstructed.to_vault_keys()?;
     assert!(matches!(reconstructed_keys.custody, CustodyPath::Hash(_)));
     let reconstructed_ready = get_vault_internals(launcher_id, &reconstructed_keys)?;
@@ -278,6 +290,7 @@ fn discover_custody_from_previous_spend() -> anyhow::Result<()> {
     };
     let rebuilt = reconstruct(&found, &recovery_words, ClawbackGuess::Unknown)?;
     assert_eq!(rebuilt.config.recovery.clawback_timelock, 10);
+    assert_eq!(rebuilt.config.puzzle_version, puzzle_version);
     assert!(rebuilt.found.custody.members_complete());
     assert!(rebuilt.matches_current);
 
@@ -286,7 +299,8 @@ fn discover_custody_from_previous_spend() -> anyhow::Result<()> {
         members: vec![],
         vault_launcher_ids: vec![],
     };
-    let hash_config = reconstruct_config(launcher_id, &hash_only, &recovery_words, 10)?;
+    let hash_config =
+        reconstruct_config(launcher_id, &hash_only, &recovery_words, 10, puzzle_version)?;
     assert!(hash_config.custody.members.is_empty());
     assert!(hash_config.custody.hash.is_some());
     let hash_keys = hash_config.to_vault_keys()?;

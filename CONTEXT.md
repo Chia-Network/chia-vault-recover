@@ -44,6 +44,10 @@ _Avoid_: vault-config, session, save file
 The CHIP-0043 memo Cloud Wallet writes on the vault singleton. It reveals the public custody and recovery layout, including the clawback timelock. Primary source for recovery.
 _Avoid_: download, vault-config export
 
+**Vault puzzle version**:
+Which recovery-branch restrictions the vault uses. LEGACY, or FORCE_SINGLETON_RECREATION for vaults upgraded in Cloud Wallet (a recovery-key spend must recreate the singleton). The hint does not say which; the matching on-chain puzzle hash does. Recovery keeps the version.
+_Avoid_: v2, new vault
+
 **Clawback hint**:
 A user-supplied clawback timelock that has not been checked against the chain (no recovery phrase yet).
 _Avoid_: clawback (unqualified), on-chain recovery hint

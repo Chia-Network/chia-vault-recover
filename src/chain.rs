@@ -174,6 +174,13 @@ impl ChainClient {
             .push_tx(spend_bundle.clone())
             .await
             .map_err(|e| Error::msg(format!("push_tx failed: {e}")))?;
+        // A rejected spend comes back as `success: false` with an `error` and no `status`.
+        if !response.success {
+            return Err(Error::msg(format!(
+                "push_tx rejected: {}",
+                response.error.as_deref().unwrap_or("no error message")
+            )));
+        }
         if let Some(status) = response.status
             && status != "SUCCESS"
         {
