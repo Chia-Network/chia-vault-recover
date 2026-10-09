@@ -29,35 +29,87 @@ fn main() {
     }
 }
 
-/// Stock wgpu, then one more `run_native` that keeps only CPU adapters.
+const SOFTWARE_RENDERER_EXPLANATION: &str = "\
+The graphics driver crashed on the last launch. This launch uses the DirectX 12 \
+software renderer. Delete gui-renderer.crash in the app directory to try the \
+hardware renderer again.";
+
+/// Primary renderer, then one CPU-adapter `run_native` if that returns `Err`.
 ///
-/// The first call uses [`eframe::egui_wgpu::WgpuConfiguration::default`], so
-/// `WGPU_POWER_PREF` still applies. The retry runs only when that call returns
-/// `Err`: a non-CPU adapter was surface-compatible and then `request_device`
-/// failed. Each call gets a new app closure because eframe consumes it.
+/// On Windows the primary instance is DirectX 12 unless `WGPU_BACKEND` is set.
+/// `WGPU_POWER_PREF` still applies, because the first attempt does not install
+/// an adapter selector. A native driver abort never returns here, so Windows
+/// writes `gui-renderer.crash` before `run_native` and the next process skips
+/// to the CPU adapter. Each call gets a new app closure because eframe consumes it.
 fn start_gui(smoke: bool) -> Result<(), String> {
-    startup::write_log("attempt: wgpu");
-    if let Err(err) = run(eframe::NativeOptions::default(), smoke) {
-        let first = format!("wgpu failed: {err}");
-        startup::write_log(&first);
-        startup::write_log("attempt: wgpu cpu");
-        let retry = eframe::NativeOptions {
-            wgpu_options: cpu_wgpu_config(),
-            ..Default::default()
-        };
-        if let Err(err) = run(retry, smoke) {
-            let second = format!("wgpu cpu failed: {err}");
-            startup::write_log(&second);
-            return Err(format!(
-                "{first}\n\n{second}\n\nDetails were saved to:\n{}",
-                startup::log_path().display()
-            ));
+    let marker = read_startup_marker();
+    match startup::plan_from_marker(marker.as_deref()) {
+        startup::StartupPlan::Stop => Err(both_crashed_message()),
+        startup::StartupPlan::Primary => {
+            match run_attempt(startup::AttemptKind::Primary, false, smoke) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    let first = format!("{}: {err}", failure_prefix(startup::AttemptKind::Primary));
+                    startup::write_log(&first);
+                    run_attempt(startup::AttemptKind::Cpu, false, smoke).map_err(|second| {
+                        let cpu =
+                            format!("{}: {second}", failure_prefix(startup::AttemptKind::Cpu));
+                        startup::write_log(&cpu);
+                        format!(
+                            "{first}\n\n{cpu}\n\nDetails were saved to:\n{}",
+                            startup::log_path().display()
+                        )
+                    })
+                }
+            }
+        }
+        startup::StartupPlan::Cpu { explain } => {
+            if explain {
+                startup::write_log(SOFTWARE_RENDERER_EXPLANATION);
+                startup::show_dialog(SOFTWARE_RENDERER_EXPLANATION);
+            }
+            run_attempt(startup::AttemptKind::Cpu, true, smoke).map_err(|err| {
+                let cpu = format!("{}: {err}", failure_prefix(startup::AttemptKind::Cpu));
+                startup::write_log(&cpu);
+                format!(
+                    "{cpu}\n\nDetails were saved to:\n{}",
+                    startup::log_path().display()
+                )
+            })
         }
     }
-    Ok(())
+}
+
+fn run_attempt(
+    kind: startup::AttemptKind,
+    because_hardware_crash: bool,
+    smoke: bool,
+) -> Result<(), String> {
+    arm_crash_marker(kind);
+    startup::write_log(attempt_log(kind));
+    let options = eframe::NativeOptions {
+        wgpu_options: wgpu_config(kind == startup::AttemptKind::Cpu),
+        ..Default::default()
+    };
+    match run(options, smoke) {
+        Ok(()) => {
+            finish_crash_marker(kind, because_hardware_crash, true);
+            Ok(())
+        }
+        Err(err) => {
+            finish_crash_marker(kind, because_hardware_crash, false);
+            Err(err.to_string())
+        }
+    }
 }
 
 fn run(mut options: eframe::NativeOptions, smoke: bool) -> eframe::Result<()> {
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &options.wgpu_options.wgpu_setup {
+        startup::write_log(&format!(
+            "creating wgpu instance backends={:?}",
+            create.instance_descriptor.backends
+        ));
+    }
     options.viewport = egui::ViewportBuilder::default()
         .with_inner_size([720.0, 780.0])
         .with_title(APP_NAME)
@@ -66,18 +118,116 @@ fn run(mut options: eframe::NativeOptions, smoke: bool) -> eframe::Result<()> {
         APP_NAME,
         options,
         Box::new(move |cc| {
+            // `Painter::set_window` configures the surface before this closure.
+            startup::write_log("surface configured");
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app::App::new(smoke)))
+            let app = app::App::new(smoke);
+            startup::write_log("app created");
+            Ok(Box::new(app))
         }),
     )
 }
 
-fn cpu_wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
+fn wgpu_config(cpu_only: bool) -> eframe::egui_wgpu::WgpuConfiguration {
     let mut config = eframe::egui_wgpu::WgpuConfiguration::default();
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut config.wgpu_setup {
+    let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut config.wgpu_setup else {
+        return config;
+    };
+    #[cfg(windows)]
+    {
+        create.instance_descriptor.backends =
+            windows_backends(std::env::var("WGPU_BACKEND").ok().as_deref());
+    }
+    if cpu_only {
         create.native_adapter_selector = Some(Arc::new(select_cpu_adapter));
     }
+    let inner = Arc::clone(&create.device_descriptor);
+    create.device_descriptor = Arc::new(move |adapter| {
+        let info = adapter.get_info();
+        startup::write_log(&format!(
+            "request_device: {} backend={:?} type={:?}",
+            info.name, info.backend, info.device_type
+        ));
+        inner(adapter)
+    });
     config
+}
+
+/// Windows defaults to DX12. A non-empty `WGPU_BACKEND` list still wins.
+#[cfg(any(windows, test))]
+fn windows_backends(wgpu_backend: Option<&str>) -> eframe::wgpu::Backends {
+    match wgpu_backend.map(eframe::wgpu::Backends::from_comma_list) {
+        Some(backends) if !backends.is_empty() => backends,
+        _ => eframe::wgpu::Backends::DX12,
+    }
+}
+
+fn read_startup_marker() -> Option<String> {
+    #[cfg(windows)]
+    {
+        startup::read_crash_marker()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn arm_crash_marker(kind: startup::AttemptKind) {
+    #[cfg(windows)]
+    {
+        let marker = startup::marker_to_write(kind);
+        startup::write_crash_marker(marker);
+        startup::write_log(&format!("crash marker: {marker}"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = kind;
+    }
+}
+
+fn finish_crash_marker(kind: startup::AttemptKind, because_hardware_crash: bool, ok: bool) {
+    let next = startup::marker_after_return(kind, because_hardware_crash, ok);
+    #[cfg(windows)]
+    match next {
+        Some(text) => startup::write_crash_marker(text),
+        None => startup::clear_crash_marker(),
+    }
+    #[cfg(not(windows))]
+    let _ = next;
+}
+
+fn attempt_log(kind: startup::AttemptKind) -> &'static str {
+    #[cfg(windows)]
+    return match kind {
+        startup::AttemptKind::Primary => "attempt: dx12",
+        startup::AttemptKind::Cpu => "attempt: dx12-cpu",
+    };
+    #[cfg(not(windows))]
+    return match kind {
+        startup::AttemptKind::Primary => "attempt: wgpu",
+        startup::AttemptKind::Cpu => "attempt: wgpu cpu",
+    };
+}
+
+fn failure_prefix(kind: startup::AttemptKind) -> &'static str {
+    #[cfg(windows)]
+    return match kind {
+        startup::AttemptKind::Primary => "dx12 failed",
+        startup::AttemptKind::Cpu => "dx12-cpu failed",
+    };
+    #[cfg(not(windows))]
+    return match kind {
+        startup::AttemptKind::Primary => "wgpu failed",
+        startup::AttemptKind::Cpu => "wgpu cpu failed",
+    };
+}
+
+fn both_crashed_message() -> String {
+    format!(
+        "The graphics driver crashed on the last two launches, including the DirectX 12 software renderer.\n\nDelete gui-renderer.crash in the app directory to try again.\n\nDetails were saved to:\n{}",
+        startup::log_path().display()
+    )
 }
 
 fn select_cpu_adapter(
@@ -181,6 +331,26 @@ mod tests {
         }
         assert_eq!(off, bytes.len());
         chunks
+    }
+
+    #[test]
+    fn windows_backend_defaults_to_dx12_and_honors_wgpu_backend() {
+        use eframe::wgpu::Backends;
+
+        assert_eq!(super::windows_backends(None), Backends::DX12);
+        assert_eq!(super::windows_backends(Some("")), Backends::DX12);
+        assert_eq!(
+            super::windows_backends(Some("not-a-backend")),
+            Backends::DX12
+        );
+        assert_eq!(super::windows_backends(Some("dx12")), Backends::DX12);
+        assert_eq!(super::windows_backends(Some("d3d12")), Backends::DX12);
+        assert_eq!(super::windows_backends(Some("vulkan")), Backends::VULKAN);
+        assert_eq!(super::windows_backends(Some("vk")), Backends::VULKAN);
+        assert_eq!(
+            super::windows_backends(Some("dx12, gl")),
+            Backends::DX12 | Backends::GL
+        );
     }
 
     #[test]
