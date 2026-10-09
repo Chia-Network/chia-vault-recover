@@ -1165,6 +1165,7 @@ dependencies = [
  "egui",
  "hex",
  "hex-literal 1.1.0",
+ "log",
  "rand 0.10.3",
  "rfd",
  "rstest 0.27.0",
@@ -1172,6 +1173,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
@@ -1770,6 +1772,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",

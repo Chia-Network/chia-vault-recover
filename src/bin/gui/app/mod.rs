@@ -327,6 +327,11 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if crate::startup::smoke_requested() {
+            crate::startup::mark_smoke_frame();
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.heading("Chia Vault Recover");
