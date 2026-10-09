@@ -95,16 +95,18 @@ pub struct App {
     /// Last inspect / wait guidance (collapsible Details).
     detail: String,
     cache: LookupCache,
+    /// `--smoke`: paint one frame, then close.
+    smoke: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(smoke: bool) -> Self {
         let cache = LookupCache::open();
         let (config_path, post_recovery_path) = default_config_paths();
         let mut app = Self {
@@ -122,6 +124,7 @@ impl App {
             phase: Phase::Lookup,
             detail: String::new(),
             cache,
+            smoke,
         };
         app.resume_from_disk();
         app
@@ -327,8 +330,8 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if crate::startup::smoke_requested() {
-            crate::startup::mark_smoke_frame();
+        if self.smoke {
+            crate::startup::write_log("smoke: first frame");
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }

@@ -174,9 +174,8 @@ runs:
         }
         if ($failed) { exit 1 }
 
-    # Launch the staged GUI the way a double-click would, but with --smoke so
-    # it initializes a renderer, paints one frame, and exits. A panic or a
-    # renderer failure is a non-zero exit; a hang is a timeout.
+    # --smoke paints one frame and exits. Stock wgpu must succeed: a CPU-adapter
+    # retry, a logged failure, a non-zero exit, or a hang fails the job.
     - name: Smoke test the Windows GUI
       if: ${{ contains(inputs.target, 'windows-msvc') }}
       shell: pwsh
@@ -188,11 +187,20 @@ runs:
         }
         $exe = $gui[0]
         $smokeRoot = Join-Path $env:RUNNER_TEMP 'chia-vault-recover-smoke'
-        New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
-        $env:LOCALAPPDATA = $smokeRoot
-        $env:CHIA_VAULT_RECOVER_DIR = Join-Path $smokeRoot 'app'
+        $appDir = Join-Path $smokeRoot 'app'
+        New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+        $env:CHIA_VAULT_RECOVER_DIR = $appDir
         $stdout = Join-Path $smokeRoot 'stdout.txt'
         $stderr = Join-Path $smokeRoot 'stderr.txt'
+        $log = Join-Path $appDir 'gui.log'
+        function Write-SmokeEvidence {
+          Write-Host '----- stdout -----'
+          if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout | Write-Host }
+          Write-Host '----- stderr -----'
+          if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr | Write-Host }
+          Write-Host '----- gui.log -----'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log | Write-Host } else { Write-Host '(missing)' }
+        }
         Write-Host "Launching $($exe.FullName) --smoke"
         $proc = Start-Process -FilePath $exe.FullName -ArgumentList '--smoke' -PassThru `
           -WorkingDirectory $exe.DirectoryName -WindowStyle Normal `
@@ -200,28 +208,37 @@ runs:
         $timeoutMs = 90000
         if (-not $proc.WaitForExit($timeoutMs)) {
           Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          $null = $proc.WaitForExit()
           Write-Host "::error::GUI smoke test did not exit within $($timeoutMs / 1000)s"
-          foreach ($path in @($stdout, $stderr)) {
-            if (Test-Path $path) { Get-Content -Path $path | Write-Host }
-          }
+          Write-SmokeEvidence
           exit 1
         }
+        # WaitForExit(int) can return before redirected output and ExitCode are ready.
+        $null = $proc.WaitForExit()
         Write-Host "smoke exit code: $($proc.ExitCode)"
-        Write-Host '----- stdout -----'
-        if (Test-Path $stdout) { Get-Content -Path $stdout | Write-Host }
-        Write-Host '----- stderr -----'
-        if (Test-Path $stderr) { Get-Content -Path $stderr | Write-Host }
-        $log = Join-Path $smokeRoot 'chia-vault-recover\gui.log'
-        Write-Host '----- gui.log -----'
-        if (Test-Path $log) { Get-Content -Path $log | Write-Host } else { Write-Host '(missing)' }
+        $logText = ''
+        if (Test-Path -LiteralPath $log) {
+          $logText = [string](Get-Content -LiteralPath $log -Raw)
+        }
+        $reasons = @()
         if ($proc.ExitCode -ne 0) {
-          Write-Host "::error::GUI smoke test exited $($proc.ExitCode)"
+          $reasons += "GUI smoke test exited $($proc.ExitCode)"
+        }
+        if ($logText -notmatch 'smoke: first frame') {
+          $reasons += 'GUI smoke test exited without painting a frame'
+        }
+        if ($logText -match 'attempt: wgpu cpu') {
+          $reasons += 'GUI smoke test needed the CPU wgpu retry'
+        }
+        if ($logText -match 'failed:' -or $logText -match 'ERROR:' -or $logText -match 'panic at ' -or $logText -match '(?m)^[0-9]+ panic:') {
+          $reasons += 'GUI smoke test log recorded a failure'
+        }
+        if ($reasons.Count -gt 0) {
+          foreach ($reason in $reasons) { Write-Host "::error::$reason" }
+          Write-SmokeEvidence
           exit 1
         }
-        if (-not (Test-Path $log) -or -not (Select-String -Path $log -Pattern 'smoke: first frame' -Quiet)) {
-          Write-Host '::error::GUI smoke test exited 0 without painting a frame'
-          exit 1
-        }
+        Write-SmokeEvidence
 
     - name: Upload CI artifacts
       uses: actions/upload-artifact@v7

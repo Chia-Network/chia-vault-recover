@@ -1173,7 +1173,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "windows-sys 0.61.2",
  "winresource",
 ]
 
@@ -1772,7 +1771,6 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
- "glow",
  "glutin",
  "glutin-winit",
  "image",
