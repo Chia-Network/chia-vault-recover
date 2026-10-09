@@ -1,0 +1,108 @@
+name: Release build
+description: Build one release target and upload the CI artifact.
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  cache-name:
+    description: Cache segment unique to this target (matrix name)
+    required: true
+  artifact:
+    description: Artifact name suffix, chia-vault-recover-<artifact>
+    required: true
+  layout:
+    description: "suffixed (dist/name-<artifact>) or arch (dist/name, for lipo)"
+    required: true
+  cross:
+    description: "true for the aarch64 CLI-then-GUI build"
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    # actions/cache does not update a key that already hit, so the key must
+    # contain every input that should bust it. Do not add github.sha or
+    # run_id: each entry is ~450 MB and five of them already approach 2 GB.
+    # target/ is cached so unchanged dependency crates stay Fresh. sccache
+    # still covers misses. The root crate links with LTO and is rebuilt from
+    # fingerprints; that link is not what this cache is for.
+    - name: Cache key
+      id: cargo-cache
+      shell: bash
+      run: |
+        rustc_hash="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+        flags_hash="$(printf '%s' "$RUSTFLAGS" | openssl dgst -sha256 | awk '{print $NF}')"
+        lock_hash="$(openssl dgst -sha256 Cargo.lock | awk '{print $NF}')"
+        image="$(printf '%s' "${ImageVersion:-unknown}" | tr -c 'A-Za-z0-9_-' '-')"
+        {
+          echo "rustc=${rustc_hash}"
+          echo "flags=${flags_hash}"
+          echo "lock=${lock_hash}"
+          echo "image=${image}"
+        } >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: cargo-${{ inputs.cache-name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.cargo-cache.outputs.image }}-${{ steps.cargo-cache.outputs.rustc }}-${{ steps.cargo-cache.outputs.flags }}-${{ steps.cargo-cache.outputs.lock }}
+        restore-keys: |
+          cargo-${{ inputs.cache-name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.cargo-cache.outputs.image }}-${{ steps.cargo-cache.outputs.rustc }}-${{ steps.cargo-cache.outputs.flags }}-
+          cargo-${{ inputs.cache-name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.cargo-cache.outputs.image }}-${{ steps.cargo-cache.outputs.rustc }}-
+          cargo-${{ inputs.cache-name }}-${{ runner.os }}-${{ runner.arch }}-
+          cargo-${{ inputs.cache-name }}-
+
+    - uses: mozilla-actions/sccache-action@v0.0.11
+
+    - name: Build
+      if: ${{ inputs.cross != 'true' }}
+      shell: bash
+      run: cargo build --release --target ${{ inputs.target }}
+
+    - name: Build (linux aarch64)
+      if: ${{ inputs.cross == 'true' }}
+      shell: bash
+      run: |
+        # CLI always. GUI may lack cross libs; a GUI failure still leaves the CLI artifact.
+        cargo build --release --target ${{ inputs.target }} --bin chia-vault-recover
+        cargo build --release --target ${{ inputs.target }} --bin chia-vault-recover-gui || \
+          echo "GUI cross-build skipped/failed; CLI artifact still produced"
+
+    - name: Stage artifacts
+      shell: bash
+      run: |
+        mkdir -p dist
+        target_dir="target/${{ inputs.target }}/release"
+        case "${{ inputs.layout }}" in
+          arch)
+            cp "$target_dir/chia-vault-recover" dist/chia-vault-recover
+            cp "$target_dir/chia-vault-recover-gui" dist/chia-vault-recover-gui
+            chmod +x dist/*
+            ;;
+          suffixed)
+            ext=""
+            if [[ "${{ runner.os }}" == "Windows" ]]; then ext=".exe"; fi
+            cp "$target_dir/chia-vault-recover${ext}" "dist/chia-vault-recover-${{ inputs.artifact }}${ext}"
+            if [[ -f "$target_dir/chia-vault-recover-gui${ext}" ]]; then
+              cp "$target_dir/chia-vault-recover-gui${ext}" "dist/chia-vault-recover-gui-${{ inputs.artifact }}${ext}"
+            fi
+            ;;
+          *)
+            echo "::error::layout must be arch or suffixed, got '${{ inputs.layout }}'"
+            exit 1
+            ;;
+        esac
+
+    - name: Upload CI artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: chia-vault-recover-${{ inputs.artifact }}
+        path: dist/*
+        if-no-files-found: error
