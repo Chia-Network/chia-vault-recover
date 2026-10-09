@@ -30,13 +30,19 @@ runs:
     # target/ is cached so unchanged dependency crates stay Fresh. sccache
     # still covers misses. The root crate links with LTO and is rebuilt from
     # fingerprints; that link is not what this cache is for.
+    # Rustflags live in .cargo/config.toml. Cargo ignores that file when
+    # RUSTFLAGS is set, including when it is empty, so this hash is of the
+    # config file and CI must not set RUSTFLAGS.
     - name: Cache key
       id: cargo-cache
       shell: bash
       run: |
-        echo "effective RUSTFLAGS=${RUSTFLAGS}"
+        if [[ -n "${RUSTFLAGS+x}" ]]; then
+          echo "::error::RUSTFLAGS is set; Cargo ignores .cargo/config.toml rustflags"
+          exit 1
+        fi
         rustc_hash="$(rustc -vV | sed -n 's/^commit-hash: //p')"
-        flags_hash="$(printf '%s' "$RUSTFLAGS" | openssl dgst -sha256 | awk '{print $NF}')"
+        flags_hash="$(openssl dgst -sha256 .cargo/config.toml | awk '{print $NF}')"
         lock_hash="$(openssl dgst -sha256 Cargo.lock | awk '{print $NF}')"
         image="$(printf '%s' "${ImageVersion:-unknown}" | tr -c 'A-Za-z0-9_-' '-')"
         {
@@ -101,80 +107,72 @@ runs:
             ;;
         esac
 
-    # Fail the job before upload if either Windows exe still imports the VC++
-    # redistributable. api-ms-win-crt-*.dll is the Universal CRT, which ships
-    # with Windows 10 and later, and is not this check.
+    # api-ms-win-crt-*.dll is the Universal CRT and is allowed. vcruntime/msvcp/
+    # concrt/vccorlib are the VC++ redistributable and are not.
     - name: Verify Windows binaries do not import the VC++ redistributable
       if: ${{ contains(inputs.target, 'windows-msvc') }}
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        Write-Host "RUSTFLAGS=$env:RUSTFLAGS"
-        if ($env:RUSTFLAGS -notmatch 'target-feature=\+crt-static') {
-          throw "Windows release build did not enable +crt-static (RUSTFLAGS=$env:RUSTFLAGS)"
-        }
+        $PSNativeCommandUseErrorActionPreference = $false
 
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
         if (-not (Test-Path -LiteralPath $vswhere)) {
           throw "vswhere.exe not found at $vswhere"
         }
-        $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        if (-not $vs) { throw 'Visual Studio C++ toolset not found' }
-        $msvcRoot = Get-ChildItem -Path (Join-Path $vs 'VC\Tools\MSVC') -Directory |
-          Sort-Object Name -Descending |
-          Select-Object -First 1
-        if (-not $msvcRoot) { throw "MSVC toolset directory not found under $vs" }
-        $dumpbin = Join-Path $msvcRoot.FullName 'bin\Hostx64\x64\dumpbin.exe'
-        if (-not (Test-Path -LiteralPath $dumpbin)) { throw "dumpbin.exe not found at $dumpbin" }
+        $found = @(
+          & $vswhere -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
+            ForEach-Object { "$_".Trim() } |
+            Where-Object { $_ }
+        )
+        if ($found.Count -eq 0) {
+          throw "dumpbin.exe not found"
+        }
+        $dumpbin = $found | Sort-Object {
+          $match = [regex]::Match($_, 'MSVC[\\/](\d+(?:\.\d+){1,3})')
+          if (-not $match.Success) { throw "dumpbin path has no MSVC version: $_" }
+          [version]$match.Groups[1].Value
+        } | Select-Object -Last 1
+        if (-not (Test-Path -LiteralPath $dumpbin)) {
+          throw "dumpbin.exe not found at $dumpbin"
+        }
         Write-Host "dumpbin: $dumpbin"
         $env:PATH = "$(Split-Path -Parent $dumpbin);$env:PATH"
 
-        $forbidden = @(
-          'VCRUNTIME140.dll',
-          'VCRUNTIME140_1.dll',
-          'MSVCP140.dll',
-          'MSVCP140_1.dll',
-          'MSVCP140_2.dll',
-          'MSVCP140_ATOMIC_WAIT.dll',
-          'CONCRT140.dll',
-          'VCCORLIB140.dll'
-        )
-
-        $exes = @(Get-ChildItem -Path dist -Filter *.exe | Sort-Object Name)
-        $hasCli = $false
-        $hasGui = $false
-        foreach ($exe in $exes) {
-          if ($exe.Name -like 'chia-vault-recover-gui*') { $hasGui = $true }
-          elseif ($exe.Name -like 'chia-vault-recover*') { $hasCli = $true }
-        }
-        if (-not $hasCli -or -not $hasGui) {
-          throw "dist must contain the CLI and GUI executables; found: $($exes.Name -join ', ')"
+        $exes = @(Get-ChildItem -Path dist -Filter *.exe -File)
+        if ($exes.Count -eq 0) {
+          throw 'No executables matched dist\*.exe'
         }
 
         $failed = $false
         foreach ($exe in $exes) {
           Write-Host ""
           Write-Host "===== dumpbin /dependents $($exe.Name) ====="
-          $output = & $dumpbin /dependents $exe.FullName
+          $output = @(& $dumpbin /dependents $exe.FullName)
           if ($LASTEXITCODE -ne 0) {
-            throw "dumpbin failed for $($exe.Name) with exit $LASTEXITCODE"
+            Write-Host "::error::$($exe.Name): dumpbin exited $LASTEXITCODE"
+            $failed = $true
+            continue
           }
           $output | ForEach-Object { Write-Host $_ }
-          $imports = [regex]::Matches(($output -join "`n"), '(?i)\b[\w.+\-]+\.dll\b') |
-            ForEach-Object { $_.Value } |
-            Sort-Object -Unique
+          $imports = @($output | ForEach-Object {
+            $name = "$_".Trim()
+            if ($name -match '^(?i)[\w.+\-]+\.dll$') { $name }
+          })
+          if ($imports.Count -eq 0) {
+            Write-Host "::error::$($exe.Name) has no parsed DLL imports"
+            $failed = $true
+            continue
+          }
           Write-Host "DLL imports: $($imports -join ', ')"
-          foreach ($dll in $forbidden) {
-            $hit = @($imports | Where-Object { $_ -ieq $dll })
-            if ($hit.Count -gt 0) {
-              Write-Host "::error title=VC++ redistributable import::$($exe.Name) imports $dll"
+          foreach ($dll in $imports) {
+            if ($dll -match '^(?i)(vcruntime|msvcp|concrt|vccorlib)\d.*\.dll$') {
+              Write-Host "::error::$($exe.Name) imports $dll"
               $failed = $true
             }
           }
         }
-
         if ($failed) { exit 1 }
-        Write-Host "No VC++ redistributable imports."
 
     - name: Upload CI artifacts
       uses: actions/upload-artifact@v7

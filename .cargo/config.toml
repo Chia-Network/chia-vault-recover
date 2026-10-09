@@ -1,0 +1,6 @@
+# Cargo does not merge RUSTFLAGS with these. Do not set RUSTFLAGS in CI.
+[build]
+rustflags = ["-Dwarnings"]
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-Dwarnings", "-C", "target-feature=+crt-static"]

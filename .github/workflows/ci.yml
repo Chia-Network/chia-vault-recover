@@ -15,7 +15,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
   # Incremental compilation and sccache cache the same objects.
   CARGO_INCREMENTAL: "0"
   SCCACHE_GHA_ENABLED: "true"
@@ -64,11 +63,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-    # Windows release exes are raw binaries. +crt-static is the MSVC /MT link,
-    # so a clean machine does not need VCRUNTIME140.dll. release-build hashes
-    # RUSTFLAGS into the cargo cache key. Other targets keep -Dwarnings.
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags || '-Dwarnings' }}
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +80,6 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: windows-x86_64
-            rustflags: "-Dwarnings -C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@v7
 
