@@ -1165,6 +1165,7 @@ dependencies = [
  "egui",
  "hex",
  "hex-literal 1.1.0",
+ "log",
  "rand 0.10.3",
  "rfd",
  "rstest 0.27.0",

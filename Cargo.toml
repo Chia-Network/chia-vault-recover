@@ -42,6 +42,7 @@ clvm-utils = "0.36"
 clvmr = "0.16"
 eframe = { version = "0.36", default-features = true }
 egui = "0.36"
+log = "0.4"
 hex = "0.4"
 rand = "0.10"
 rfd = "0.17"
