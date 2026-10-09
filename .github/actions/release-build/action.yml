@@ -30,12 +30,19 @@ runs:
     # target/ is cached so unchanged dependency crates stay Fresh. sccache
     # still covers misses. The root crate links with LTO and is rebuilt from
     # fingerprints; that link is not what this cache is for.
+    # Rustflags live in .cargo/config.toml. Cargo ignores that file when
+    # RUSTFLAGS is set, including when it is empty, so this hash is of the
+    # config file and CI must not set RUSTFLAGS.
     - name: Cache key
       id: cargo-cache
       shell: bash
       run: |
+        if [[ -n "${RUSTFLAGS+x}" ]]; then
+          echo "::error::RUSTFLAGS is set; Cargo ignores .cargo/config.toml rustflags"
+          exit 1
+        fi
         rustc_hash="$(rustc -vV | sed -n 's/^commit-hash: //p')"
-        flags_hash="$(printf '%s' "$RUSTFLAGS" | openssl dgst -sha256 | awk '{print $NF}')"
+        flags_hash="$(openssl dgst -sha256 .cargo/config.toml | awk '{print $NF}')"
         lock_hash="$(openssl dgst -sha256 Cargo.lock | awk '{print $NF}')"
         image="$(printf '%s' "${ImageVersion:-unknown}" | tr -c 'A-Za-z0-9_-' '-')"
         {
@@ -99,6 +106,73 @@ runs:
             exit 1
             ;;
         esac
+
+    # api-ms-win-crt-*.dll is the Universal CRT and is allowed. vcruntime/msvcp/
+    # concrt/vccorlib are the VC++ redistributable and are not.
+    - name: Verify Windows binaries do not import the VC++ redistributable
+      if: ${{ contains(inputs.target, 'windows-msvc') }}
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $false
+
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (-not (Test-Path -LiteralPath $vswhere)) {
+          throw "vswhere.exe not found at $vswhere"
+        }
+        $found = @(
+          & $vswhere -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
+            ForEach-Object { "$_".Trim() } |
+            Where-Object { $_ }
+        )
+        if ($found.Count -eq 0) {
+          throw "dumpbin.exe not found"
+        }
+        $dumpbin = $found | Sort-Object {
+          $match = [regex]::Match($_, 'MSVC[\\/](\d+(?:\.\d+){1,3})')
+          if (-not $match.Success) { throw "dumpbin path has no MSVC version: $_" }
+          [version]$match.Groups[1].Value
+        } | Select-Object -Last 1
+        if (-not (Test-Path -LiteralPath $dumpbin)) {
+          throw "dumpbin.exe not found at $dumpbin"
+        }
+        Write-Host "dumpbin: $dumpbin"
+        $env:PATH = "$(Split-Path -Parent $dumpbin);$env:PATH"
+
+        $exes = @(Get-ChildItem -Path dist -Filter *.exe -File)
+        if ($exes.Count -eq 0) {
+          throw 'No executables matched dist\*.exe'
+        }
+
+        $failed = $false
+        foreach ($exe in $exes) {
+          Write-Host ""
+          Write-Host "===== dumpbin /dependents $($exe.Name) ====="
+          $output = @(& $dumpbin /dependents $exe.FullName)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::$($exe.Name): dumpbin exited $LASTEXITCODE"
+            $failed = $true
+            continue
+          }
+          $output | ForEach-Object { Write-Host $_ }
+          $imports = @($output | ForEach-Object {
+            $name = "$_".Trim()
+            if ($name -match '^(?i)[\w.+\-]+\.dll$') { $name }
+          })
+          if ($imports.Count -eq 0) {
+            Write-Host "::error::$($exe.Name) has no parsed DLL imports"
+            $failed = $true
+            continue
+          }
+          Write-Host "DLL imports: $($imports -join ', ')"
+          foreach ($dll in $imports) {
+            if ($dll -match '^(?i)(vcruntime|msvcp|concrt|vccorlib)\d.*\.dll$') {
+              Write-Host "::error::$($exe.Name) imports $dll"
+              $failed = $true
+            }
+          }
+        }
+        if ($failed) { exit 1 }
 
     - name: Upload CI artifacts
       uses: actions/upload-artifact@v7

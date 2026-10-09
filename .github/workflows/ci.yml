@@ -15,7 +15,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
   # Incremental compilation and sccache cache the same objects.
   CARGO_INCREMENTAL: "0"
   SCCACHE_GHA_ENABLED: "true"
