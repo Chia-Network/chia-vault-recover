@@ -175,9 +175,8 @@ runs:
         if ($failed) { exit 1 }
 
     # --smoke paints one frame and exits. The DirectX 12 attempt must succeed:
-    # a CPU-adapter retry, a logged failure, a leftover crash marker, a non-zero
-    # exit, or a hang fails the job. The runner has no Intel GPU; WARP on the
-    # first attempt is success.
+    # a CPU-adapter retry, a logged failure, a non-zero exit, or a hang fails
+    # the job. The runner has no Intel GPU; WARP on the first attempt is success.
     - name: Smoke test the Windows GUI
       if: ${{ contains(inputs.target, 'windows-msvc') }}
       shell: pwsh
@@ -195,7 +194,6 @@ runs:
         $stdout = Join-Path $smokeRoot 'stdout.txt'
         $stderr = Join-Path $smokeRoot 'stderr.txt'
         $log = Join-Path $appDir 'gui.log'
-        $crashMarker = Join-Path $appDir 'gui-renderer.crash'
         function Write-SmokeEvidence {
           Write-Host '----- stdout -----'
           if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout | Write-Host }
@@ -241,12 +239,6 @@ runs:
         }
         if ($logText -match 'attempt: dx12-cpu') {
           $reasons += 'GUI smoke test needed the CPU renderer fallback'
-        }
-        if ($logText -match 'unhandled exception') {
-          $reasons += 'GUI smoke test recorded a native exception'
-        }
-        if (Test-Path -LiteralPath $crashMarker) {
-          $reasons += 'GUI smoke test left a renderer crash marker'
         }
         if ($logText -match 'failed:' -or $logText -match 'ERROR:' -or $logText -match 'panic at ' -or $logText -match '(?m)^[0-9]+ panic:') {
           $reasons += 'GUI smoke test log recorded a failure'
