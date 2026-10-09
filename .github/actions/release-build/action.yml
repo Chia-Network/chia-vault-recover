@@ -174,8 +174,9 @@ runs:
         }
         if ($failed) { exit 1 }
 
-    # --smoke paints one frame and exits. Stock wgpu must succeed: a CPU-adapter
-    # retry, a logged failure, a non-zero exit, or a hang fails the job.
+    # --smoke paints one frame and exits. The DirectX 12 attempt must succeed:
+    # a CPU-adapter retry, a logged failure, a non-zero exit, or a hang fails
+    # the job. The runner has no Intel GPU; WARP on the first attempt is success.
     - name: Smoke test the Windows GUI
       if: ${{ contains(inputs.target, 'windows-msvc') }}
       shell: pwsh
@@ -227,8 +228,17 @@ runs:
         if ($logText -notmatch 'smoke: first frame') {
           $reasons += 'GUI smoke test exited without painting a frame'
         }
-        if ($logText -match 'attempt: wgpu cpu') {
-          $reasons += 'GUI smoke test needed the CPU wgpu retry'
+        if ($logText -notmatch '(?m)^[0-9]+ attempt: dx12$') {
+          $reasons += 'GUI smoke test did not log the DirectX 12 attempt'
+        }
+        if ($logText -notmatch '(?m)^[0-9]+ request_device: ') {
+          $reasons += 'GUI smoke test did not log device creation'
+        }
+        if ($logText -notmatch '(?m)^[0-9]+ first frame$') {
+          $reasons += 'GUI smoke test did not log the first frame'
+        }
+        if ($logText -match 'attempt: dx12-cpu') {
+          $reasons += 'GUI smoke test needed the CPU renderer fallback'
         }
         if ($logText -match 'failed:' -or $logText -match 'ERROR:' -or $logText -match 'panic at ' -or $logText -match '(?m)^[0-9]+ panic:') {
           $reasons += 'GUI smoke test log recorded a failure'

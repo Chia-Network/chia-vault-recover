@@ -97,6 +97,7 @@ pub struct App {
     cache: LookupCache,
     /// `--smoke`: paint one frame, then close.
     smoke: bool,
+    logged_first_frame: bool,
 }
 
 impl Default for App {
@@ -125,6 +126,7 @@ impl App {
             detail: String::new(),
             cache,
             smoke,
+            logged_first_frame: false,
         };
         app.resume_from_disk();
         app
@@ -330,6 +332,10 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.logged_first_frame {
+            self.logged_first_frame = true;
+            crate::startup::write_log("first frame");
+        }
         if self.smoke {
             crate::startup::write_log("smoke: first frame");
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

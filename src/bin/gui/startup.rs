@@ -12,12 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn install() {
+    enable_rust_backtrace();
     log::set_max_level(log::LevelFilter::Info);
     let _ = log::set_boxed_logger(Box::new(FileLog));
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let message = panic_message(info);
         write_log(&message);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        write_log(&format!("{backtrace}"));
         show_dialog(&message);
         previous(info);
     }));
@@ -43,6 +46,7 @@ pub fn write_log(message: &str) {
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{line}");
+        let _ = file.sync_all();
     }
 }
 
@@ -50,6 +54,13 @@ pub fn fail(message: &str) -> ! {
     write_log(message);
     show_dialog(message);
     std::process::exit(1);
+}
+
+fn enable_rust_backtrace() {
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // Safety: GUI startup, on the main thread, before any other thread exists.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
 }
 
 fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {

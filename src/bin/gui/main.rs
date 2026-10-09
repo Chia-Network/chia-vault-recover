@@ -29,24 +29,20 @@ fn main() {
     }
 }
 
-/// Stock wgpu, then one more `run_native` that keeps only CPU adapters.
+/// DirectX 12 on Windows, then one CPU-adapter `run_native` if that returns `Err`.
 ///
-/// The first call uses [`eframe::egui_wgpu::WgpuConfiguration::default`], so
-/// `WGPU_POWER_PREF` still applies. The retry runs only when that call returns
-/// `Err`: a non-CPU adapter was surface-compatible and then `request_device`
-/// failed. Each call gets a new app closure because eframe consumes it.
+/// The first attempt does not install an adapter selector, so `WGPU_POWER_PREF`
+/// still applies. `WGPU_BACKEND` overrides the Windows DX12 default. The retry
+/// runs only when `run_native` returns `Err`. Each call gets a new app closure
+/// because eframe consumes it.
 fn start_gui(smoke: bool) -> Result<(), String> {
-    startup::write_log("attempt: wgpu");
-    if let Err(err) = run(eframe::NativeOptions::default(), smoke) {
-        let first = format!("wgpu failed: {err}");
+    startup::write_log(PRIMARY_ATTEMPT);
+    if let Err(err) = run(native_options(false), smoke) {
+        let first = format!("{PRIMARY_FAILURE}: {err}");
         startup::write_log(&first);
-        startup::write_log("attempt: wgpu cpu");
-        let retry = eframe::NativeOptions {
-            wgpu_options: cpu_wgpu_config(),
-            ..Default::default()
-        };
-        if let Err(err) = run(retry, smoke) {
-            let second = format!("wgpu cpu failed: {err}");
+        startup::write_log(CPU_ATTEMPT);
+        if let Err(err) = run(native_options(true), smoke) {
+            let second = format!("{CPU_FAILURE}: {err}");
             startup::write_log(&second);
             return Err(format!(
                 "{first}\n\n{second}\n\nDetails were saved to:\n{}",
@@ -57,7 +53,37 @@ fn start_gui(smoke: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn native_options(cpu_only: bool) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        wgpu_options: wgpu_config(cpu_only),
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+const PRIMARY_ATTEMPT: &str = "attempt: dx12";
+#[cfg(not(windows))]
+const PRIMARY_ATTEMPT: &str = "attempt: wgpu";
+#[cfg(windows)]
+const CPU_ATTEMPT: &str = "attempt: dx12-cpu";
+#[cfg(not(windows))]
+const CPU_ATTEMPT: &str = "attempt: wgpu cpu";
+#[cfg(windows)]
+const PRIMARY_FAILURE: &str = "dx12 failed";
+#[cfg(not(windows))]
+const PRIMARY_FAILURE: &str = "wgpu failed";
+#[cfg(windows)]
+const CPU_FAILURE: &str = "dx12-cpu failed";
+#[cfg(not(windows))]
+const CPU_FAILURE: &str = "wgpu cpu failed";
+
 fn run(mut options: eframe::NativeOptions, smoke: bool) -> eframe::Result<()> {
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &options.wgpu_options.wgpu_setup {
+        startup::write_log(&format!(
+            "creating wgpu instance backends={:?}",
+            create.instance_descriptor.backends
+        ));
+    }
     options.viewport = egui::ViewportBuilder::default()
         .with_inner_size([720.0, 780.0])
         .with_title(APP_NAME)
@@ -66,18 +92,48 @@ fn run(mut options: eframe::NativeOptions, smoke: bool) -> eframe::Result<()> {
         APP_NAME,
         options,
         Box::new(move |cc| {
+            // `Painter::set_window` configures the surface before this closure.
+            startup::write_log("surface configured");
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app::App::new(smoke)))
+            let app = app::App::new(smoke);
+            startup::write_log("app created");
+            Ok(Box::new(app))
         }),
     )
 }
 
-fn cpu_wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
+fn wgpu_config(cpu_only: bool) -> eframe::egui_wgpu::WgpuConfiguration {
     let mut config = eframe::egui_wgpu::WgpuConfiguration::default();
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut config.wgpu_setup {
+    let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut config.wgpu_setup else {
+        return config;
+    };
+    #[cfg(windows)]
+    {
+        create.instance_descriptor.backends =
+            windows_backends(std::env::var("WGPU_BACKEND").ok().as_deref());
+    }
+    if cpu_only {
         create.native_adapter_selector = Some(Arc::new(select_cpu_adapter));
     }
+    let inner = Arc::clone(&create.device_descriptor);
+    create.device_descriptor = Arc::new(move |adapter| {
+        let info = adapter.get_info();
+        startup::write_log(&format!(
+            "request_device: {} backend={:?} type={:?}",
+            info.name, info.backend, info.device_type
+        ));
+        inner(adapter)
+    });
     config
+}
+
+/// Windows defaults to DX12. A non-empty `WGPU_BACKEND` list still wins.
+#[cfg(any(windows, test))]
+fn windows_backends(wgpu_backend: Option<&str>) -> eframe::wgpu::Backends {
+    match wgpu_backend.map(eframe::wgpu::Backends::from_comma_list) {
+        Some(backends) if !backends.is_empty() => backends,
+        _ => eframe::wgpu::Backends::DX12,
+    }
 }
 
 fn select_cpu_adapter(
@@ -181,6 +237,26 @@ mod tests {
         }
         assert_eq!(off, bytes.len());
         chunks
+    }
+
+    #[test]
+    fn windows_backend_defaults_to_dx12_and_honors_wgpu_backend() {
+        use eframe::wgpu::Backends;
+
+        assert_eq!(super::windows_backends(None), Backends::DX12);
+        assert_eq!(super::windows_backends(Some("")), Backends::DX12);
+        assert_eq!(
+            super::windows_backends(Some("not-a-backend")),
+            Backends::DX12
+        );
+        assert_eq!(super::windows_backends(Some("dx12")), Backends::DX12);
+        assert_eq!(super::windows_backends(Some("d3d12")), Backends::DX12);
+        assert_eq!(super::windows_backends(Some("vulkan")), Backends::VULKAN);
+        assert_eq!(super::windows_backends(Some("vk")), Backends::VULKAN);
+        assert_eq!(
+            super::windows_backends(Some("dx12, gl")),
+            Backends::DX12 | Backends::GL
+        );
     }
 
     #[test]
