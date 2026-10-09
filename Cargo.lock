@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "chia-vault-recover"
-version = "1.0.0-rc7"
+version = "1.0.0-rc8"
 dependencies = [
  "anyhow",
  "bech32",
