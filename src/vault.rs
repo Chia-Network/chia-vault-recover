@@ -18,6 +18,7 @@ use clvm_utils::{ToTreeHash, TreeHash};
 use clvmr::NodePtr;
 
 use crate::error::{Error, Result};
+use crate::finish_member::{empty_delegated_spend, pinned_member};
 
 #[derive(Debug, Clone)]
 pub enum VaultMemberKey {
@@ -77,7 +78,24 @@ pub struct VaultInternals {
 #[derive(Debug, Clone)]
 pub struct RecoveryStateHashes {
     pub internals: VaultInternals,
-    pub finish_delegated_puzzle_hash: TreeHash,
+    /// Puzzle hash of the right-hand finish member.
+    pub finish_member_hash: TreeHash,
+}
+
+/// How the finish member is bound to the delegated puzzle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryLayout {
+    /// Returns the recreation conditions when the delegated puzzle hash matches.
+    Pinned,
+    /// The member is the quoted recreation conditions.
+    Quoted,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedFinish {
+    pub state: RecoveryStateHashes,
+    pub member: Spend,
+    pub delegated: Spend,
 }
 
 pub fn get_vault_internals(launcher_id: Bytes32, keys: &VaultKeys) -> Result<VaultInternals> {
@@ -98,28 +116,81 @@ pub fn get_vault_internals(launcher_id: Bytes32, keys: &VaultKeys) -> Result<Vau
     })
 }
 
-/// Compute RECOVERY-state puzzle hashes committed to `post_recovery_inner`.
+/// Compute pinned RECOVERY-state puzzle hashes committed to `post_recovery_inner`.
 pub fn recovery_state_hashes(
     launcher_id: Bytes32,
     keys: &VaultKeys,
     post_recovery_inner: TreeHash,
     amount: u64,
 ) -> Result<RecoveryStateHashes> {
-    let mut ctx = SpendContext::new();
-    let finish = finish_delegated_spend(
-        &mut ctx,
+    recovery_state_for(
+        launcher_id,
+        keys,
         post_recovery_inner,
-        keys.recovery.clawback_timelock,
         amount,
-    )?;
-    let finish_delegated_puzzle_hash = ctx.tree_hash(finish.puzzle);
-    recovery_state_from_finish_hash(launcher_id, keys, finish_delegated_puzzle_hash)
+        RecoveryLayout::Pinned,
+    )
 }
 
-fn recovery_state_from_finish_hash(
+pub(crate) fn recovery_state_for(
     launcher_id: Bytes32,
     keys: &VaultKeys,
-    finish_delegated_puzzle_hash: TreeHash,
+    post_recovery_inner: TreeHash,
+    amount: u64,
+    layout: RecoveryLayout,
+) -> Result<RecoveryStateHashes> {
+    let mut ctx = SpendContext::new();
+    Ok(prepare_finish(
+        &mut ctx,
+        launcher_id,
+        keys,
+        post_recovery_inner,
+        amount,
+        layout,
+    )?
+    .state)
+}
+
+/// Allocates the finish member and delegated puzzle for `layout`.
+pub(crate) fn prepare_finish(
+    ctx: &mut SpendContext,
+    launcher_id: Bytes32,
+    keys: &VaultKeys,
+    post_recovery_inner: TreeHash,
+    amount: u64,
+    layout: RecoveryLayout,
+) -> Result<PreparedFinish> {
+    let conditions =
+        recreation_conditions(post_recovery_inner, keys.recovery.clawback_timelock, amount);
+    let (member, delegated) = match layout {
+        RecoveryLayout::Pinned => {
+            let delegated = empty_delegated_spend(ctx)?;
+            let member = pinned_member(ctx, ctx.tree_hash(delegated.puzzle), &conditions)?;
+            (member, delegated)
+        }
+        RecoveryLayout::Quoted => {
+            let member = ctx.delegated_spend(conditions)?;
+            (member, Spend::new(NodePtr::NIL, NodePtr::NIL))
+        }
+    };
+    let state = recovery_state_from_member_hash(launcher_id, keys, ctx.tree_hash(member.puzzle))?;
+    Ok(PreparedFinish {
+        state,
+        member,
+        delegated,
+    })
+}
+
+fn recreation_conditions(post_recovery_inner: TreeHash, timelock: u64, amount: u64) -> Conditions {
+    Conditions::new()
+        .create_coin(post_recovery_inner.into(), amount, Memos::None)
+        .assert_seconds_relative(timelock)
+}
+
+fn recovery_state_from_member_hash(
+    launcher_id: Bytes32,
+    keys: &VaultKeys,
+    finish_member_hash: TreeHash,
 ) -> Result<RecoveryStateHashes> {
     let custody_hash = keys.custody.hash()?;
     let timelock = keys.recovery.clawback_timelock;
@@ -127,12 +198,7 @@ fn recovery_state_from_finish_hash(
         kind: RestrictionKind::MemberCondition,
         puzzle_hash: Timelock::new(timelock).curry_tree_hash(),
     };
-    let recovery_hash = mips_puzzle_hash(
-        0,
-        vec![timelock_restriction],
-        finish_delegated_puzzle_hash,
-        false,
-    );
+    let recovery_hash = mips_puzzle_hash(0, vec![timelock_restriction], finish_member_hash, false);
     let inner_puzzle_hash = top_level_hash(custody_hash, recovery_hash);
     let full_puzzle_hash = SingletonArgs::curry_tree_hash(launcher_id, inner_puzzle_hash).into();
 
@@ -146,39 +212,8 @@ fn recovery_state_from_finish_hash(
             recovery_restrictions: Vec::new(),
             clawback_timelock: timelock,
         },
-        finish_delegated_puzzle_hash,
+        finish_member_hash,
     })
-}
-
-/// Allocates the finish-member delegated spend and returns it with RECOVERY-state hashes.
-pub fn recovery_state_with_finish_spend(
-    ctx: &mut SpendContext,
-    launcher_id: Bytes32,
-    keys: &VaultKeys,
-    post_recovery_inner: TreeHash,
-    amount: u64,
-) -> Result<(RecoveryStateHashes, Spend)> {
-    let finish = finish_delegated_spend(
-        ctx,
-        post_recovery_inner,
-        keys.recovery.clawback_timelock,
-        amount,
-    )?;
-    let finish_ph = ctx.tree_hash(finish.puzzle);
-    let hashes = recovery_state_from_finish_hash(launcher_id, keys, finish_ph)?;
-    Ok((hashes, finish))
-}
-
-pub fn finish_delegated_spend(
-    ctx: &mut SpendContext,
-    post_recovery_inner: TreeHash,
-    timelock: u64,
-    amount: u64,
-) -> Result<Spend> {
-    let conditions = Conditions::new()
-        .create_coin(post_recovery_inner.into(), amount, Memos::None)
-        .assert_seconds_relative(timelock);
-    Ok(ctx.delegated_spend(conditions)?)
 }
 
 /// Side-effect bans used on the READY recovery branch (typed — used for both hash and spend).
@@ -222,7 +257,7 @@ pub fn insert_recovery_restriction_spends(
     mips: &mut chia_sdk_driver::MipsSpend,
     custody_hash: TreeHash,
     clawback_timelock: u64,
-    finish_delegated_puzzle_hash: TreeHash,
+    finish_member_hash: TreeHash,
 ) -> Result<()> {
     let force = Force1of2RestrictedVariable::new(
         custody_hash.into(),
@@ -235,7 +270,7 @@ pub fn insert_recovery_restriction_spends(
     let force_hash = force.curry_tree_hash();
     let force_puzzle = ctx.curry(force)?;
     let force_solution = ctx.alloc(&Force1of2RestrictedVariableSolution::new(
-        finish_delegated_puzzle_hash.into(),
+        finish_member_hash.into(),
     ))?;
     mips.restrictions
         .insert(force_hash, Spend::new(force_puzzle, force_solution));
