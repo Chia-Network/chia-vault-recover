@@ -13,13 +13,22 @@
 //! Against the curried environment `(PUZZLE_HASH CONDITIONS . (delegated_puzzle_hash))`.
 //! `if` is strict, so only the chosen branch is applied:
 //! `(a (i (= 2 11) (q . 5) (q . (x))) 1)`.
+//!
+//! `FixedPuzzleMember` returns nil on a matching hash. The recovery timelock is a member
+//! validator and rejects an empty condition list, so the matching branch returns `CONDITIONS`.
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{Spend, SpendContext};
-use chia_sdk_types::{Conditions, Mod};
+use chia_sdk_types::{
+    Conditions, Mod,
+    puzzles::{
+        EnforceDelegatedPuzzleWrappers, EnforceDelegatedPuzzleWrappersSolution, RestrictionsArgs,
+        RestrictionsSolution,
+    },
+};
 use clvm_traits::{FromClvm, ToClvm};
 use clvm_utils::{TreeHash, tree_hash};
 use clvmr::{Allocator, NodePtr, serde::node_from_bytes};
@@ -73,6 +82,31 @@ pub(crate) fn pinned_member(
         conditions,
     })?;
     Ok(Spend::new(puzzle, NodePtr::NIL))
+}
+
+/// Finish member: opcode-wrapper check, then the condition-returning hash check.
+pub(crate) fn member_spend(
+    ctx: &mut SpendContext,
+    wrapper_stack: &[TreeHash],
+    delegated_puzzle_hash: TreeHash,
+    inner_delegated_puzzle_hash: TreeHash,
+    conditions: &Conditions,
+) -> Result<Spend> {
+    let inner = pinned_member(ctx, delegated_puzzle_hash, conditions)?;
+    let enforce = ctx.curry(EnforceDelegatedPuzzleWrappers::new(wrapper_stack))?;
+    let puzzle = ctx.curry(RestrictionsArgs::new(
+        Vec::<NodePtr>::new(),
+        vec![enforce],
+        inner.puzzle,
+    ))?;
+    let solution = ctx.alloc(&RestrictionsSolution::new(
+        Vec::<NodePtr>::new(),
+        vec![EnforceDelegatedPuzzleWrappersSolution::new(
+            inner_delegated_puzzle_hash.into(),
+        )],
+        NodePtr::NIL,
+    ))?;
+    Ok(Spend::new(puzzle, solution))
 }
 
 #[cfg(test)]

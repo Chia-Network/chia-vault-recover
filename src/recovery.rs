@@ -223,7 +223,6 @@ pub fn finish_recovery(params: FinishRecoveryParams<'_>) -> Result<SpendBundle> 
         &prepared.state.internals,
         prepared.member,
         prepared.delegated,
-        current_keys.recovery.clawback_timelock,
     )
 }
 
@@ -305,7 +304,6 @@ fn build_finish_spend_bundle(
     recovery_state: &crate::vault::VaultInternals,
     member: Spend,
     delegated: Spend,
-    clawback_timelock: u64,
 ) -> Result<SpendBundle> {
     let mut mips = MipsSpend::new(delegated);
 
@@ -319,17 +317,12 @@ fn build_finish_spend_bundle(
         ),
     );
 
-    let timelock = Timelock::new(clawback_timelock);
-    let timelock_restriction = chia_sdk_driver::Restriction {
-        kind: chia_sdk_driver::RestrictionKind::MemberCondition,
-        puzzle_hash: timelock.curry_tree_hash(),
-    };
-
     mips.members.insert(
         recovery_state.recovery_hash,
-        InnerPuzzleSpend::new(0, vec![timelock_restriction], member),
+        InnerPuzzleSpend::new(0, recovery_state.recovery_restrictions.clone(), member),
     );
 
+    let timelock = Timelock::new(recovery_state.clawback_timelock);
     let timelock_puzzle = ctx.curry(timelock)?;
     mips.restrictions.insert(
         timelock.curry_tree_hash(),
@@ -528,7 +521,6 @@ mod finish_tests {
             &prepared.state.internals,
             prepared.member,
             alt,
-            started.keys.recovery.clawback_timelock,
         )?;
         started.sim.pass_time(10);
         assert!(started.sim.spend_coins(rejected.coin_spends, &[]).is_err());
