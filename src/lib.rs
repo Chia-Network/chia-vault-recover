@@ -6,6 +6,7 @@ pub mod chain;
 pub mod config;
 pub mod discover;
 pub mod error;
+mod finish_member;
 pub mod guidance;
 pub mod hint;
 pub mod keys;

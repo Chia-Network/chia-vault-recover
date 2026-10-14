@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use chia_protocol::Coin;
+use chia_protocol::{Bytes32, Coin};
 use chia_puzzle_types::Proof;
 use clvm_utils::TreeHash;
 
@@ -23,7 +23,7 @@ use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
     finish_recovery, inspect_vault, start_recovery,
 };
-use crate::vault::{get_vault_internals, recovery_state_hashes};
+use crate::vault::{VaultKeys, get_vault_internals, recovery_state_hashes};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedVault {
@@ -58,28 +58,9 @@ pub async fn resolve_vault(
 
     if let Some(post) = post_recovery {
         let post_ready = get_vault_internals(launcher_id, &post.to_vault_keys()?)?;
-        // Prefer coin.amount when we find it; for lookup we try amount=1 first (vault singleton).
-        let hashes = recovery_state_hashes(launcher_id, &keys, post_ready.inner_puzzle_hash, 1)?;
-        if let Some(coin) = client
-            .find_unspent_by_puzzle_hash(hashes.internals.full_puzzle_hash)
-            .await?
+        if let Some(coin) =
+            find_recovery_coin(client, launcher_id, &keys, post_ready.inner_puzzle_hash).await?
         {
-            // Recompute with actual amount if it differs (rare for vaults).
-            let hashes = if coin.amount != 1 {
-                recovery_state_hashes(
-                    launcher_id,
-                    &keys,
-                    post_ready.inner_puzzle_hash,
-                    coin.amount,
-                )?
-            } else {
-                hashes
-            };
-            if coin.puzzle_hash != hashes.internals.full_puzzle_hash {
-                return Err(Error::msg(
-                    "found coin amount implies a different RECOVERY puzzle hash",
-                ));
-            }
             let proof = client.lineage_proof_for_coin(&coin).await?;
             return Ok(ResolvedVault {
                 coin,
@@ -110,11 +91,7 @@ pub async fn inspect(
     let post_inner: Option<TreeHash> = if let Some(post) = post_recovery {
         let post_ready = get_vault_internals(launcher_id, &post.to_vault_keys()?)?;
         if coin.is_none() {
-            let amount = 1u64;
-            let hashes =
-                recovery_state_hashes(launcher_id, &keys, post_ready.inner_puzzle_hash, amount)?;
-            coin = client
-                .find_unspent_by_puzzle_hash(hashes.internals.full_puzzle_hash)
+            coin = find_recovery_coin(client, launcher_id, &keys, post_ready.inner_puzzle_hash)
                 .await?;
         }
         Some(post_ready.inner_puzzle_hash)
@@ -123,6 +100,33 @@ pub async fn inspect(
     };
 
     inspect_vault(config, coin, post_inner)
+}
+
+/// Prefer coin.amount when we find it; for lookup we try amount 1 first (vault singleton).
+async fn find_recovery_coin(
+    client: &ChainClient,
+    launcher_id: Bytes32,
+    keys: &VaultKeys,
+    post_inner: TreeHash,
+) -> Result<Option<Coin>> {
+    let hashes = recovery_state_hashes(launcher_id, keys, post_inner, 1)?;
+    let Some(coin) = client
+        .find_unspent_by_puzzle_hash(hashes.internals.full_puzzle_hash)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let hashes = if coin.amount != 1 {
+        recovery_state_hashes(launcher_id, keys, post_inner, coin.amount)?
+    } else {
+        hashes
+    };
+    if coin.puzzle_hash != hashes.internals.full_puzzle_hash {
+        return Err(Error::msg(
+            "found coin amount implies a different RECOVERY puzzle hash",
+        ));
+    }
+    Ok(Some(coin))
 }
 
 pub struct StartWorkflow<'a> {
