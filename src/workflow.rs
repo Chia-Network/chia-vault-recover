@@ -23,7 +23,7 @@ use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
     finish_recovery, inspect_vault, start_recovery,
 };
-use crate::vault::{RecoveryLayout, VaultKeys, get_vault_internals, recovery_state_for};
+use crate::vault::{VaultKeys, get_vault_internals, recovery_state_hashes};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedVault {
@@ -109,27 +109,24 @@ async fn find_recovery_coin(
     keys: &VaultKeys,
     post_inner: TreeHash,
 ) -> Result<Option<Coin>> {
-    for layout in [RecoveryLayout::Pinned, RecoveryLayout::Quoted] {
-        let hashes = recovery_state_for(launcher_id, keys, post_inner, 1, layout)?;
-        let Some(coin) = client
-            .find_unspent_by_puzzle_hash(hashes.internals.full_puzzle_hash)
-            .await?
-        else {
-            continue;
-        };
-        let hashes = if coin.amount != 1 {
-            recovery_state_for(launcher_id, keys, post_inner, coin.amount, layout)?
-        } else {
-            hashes
-        };
-        if coin.puzzle_hash != hashes.internals.full_puzzle_hash {
-            return Err(Error::msg(
-                "found coin amount implies a different RECOVERY puzzle hash",
-            ));
-        }
-        return Ok(Some(coin));
+    let hashes = recovery_state_hashes(launcher_id, keys, post_inner, 1)?;
+    let Some(coin) = client
+        .find_unspent_by_puzzle_hash(hashes.internals.full_puzzle_hash)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let hashes = if coin.amount != 1 {
+        recovery_state_hashes(launcher_id, keys, post_inner, coin.amount)?
+    } else {
+        hashes
+    };
+    if coin.puzzle_hash != hashes.internals.full_puzzle_hash {
+        return Err(Error::msg(
+            "found coin amount implies a different RECOVERY puzzle hash",
+        ));
     }
-    Ok(None)
+    Ok(Some(coin))
 }
 
 pub struct StartWorkflow<'a> {

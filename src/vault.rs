@@ -82,15 +82,6 @@ pub struct RecoveryStateHashes {
     pub finish_member_hash: TreeHash,
 }
 
-/// How the finish member is bound to the delegated puzzle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveryLayout {
-    /// Returns the recreation conditions when the delegated puzzle hash matches.
-    Pinned,
-    /// The member is the quoted recreation conditions.
-    Quoted,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedFinish {
     pub state: RecoveryStateHashes,
@@ -116,63 +107,29 @@ pub fn get_vault_internals(launcher_id: Bytes32, keys: &VaultKeys) -> Result<Vau
     })
 }
 
-/// Compute pinned RECOVERY-state puzzle hashes committed to `post_recovery_inner`.
+/// Compute RECOVERY-state puzzle hashes committed to `post_recovery_inner`.
 pub fn recovery_state_hashes(
     launcher_id: Bytes32,
     keys: &VaultKeys,
     post_recovery_inner: TreeHash,
     amount: u64,
 ) -> Result<RecoveryStateHashes> {
-    recovery_state_for(
-        launcher_id,
-        keys,
-        post_recovery_inner,
-        amount,
-        RecoveryLayout::Pinned,
-    )
-}
-
-pub(crate) fn recovery_state_for(
-    launcher_id: Bytes32,
-    keys: &VaultKeys,
-    post_recovery_inner: TreeHash,
-    amount: u64,
-    layout: RecoveryLayout,
-) -> Result<RecoveryStateHashes> {
     let mut ctx = SpendContext::new();
-    Ok(prepare_finish(
-        &mut ctx,
-        launcher_id,
-        keys,
-        post_recovery_inner,
-        amount,
-        layout,
-    )?
-    .state)
+    Ok(prepare_finish(&mut ctx, launcher_id, keys, post_recovery_inner, amount)?.state)
 }
 
-/// Allocates the finish member and delegated puzzle for `layout`.
+/// Allocates the finish member and its delegated puzzle.
 pub(crate) fn prepare_finish(
     ctx: &mut SpendContext,
     launcher_id: Bytes32,
     keys: &VaultKeys,
     post_recovery_inner: TreeHash,
     amount: u64,
-    layout: RecoveryLayout,
 ) -> Result<PreparedFinish> {
     let conditions =
         recreation_conditions(post_recovery_inner, keys.recovery.clawback_timelock, amount);
-    let (member, delegated) = match layout {
-        RecoveryLayout::Pinned => {
-            let delegated = empty_delegated_spend(ctx)?;
-            let member = pinned_member(ctx, ctx.tree_hash(delegated.puzzle), &conditions)?;
-            (member, delegated)
-        }
-        RecoveryLayout::Quoted => {
-            let member = ctx.delegated_spend(conditions)?;
-            (member, Spend::new(NodePtr::NIL, NodePtr::NIL))
-        }
-    };
+    let delegated = empty_delegated_spend(ctx)?;
+    let member = pinned_member(ctx, ctx.tree_hash(delegated.puzzle), &conditions)?;
     let state = recovery_state_from_member_hash(launcher_id, keys, ctx.tree_hash(member.puzzle))?;
     Ok(PreparedFinish {
         state,

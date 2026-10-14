@@ -16,8 +16,8 @@ use crate::error::{Error, Result};
 use crate::keys::{MnemonicWordCount, generate_mnemonic, key_from_mnemonic};
 use crate::network::Network;
 use crate::vault::{
-    PreparedFinish, RecoveryLayout, VaultKeys, VaultMemberKey, get_vault_internals,
-    insert_recovery_restriction_spends, prepare_finish, recovery_state_for, recovery_state_hashes,
+    VaultKeys, VaultMemberKey, get_vault_internals, insert_recovery_restriction_spends,
+    prepare_finish, recovery_state_hashes,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,29 +80,15 @@ pub fn inspect_vault(
     let keys = config.to_vault_keys()?;
     let ready = get_vault_internals(launcher_id, &keys)?;
 
-    let (pinned_hash, quoted_hash) = if let Some(post_inner) = post_recovery_inner {
+    let expected_recovery_puzzle_hash = if let Some(post_inner) = post_recovery_inner {
         let amount = on_chain_coin.map(|c| c.amount).unwrap_or(1);
-        let pinned = recovery_state_hashes(launcher_id, &keys, post_inner, amount)?
-            .internals
-            .full_puzzle_hash;
-        let quoted = recovery_state_for(
-            launcher_id,
-            &keys,
-            post_inner,
-            amount,
-            RecoveryLayout::Quoted,
-        )?
-        .internals
-        .full_puzzle_hash;
-        (Some(pinned), Some(quoted))
+        Some(
+            recovery_state_hashes(launcher_id, &keys, post_inner, amount)?
+                .internals
+                .full_puzzle_hash,
+        )
     } else {
-        (None, None)
-    };
-    let on_chain_hash = on_chain_coin.map(|c| c.puzzle_hash);
-    let expected_recovery_puzzle_hash = if on_chain_hash == quoted_hash {
-        quoted_hash
-    } else {
-        pinned_hash
+        None
     };
 
     let (phase, guidance) = match &on_chain_coin {
@@ -114,15 +100,11 @@ pub fn inspect_vault(
             VaultPhase::Ready,
             "Vault is READY. Use `start` to begin delayed recovery.".to_string(),
         ),
-        Some(coin)
-            if Some(coin.puzzle_hash) == pinned_hash || Some(coin.puzzle_hash) == quoted_hash =>
-        {
-            (
-                VaultPhase::InRecovery,
-                "Vault is already in RECOVERY. Wait for the clawback timelock, then use `finish`."
-                    .to_string(),
-            )
-        }
+        Some(coin) if Some(coin.puzzle_hash) == expected_recovery_puzzle_hash => (
+            VaultPhase::InRecovery,
+            "Vault is already in RECOVERY. Wait for the clawback timelock, then use `finish`."
+                .to_string(),
+        ),
         Some(_) => (
             VaultPhase::Unknown,
             "On-chain puzzle hash does not match READY (or expected RECOVERY if a post-recovery config was provided)."
@@ -143,13 +125,6 @@ pub fn inspect_vault(
 }
 
 pub fn start_recovery(params: StartRecoveryParams<'_>) -> Result<StartRecoveryResult> {
-    start_with_layout(params, RecoveryLayout::Pinned)
-}
-
-fn start_with_layout(
-    params: StartRecoveryParams<'_>,
-    layout: RecoveryLayout,
-) -> Result<StartRecoveryResult> {
     let launcher_id = params.config.launcher_id_bytes()?;
     let current_keys = params.config.to_vault_keys()?;
     let current = get_vault_internals(launcher_id, &current_keys)?;
@@ -187,7 +162,6 @@ fn start_with_layout(
         &current_keys,
         post_ready.inner_puzzle_hash,
         params.vault_coin.amount,
-        layout,
     )?;
 
     let vault = Vault {
@@ -222,13 +196,20 @@ pub fn finish_recovery(params: FinishRecoveryParams<'_>) -> Result<SpendBundle> 
         get_vault_internals(launcher_id, &params.post_recovery_config.to_vault_keys()?)?;
 
     let mut ctx = SpendContext::new();
-    let prepared = select_finish(
+    let prepared = prepare_finish(
         &mut ctx,
         launcher_id,
         &current_keys,
         post_ready.inner_puzzle_hash,
-        params.vault_coin,
+        params.vault_coin.amount,
     )?;
+    if params.vault_coin.puzzle_hash != prepared.state.internals.full_puzzle_hash {
+        return Err(Error::msg(format!(
+            "vault coin puzzle hash {} does not match expected RECOVERY hash {}",
+            hex::encode(params.vault_coin.puzzle_hash),
+            hex::encode(prepared.state.internals.full_puzzle_hash)
+        )));
+    }
 
     let vault = Vault {
         coin: params.vault_coin,
@@ -244,43 +225,6 @@ pub fn finish_recovery(params: FinishRecoveryParams<'_>) -> Result<SpendBundle> 
         prepared.delegated,
         current_keys.recovery.clawback_timelock,
     )
-}
-
-fn select_finish(
-    ctx: &mut SpendContext,
-    launcher_id: Bytes32,
-    keys: &VaultKeys,
-    post_recovery_inner: TreeHash,
-    vault_coin: Coin,
-) -> Result<PreparedFinish> {
-    let pinned = prepare_finish(
-        ctx,
-        launcher_id,
-        keys,
-        post_recovery_inner,
-        vault_coin.amount,
-        RecoveryLayout::Pinned,
-    )?;
-    if vault_coin.puzzle_hash == pinned.state.internals.full_puzzle_hash {
-        return Ok(pinned);
-    }
-    let quoted = prepare_finish(
-        ctx,
-        launcher_id,
-        keys,
-        post_recovery_inner,
-        vault_coin.amount,
-        RecoveryLayout::Quoted,
-    )?;
-    if vault_coin.puzzle_hash == quoted.state.internals.full_puzzle_hash {
-        return Ok(quoted);
-    }
-    Err(Error::msg(format!(
-        "vault coin puzzle hash {} does not match expected RECOVERY hash {} or {}",
-        hex::encode(vault_coin.puzzle_hash),
-        hex::encode(pinned.state.internals.full_puzzle_hash),
-        hex::encode(quoted.state.internals.full_puzzle_hash)
-    )))
 }
 
 fn ensure_recovery_key_matches(keys: &VaultKeys, pk: &BlsPublicKey) -> Result<()> {
@@ -432,7 +376,7 @@ mod key_match_tests {
 }
 
 #[cfg(test)]
-mod layout_tests {
+mod finish_tests {
     use super::*;
     use chia_sdk_driver::{Launcher, StandardLayer};
     use chia_sdk_test::{K1Pair, Simulator};
@@ -441,7 +385,7 @@ mod layout_tests {
     use crate::config::{Curve, KeyType, VaultConfigMember, VaultConfigRecovery, VaultConfigSide};
     use crate::keys::{MnemonicWordCount, generate_mnemonic, public_key_to_hex};
     use crate::vault::{
-        CustodyPath, RecoverySignerSet, SignerSet, get_vault_internals, recovery_state_for,
+        CustodyPath, RecoverySignerSet, SignerSet, get_vault_internals, recovery_state_hashes,
     };
 
     fn mint_vault(
@@ -467,7 +411,7 @@ mod layout_tests {
         post_inner: TreeHash,
     }
 
-    fn start_layout(layout: RecoveryLayout) -> anyhow::Result<Started> {
+    fn start_on_sim() -> anyhow::Result<Started> {
         let mut sim = Simulator::new();
         let ctx = &mut SpendContext::new();
         let custody = K1Pair::default();
@@ -514,27 +458,24 @@ mod layout_tests {
             receive_address: None,
         };
         let new_custody = generate_mnemonic(MnemonicWordCount::Words24)?;
-        let start = start_with_layout(
-            StartRecoveryParams {
-                config: &config,
-                vault_coin: vault.coin,
-                lineage_proof: vault.proof,
-                recovery_mnemonic: &words,
-                new_custody_mnemonic: &new_custody.words,
-                new_recovery_mnemonic: None,
-                new_clawback_timelock: Some(10),
-                new_word_count: MnemonicWordCount::Words24,
-                network: Network::Testnet11,
-            },
-            layout,
-        )?;
+        let start = start_recovery(StartRecoveryParams {
+            config: &config,
+            vault_coin: vault.coin,
+            lineage_proof: vault.proof,
+            recovery_mnemonic: &words,
+            new_custody_mnemonic: &new_custody.words,
+            new_recovery_mnemonic: None,
+            new_clawback_timelock: Some(10),
+            new_word_count: MnemonicWordCount::Words24,
+            network: Network::Testnet11,
+        })?;
         sim.spend_coins(
             start.spend_bundle.coin_spends,
             std::slice::from_ref(&recovery.key_pair.secret_key),
         )?;
         let post_keys = start.post_recovery_config.to_vault_keys()?;
         let post_inner = get_vault_internals(launcher_id, &post_keys)?.inner_puzzle_hash;
-        let state = recovery_state_for(launcher_id, &keys, post_inner, 1, layout)?;
+        let state = recovery_state_hashes(launcher_id, &keys, post_inner, 1)?;
         assert_eq!(
             state.internals.full_puzzle_hash,
             start.recovery_state_puzzle_hash
@@ -551,7 +492,7 @@ mod layout_tests {
     }
 
     fn nil_program(ctx: &mut SpendContext) -> anyhow::Result<Spend> {
-        // `(i 1 () ())` returns nil and is not the empty quoted puzzle.
+        // `(i 1 () ())` returns nil and is a different puzzle.
         let nil = NodePtr::NIL;
         let one = ctx.new_atom(&[1])?;
         let op_if = ctx.new_atom(&[3])?;
@@ -563,34 +504,8 @@ mod layout_tests {
     }
 
     #[test]
-    fn quoted_layout_still_finishes() -> anyhow::Result<()> {
-        let mut started = start_layout(RecoveryLayout::Quoted)?;
-        let pinned = recovery_state_for(
-            started.config.launcher_id_bytes()?,
-            &started.keys,
-            started.post_inner,
-            1,
-            RecoveryLayout::Pinned,
-        )?;
-        assert_ne!(
-            pinned.internals.full_puzzle_hash,
-            started.child.coin.puzzle_hash
-        );
-        started.sim.pass_time(10);
-        let bundle = finish_recovery(FinishRecoveryParams {
-            config: &started.config,
-            post_recovery_config: &started.post,
-            vault_coin: started.child.coin,
-            lineage_proof: started.child.proof,
-            network: Network::Testnet11,
-        })?;
-        started.sim.spend_coins(bundle.coin_spends, &[])?;
-        Ok(())
-    }
-
-    #[test]
-    fn pinned_finish_runs_only_the_committed_delegated_puzzle() -> anyhow::Result<()> {
-        let mut started = start_layout(RecoveryLayout::Pinned)?;
+    fn finish_rejects_a_different_delegated_puzzle() -> anyhow::Result<()> {
+        let mut started = start_on_sim()?;
         let mut ctx = SpendContext::new();
         let prepared = prepare_finish(
             &mut ctx,
@@ -598,7 +513,6 @@ mod layout_tests {
             &started.keys,
             started.post_inner,
             1,
-            RecoveryLayout::Pinned,
         )?;
         let alt = nil_program(&mut ctx)?;
         let honest = ctx.run(prepared.delegated.puzzle, prepared.delegated.solution)?;
