@@ -6,7 +6,7 @@ use chia_protocol::Coin;
 use chia_puzzle_types::Proof;
 
 use crate::cache::{LookupCache, VaultLookup};
-use crate::chain::ChainClient;
+use crate::chain::{ChainClient, SingletonIndex};
 use crate::config::VaultConfig;
 use crate::discover::{
     ClawbackGuess, DEFAULT_TIMELOCK_CANDIDATES, FoundVault, ReconstructedVault,
@@ -20,12 +20,19 @@ use crate::locate::{parse_vault_locator, resolve_launcher_id};
 use crate::network::Network;
 use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
-    finish_recovery, inspect_vault, start_recovery,
+    classify_singleton, finish_recovery, load_singleton, start_recovery,
 };
 
 /// What `finish` did with a vault that may already have left recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FinishOutcome {
+pub struct FinishOutcome {
+    pub action: FinishAction,
+    /// Present when the confirmed coin is in recovery and also has a mempool spend.
+    pub pending_note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishAction {
     /// Unsigned finish spend was submitted.
     Pushed(String),
     /// The unspent coin is already the recovered custody puzzle.
@@ -67,22 +74,16 @@ pub async fn resolve_vault(
 }
 
 pub async fn inspect(
-    client: &ChainClient,
+    client: &impl SingletonIndex,
     config: &VaultConfig,
     post_recovery: Option<&VaultConfig>,
 ) -> Result<InspectReport> {
     let launcher_id = config.launcher_id_bytes()?;
-    let (_spent, current) = client.walk_singleton_chain(launcher_id).await?;
-    let parent_puzzle_hash = client
-        .get_coin_record(current.coin.parent_coin_info)
-        .await?
-        .map(|record| record.coin.puzzle_hash);
-    inspect_vault(
-        config,
-        Some(current.coin),
-        post_recovery,
-        parent_puzzle_hash,
-    )
+    let observed = load_singleton(client, launcher_id).await?;
+    let pending = client
+        .coin_has_pending_spend(observed.tip.coin.coin_id())
+        .await?;
+    classify_singleton(config, post_recovery, &observed, pending)
 }
 
 pub struct StartWorkflow<'a> {
@@ -128,24 +129,35 @@ pub async fn finish(
     post_recovery: &VaultConfig,
     network: Network,
 ) -> Result<FinishOutcome> {
-    let resolved = resolve_vault(client, config, Some(post_recovery)).await?;
-    match resolved.phase {
+    let report = inspect(client, config, Some(post_recovery)).await?;
+    let pending_note = report.pending_note.clone();
+    let action = match report.phase {
         VaultPhase::InRecovery => {
+            let coin = report
+                .on_chain_coin
+                .ok_or_else(|| Error::msg("vault singleton not found on chain for this config"))?;
+            let proof = client.lineage_proof_for_coin(&coin).await?;
             let bundle = finish_recovery(FinishRecoveryParams {
                 config,
                 post_recovery_config: post_recovery,
-                vault_coin: resolved.coin,
-                lineage_proof: resolved.proof,
+                vault_coin: coin,
+                lineage_proof: proof,
                 network,
             })?;
-            Ok(FinishOutcome::Pushed(client.push_tx(&bundle).await?))
+            FinishAction::Pushed(client.push_tx(&bundle).await?)
         }
-        VaultPhase::Finished => Ok(FinishOutcome::AlreadyFinished),
-        VaultPhase::ClawedBack => Ok(FinishOutcome::ClawedBack),
-        VaultPhase::Ready | VaultPhase::Unknown => Err(Error::msg(
-            "vault is not in RECOVERY state; cannot finish (did start confirm? is post-recovery config correct?)",
-        )),
-    }
+        VaultPhase::Finished => FinishAction::AlreadyFinished,
+        VaultPhase::ClawedBack => FinishAction::ClawedBack,
+        VaultPhase::Ready | VaultPhase::Unknown => {
+            return Err(Error::msg(
+                "vault is not in RECOVERY state; cannot finish (did start confirm? is post-recovery config correct?)",
+            ));
+        }
+    };
+    Ok(FinishOutcome {
+        action,
+        pending_note,
+    })
 }
 
 /// Result of looking up a vault from its receive address (or launcher id).
