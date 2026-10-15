@@ -157,9 +157,21 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
         &config,
         Some(vault_final.coin),
         Some(&start.post_recovery_config),
-        None,
+        Some(vault_after_start.coin.puzzle_hash),
     )?;
     assert_eq!(report_finished.phase, VaultPhase::Finished);
+    let dust = chia_protocol::Coin::new(
+        chia_protocol::Bytes32::new([9; 32]),
+        vault_final.coin.puzzle_hash,
+        1,
+    );
+    let report_dust = inspect_vault(
+        &config,
+        Some(dust),
+        Some(&start.post_recovery_config),
+        Some(chia_protocol::Bytes32::new([8; 32])),
+    )?;
+    assert_ne!(report_dust.phase, VaultPhase::Finished);
 
     let conditions =
         Conditions::new().create_coin(vault_final.info.custody_hash.into(), 1, Memos::None);

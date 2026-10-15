@@ -2,9 +2,8 @@
 
 use std::path::Path;
 
-use chia_protocol::{Bytes32, Coin};
+use chia_protocol::Coin;
 use chia_puzzle_types::Proof;
-use clvm_utils::TreeHash;
 
 use crate::cache::{LookupCache, VaultLookup};
 use crate::chain::ChainClient;
@@ -23,7 +22,6 @@ use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
     finish_recovery, inspect_vault, start_recovery,
 };
-use crate::vault::{VaultKeys, get_vault_internals, recovery_state_hashes};
 
 /// What `finish` did with a vault that may already have left recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,9 +41,9 @@ pub struct ResolvedVault {
     pub phase: VaultPhase,
 }
 
-/// Find the unspent vault singleton and its lineage proof.
+/// Find the live singleton from its launcher and its lineage proof.
 ///
-/// With a post-recovery config, a coin already under either custody configuration is returned as such.
+/// With a post-recovery config, that coin is settled only when its parent is the recovery coin.
 pub async fn resolve_vault(
     client: &ChainClient,
     config: &VaultConfig,
@@ -74,94 +72,17 @@ pub async fn inspect(
     post_recovery: Option<&VaultConfig>,
 ) -> Result<InspectReport> {
     let launcher_id = config.launcher_id_bytes()?;
-    let keys = config.to_vault_keys()?;
-    let ready = get_vault_internals(launcher_id, &keys)?;
-    let observed = observe(
-        client,
-        launcher_id,
-        &keys,
-        ready.full_puzzle_hash,
-        post_recovery,
-    )
-    .await?;
+    let (_spent, current) = client.walk_singleton_chain(launcher_id).await?;
+    let parent_puzzle_hash = client
+        .get_coin_record(current.coin.parent_coin_info)
+        .await?
+        .map(|record| record.coin.puzzle_hash);
     inspect_vault(
         config,
-        observed.coin,
+        Some(current.coin),
         post_recovery,
-        observed.parent_puzzle_hash,
-    )
-}
-
-struct Observed {
-    coin: Option<Coin>,
-    parent_puzzle_hash: Option<Bytes32>,
-}
-
-async fn observe(
-    client: &ChainClient,
-    launcher_id: Bytes32,
-    keys: &VaultKeys,
-    ready_hash: Bytes32,
-    post_recovery: Option<&VaultConfig>,
-) -> Result<Observed> {
-    let post_ready = match post_recovery {
-        Some(post) => Some(get_vault_internals(launcher_id, &post.to_vault_keys()?)?),
-        None => None,
-    };
-
-    let coin = if let Some(ready) = &post_ready
-        && let Some(coin) =
-            find_recovery_coin(client, launcher_id, keys, ready.inner_puzzle_hash).await?
-    {
-        Some(coin)
-    } else if let Some(ready) = &post_ready
-        && let Some(coin) = client
-            .find_unspent_by_puzzle_hash(ready.full_puzzle_hash)
-            .await?
-    {
-        Some(coin)
-    } else {
-        client.find_unspent_by_puzzle_hash(ready_hash).await?
-    };
-
-    let parent_puzzle_hash = match coin.as_ref().filter(|c| c.puzzle_hash == ready_hash) {
-        Some(coin) => client
-            .get_coin_record(coin.parent_coin_info)
-            .await?
-            .map(|record| record.coin.puzzle_hash),
-        None => None,
-    };
-    Ok(Observed {
-        coin,
         parent_puzzle_hash,
-    })
-}
-
-/// Prefer coin.amount when we find it; for lookup we try amount 1 first (vault singleton).
-async fn find_recovery_coin(
-    client: &ChainClient,
-    launcher_id: Bytes32,
-    keys: &VaultKeys,
-    post_inner: TreeHash,
-) -> Result<Option<Coin>> {
-    let hashes = recovery_state_hashes(launcher_id, keys, post_inner, 1)?;
-    let Some(coin) = client
-        .find_unspent_by_puzzle_hash(hashes.internals.full_puzzle_hash)
-        .await?
-    else {
-        return Ok(None);
-    };
-    let hashes = if coin.amount != 1 {
-        recovery_state_hashes(launcher_id, keys, post_inner, coin.amount)?
-    } else {
-        hashes
-    };
-    if coin.puzzle_hash != hashes.internals.full_puzzle_hash {
-        return Err(Error::msg(
-            "found coin amount implies a different RECOVERY puzzle hash",
-        ));
-    }
-    Ok(Some(coin))
+    )
 }
 
 pub struct StartWorkflow<'a> {

@@ -125,38 +125,43 @@ fn phase_of(
     finished_hash: Option<Bytes32>,
     parent_puzzle_hash: Option<Bytes32>,
 ) -> (VaultPhase, &'static str) {
-    match puzzle_hash {
-        None => (
+    let Some(puzzle_hash) = puzzle_hash else {
+        return (
             VaultPhase::Unknown,
             "No unspent vault singleton found for this config.",
-        ),
-        Some(ph) if Some(ph) == recovery_hash => (
+        );
+    };
+    if Some(puzzle_hash) == recovery_hash {
+        return (
             VaultPhase::InRecovery,
             "Vault is already in RECOVERY. Wait for the clawback timelock, then use `finish`.",
-        ),
-        Some(ph) if Some(ph) == finished_hash => (
+        );
+    }
+
+    let parent_is_recovery = recovery_hash.is_some() && parent_puzzle_hash == recovery_hash;
+    let finished_is_distinct = finished_hash.is_some() && finished_hash != Some(ready_hash);
+    if finished_is_distinct && Some(puzzle_hash) == finished_hash && parent_is_recovery {
+        return (
             VaultPhase::Finished,
             "Vault is under the recovered custody configuration.",
-        ),
-        Some(ph)
-            if ph == ready_hash
-                && recovery_hash.is_some()
-                && parent_puzzle_hash == recovery_hash =>
-        {
-            (
-                VaultPhase::ClawedBack,
-                "Vault is under the original custody configuration.",
-            )
-        }
-        Some(ph) if ph == ready_hash => (
+        );
+    }
+    if puzzle_hash == ready_hash && parent_is_recovery {
+        return (
+            VaultPhase::ClawedBack,
+            "Vault is under the original custody configuration.",
+        );
+    }
+    if puzzle_hash == ready_hash {
+        return (
             VaultPhase::Ready,
             "Vault is READY. Use `start` to begin delayed recovery.",
-        ),
-        Some(_) => (
-            VaultPhase::Unknown,
-            "On-chain puzzle hash does not match this config.",
-        ),
+        );
     }
+    (
+        VaultPhase::Unknown,
+        "On-chain puzzle hash does not match this config.",
+    )
 }
 
 pub fn start_recovery(params: StartRecoveryParams<'_>) -> Result<StartRecoveryResult> {
@@ -615,7 +620,7 @@ mod finish_tests {
             &started.config,
             Some(finished.coin),
             Some(&started.post),
-            None,
+            Some(started.child.coin.puzzle_hash),
         )?;
         assert_eq!(report.phase, VaultPhase::Finished);
         Ok(())
@@ -694,6 +699,86 @@ mod finish_tests {
             Some(Bytes32::new([1; 32])),
         )?;
         assert_eq!(still_ready.phase, VaultPhase::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn settled_phase_follows_the_recovery_parent_and_coin_amount() -> anyhow::Result<()> {
+        let started = start_on_sim()?;
+        let launcher = started.config.launcher_id_bytes()?;
+        let ready = get_vault_internals(launcher, &started.keys)?;
+        let post_ready = get_vault_internals(launcher, &started.post.to_vault_keys()?)?;
+        let recovery_parent = started.child.coin.puzzle_hash;
+
+        let dust = Coin::new(Bytes32::new([7; 32]), post_ready.full_puzzle_hash, 1);
+        let dust_report = inspect_vault(
+            &started.config,
+            Some(dust),
+            Some(&started.post),
+            Some(Bytes32::new([8; 32])),
+        )?;
+        assert_ne!(dust_report.phase, VaultPhase::Finished);
+
+        let finished = Coin::new(recovery_parent, post_ready.full_puzzle_hash, 1);
+        let finished_report = inspect_vault(
+            &started.config,
+            Some(finished),
+            Some(&started.post),
+            Some(recovery_parent),
+        )?;
+        assert_eq!(finished_report.phase, VaultPhase::Finished);
+
+        let untouched = Coin::new(Bytes32::new([4; 32]), ready.full_puzzle_hash, 1);
+        let same_hash = inspect_vault(
+            &started.config,
+            Some(untouched),
+            Some(&started.config),
+            Some(Bytes32::new([5; 32])),
+        )?;
+        assert_eq!(same_hash.phase, VaultPhase::Ready);
+
+        let same_inner =
+            recovery_state_hashes(launcher, &started.keys, ready.inner_puzzle_hash, 1)?;
+        let settled = inspect_vault(
+            &started.config,
+            Some(untouched),
+            Some(&started.config),
+            Some(same_inner.internals.full_puzzle_hash),
+        )?;
+        assert_eq!(settled.phase, VaultPhase::ClawedBack);
+        assert_eq!(
+            settled.guidance,
+            "Vault is under the original custody configuration."
+        );
+
+        let at_one = recovery_state_hashes(launcher, &started.keys, started.post_inner, 1)?;
+        let at_three = recovery_state_hashes(launcher, &started.keys, started.post_inner, 3)?;
+        assert_ne!(
+            at_one.internals.full_puzzle_hash,
+            at_three.internals.full_puzzle_hash
+        );
+        let amount_three = Coin::new(
+            Bytes32::new([3; 32]),
+            at_three.internals.full_puzzle_hash,
+            3,
+        );
+        let report_three = inspect_vault(
+            &started.config,
+            Some(amount_three),
+            Some(&started.post),
+            None,
+        )?;
+        assert_eq!(report_three.phase, VaultPhase::InRecovery);
+
+        let amount_one_hash =
+            Coin::new(Bytes32::new([3; 32]), at_one.internals.full_puzzle_hash, 3);
+        let report_mismatch = inspect_vault(
+            &started.config,
+            Some(amount_one_hash),
+            Some(&started.post),
+            None,
+        )?;
+        assert_ne!(report_mismatch.phase, VaultPhase::InRecovery);
         Ok(())
     }
 }
