@@ -25,6 +25,17 @@ use crate::recovery::{
 };
 use crate::vault::{VaultKeys, get_vault_internals, recovery_state_hashes};
 
+/// What `finish` did with a vault that may already have left recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishOutcome {
+    /// Unsigned finish spend was submitted.
+    Pushed(String),
+    /// The unspent coin is already the recovered custody puzzle.
+    AlreadyFinished,
+    /// The unspent coin is the original custody puzzle, created by the recovery coin.
+    ClawedBack,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedVault {
     pub coin: Coin,
@@ -34,45 +45,27 @@ pub struct ResolvedVault {
 
 /// Find the unspent vault singleton and its lineage proof.
 ///
-/// If `post_recovery` is set, also checks the expected RECOVERY puzzle hash when READY is absent.
+/// With a post-recovery config, a coin already under either custody configuration is returned as such.
 pub async fn resolve_vault(
     client: &ChainClient,
     config: &VaultConfig,
     post_recovery: Option<&VaultConfig>,
 ) -> Result<ResolvedVault> {
-    let launcher_id = config.launcher_id_bytes()?;
-    let keys = config.to_vault_keys()?;
-    let ready = get_vault_internals(launcher_id, &keys)?;
-
-    if let Some(coin) = client
-        .find_unspent_by_puzzle_hash(ready.full_puzzle_hash)
-        .await?
-    {
-        let proof = client.lineage_proof_for_coin(&coin).await?;
-        return Ok(ResolvedVault {
-            coin,
-            proof,
-            phase: VaultPhase::Ready,
-        });
+    let report = inspect(client, config, post_recovery).await?;
+    let Some(coin) = report.on_chain_coin else {
+        return Err(Error::msg(
+            "vault singleton not found on chain for this config",
+        ));
+    };
+    if report.phase == VaultPhase::Unknown {
+        return Err(Error::msg("on-chain vault does not match this config"));
     }
-
-    if let Some(post) = post_recovery {
-        let post_ready = get_vault_internals(launcher_id, &post.to_vault_keys()?)?;
-        if let Some(coin) =
-            find_recovery_coin(client, launcher_id, &keys, post_ready.inner_puzzle_hash).await?
-        {
-            let proof = client.lineage_proof_for_coin(&coin).await?;
-            return Ok(ResolvedVault {
-                coin,
-                proof,
-                phase: VaultPhase::InRecovery,
-            });
-        }
-    }
-
-    Err(Error::msg(
-        "vault singleton not found on chain (checked READY; checked RECOVERY if post-recovery config given)",
-    ))
+    let proof = client.lineage_proof_for_coin(&coin).await?;
+    Ok(ResolvedVault {
+        coin,
+        proof,
+        phase: report.phase,
+    })
 }
 
 pub async fn inspect(
@@ -83,23 +76,65 @@ pub async fn inspect(
     let launcher_id = config.launcher_id_bytes()?;
     let keys = config.to_vault_keys()?;
     let ready = get_vault_internals(launcher_id, &keys)?;
+    let observed = observe(
+        client,
+        launcher_id,
+        &keys,
+        ready.full_puzzle_hash,
+        post_recovery,
+    )
+    .await?;
+    inspect_vault(
+        config,
+        observed.coin,
+        post_recovery,
+        observed.parent_puzzle_hash,
+    )
+}
 
-    let mut coin = client
-        .find_unspent_by_puzzle_hash(ready.full_puzzle_hash)
-        .await?;
+struct Observed {
+    coin: Option<Coin>,
+    parent_puzzle_hash: Option<Bytes32>,
+}
 
-    let post_inner: Option<TreeHash> = if let Some(post) = post_recovery {
-        let post_ready = get_vault_internals(launcher_id, &post.to_vault_keys()?)?;
-        if coin.is_none() {
-            coin = find_recovery_coin(client, launcher_id, &keys, post_ready.inner_puzzle_hash)
-                .await?;
-        }
-        Some(post_ready.inner_puzzle_hash)
-    } else {
-        None
+async fn observe(
+    client: &ChainClient,
+    launcher_id: Bytes32,
+    keys: &VaultKeys,
+    ready_hash: Bytes32,
+    post_recovery: Option<&VaultConfig>,
+) -> Result<Observed> {
+    let post_ready = match post_recovery {
+        Some(post) => Some(get_vault_internals(launcher_id, &post.to_vault_keys()?)?),
+        None => None,
     };
 
-    inspect_vault(config, coin, post_inner)
+    let coin = if let Some(ready) = &post_ready
+        && let Some(coin) =
+            find_recovery_coin(client, launcher_id, keys, ready.inner_puzzle_hash).await?
+    {
+        Some(coin)
+    } else if let Some(ready) = &post_ready
+        && let Some(coin) = client
+            .find_unspent_by_puzzle_hash(ready.full_puzzle_hash)
+            .await?
+    {
+        Some(coin)
+    } else {
+        client.find_unspent_by_puzzle_hash(ready_hash).await?
+    };
+
+    let parent_puzzle_hash = match coin.as_ref().filter(|c| c.puzzle_hash == ready_hash) {
+        Some(coin) => client
+            .get_coin_record(coin.parent_coin_info)
+            .await?
+            .map(|record| record.coin.puzzle_hash),
+        None => None,
+    };
+    Ok(Observed {
+        coin,
+        parent_puzzle_hash,
+    })
 }
 
 /// Prefer coin.amount when we find it; for lookup we try amount 1 first (vault singleton).
@@ -171,22 +206,25 @@ pub async fn finish(
     config: &VaultConfig,
     post_recovery: &VaultConfig,
     network: Network,
-) -> Result<String> {
+) -> Result<FinishOutcome> {
     let resolved = resolve_vault(client, config, Some(post_recovery)).await?;
-    if resolved.phase != VaultPhase::InRecovery {
-        return Err(Error::msg(
+    match resolved.phase {
+        VaultPhase::InRecovery => {
+            let bundle = finish_recovery(FinishRecoveryParams {
+                config,
+                post_recovery_config: post_recovery,
+                vault_coin: resolved.coin,
+                lineage_proof: resolved.proof,
+                network,
+            })?;
+            Ok(FinishOutcome::Pushed(client.push_tx(&bundle).await?))
+        }
+        VaultPhase::Finished => Ok(FinishOutcome::AlreadyFinished),
+        VaultPhase::ClawedBack => Ok(FinishOutcome::ClawedBack),
+        VaultPhase::Ready | VaultPhase::Unknown => Err(Error::msg(
             "vault is not in RECOVERY state; cannot finish (did start confirm? is post-recovery config correct?)",
-        ));
+        )),
     }
-
-    let bundle = finish_recovery(FinishRecoveryParams {
-        config,
-        post_recovery_config: post_recovery,
-        vault_coin: resolved.coin,
-        lineage_proof: resolved.proof,
-        network,
-    })?;
-    client.push_tx(&bundle).await
 }
 
 /// Result of looking up a vault from its receive address (or launcher id).

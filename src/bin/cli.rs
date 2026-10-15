@@ -15,7 +15,9 @@ use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
 use chia_vault_recover::recovery::{StartRecoveryResult, VaultPhase};
-use chia_vault_recover::workflow::{self, LookupReport, PreparedStart, StartWorkflow};
+use chia_vault_recover::workflow::{
+    self, FinishOutcome, LookupReport, PreparedStart, StartWorkflow,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -323,8 +325,17 @@ async fn main() -> Result<()> {
             let config = VaultConfig::load(&config)?;
             let post = VaultConfig::load(&post_recovery_config)?;
             let (client, network) = client_for(config.recorded_receive_address()?, backend)?;
-            let handle = workflow::finish(&client, &config, &post, network).await?;
-            println!("pushed finish recovery spend (handle): {handle}");
+            match workflow::finish(&client, &config, &post, network).await? {
+                FinishOutcome::Pushed(handle) => {
+                    println!("pushed finish recovery spend (handle): {handle}");
+                }
+                FinishOutcome::AlreadyFinished => {
+                    println!("vault is under the recovered custody configuration");
+                }
+                FinishOutcome::ClawedBack => {
+                    println!("vault is under the original custody configuration");
+                }
+            }
         }
         Commands::Inspect {
             config,

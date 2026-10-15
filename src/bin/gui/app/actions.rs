@@ -10,8 +10,7 @@ use chia_vault_recover::error::Result;
 use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::Network;
-use chia_vault_recover::recovery::VaultPhase;
-use chia_vault_recover::workflow::{self, LookupReport, StartWorkflow};
+use chia_vault_recover::workflow::{self, FinishOutcome, LookupReport, StartWorkflow};
 
 use crate::session::GuiSession;
 
@@ -152,10 +151,7 @@ impl App {
         let (client, _) = self.chain_client()?;
         let report = runtime().block_on(workflow::inspect(&client, &config, post.as_ref()))?;
         self.detail = report.guidance.clone();
-        self.set_ok(match report.phase {
-            VaultPhase::InRecovery => format!("Phase: InRecovery — {}", report.guidance),
-            phase => format!("Phase: {phase:?}"),
-        });
+        self.set_ok(format!("Phase: {:?} — {}", report.phase, report.guidance));
         Ok(())
     }
 
@@ -263,13 +259,25 @@ impl App {
         let config = VaultConfig::load(&config_path)?;
         let post = VaultConfig::load(&post_path)?;
         let (client, network) = self.chain_client()?;
-        let handle = runtime().block_on(workflow::finish(&client, &config, &post, network))?;
-        GuiSession::clear();
-        self.generated_recovery_mnemonic = None;
-        self.phase = Phase::Done;
-        self.set_ok(format!(
-            "Finish pushed ({handle}). Vault custody is now the new BLS key."
-        ));
+        match runtime().block_on(workflow::finish(&client, &config, &post, network))? {
+            FinishOutcome::Pushed(handle) => {
+                GuiSession::clear();
+                self.generated_recovery_mnemonic = None;
+                self.phase = Phase::Done;
+                self.set_ok(format!(
+                    "Finish pushed ({handle}). Vault custody is now the new BLS key."
+                ));
+            }
+            FinishOutcome::AlreadyFinished => {
+                GuiSession::clear();
+                self.generated_recovery_mnemonic = None;
+                self.phase = Phase::Done;
+                self.set_ok("Vault is under the recovered custody configuration.".to_string());
+            }
+            FinishOutcome::ClawedBack => {
+                self.set_ok("Vault is under the original custody configuration.".to_string());
+            }
+        }
         Ok(())
     }
 }

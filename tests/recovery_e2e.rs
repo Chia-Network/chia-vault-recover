@@ -94,7 +94,7 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
         receive_address: None,
     };
 
-    let report = inspect_vault(&config, Some(vault.coin), None)?;
+    let report = inspect_vault(&config, Some(vault.coin), None, None)?;
     assert_eq!(report.phase, VaultPhase::Ready);
 
     let new_custody = generate_mnemonic(MnemonicWordCount::Words24)?;
@@ -129,13 +129,14 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
     let report2 = inspect_vault(
         &config,
         Some(vault_after_start.coin),
-        Some(post_ready.inner_puzzle_hash),
+        Some(&start.post_recovery_config),
+        None,
     )?;
     assert_eq!(report2.phase, VaultPhase::InRecovery);
     assert!(report2.guidance.contains("finish"));
 
     // Without post-recovery config, mismatched PH must be Unknown (not a guessed InRecovery).
-    let report_unknown = inspect_vault(&config, Some(vault_after_start.coin), None)?;
+    let report_unknown = inspect_vault(&config, Some(vault_after_start.coin), None, None)?;
     assert_eq!(report_unknown.phase, VaultPhase::Unknown);
 
     sim.pass_time(10);
@@ -152,6 +153,13 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
 
     let post_ready = get_vault_internals(launcher_id, &post_keys)?;
     let vault_final = vault_after_start.child(post_ready.inner_puzzle_hash, 1);
+    let report_finished = inspect_vault(
+        &config,
+        Some(vault_final.coin),
+        Some(&start.post_recovery_config),
+        None,
+    )?;
+    assert_eq!(report_finished.phase, VaultPhase::Finished);
 
     let conditions =
         Conditions::new().create_coin(vault_final.info.custody_hash.into(), 1, Memos::None);
