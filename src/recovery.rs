@@ -3,6 +3,7 @@
 use chia_bls::{PublicKey as BlsPublicKey, SecretKey, sign};
 use chia_protocol::{Bytes32, Coin, SpendBundle};
 use chia_puzzle_types::{Memos, Proof};
+use chia_sdk_coinset::CoinRecord;
 use chia_sdk_driver::{
     InnerPuzzleSpend, MipsSpend, Spend, SpendContext, Vault, VaultInfo,
     calculate_vault_start_recovery_message,
@@ -11,6 +12,7 @@ use chia_sdk_types::{Conditions, Mod, puzzles::BlsMember, puzzles::Timelock};
 use clvm_utils::TreeHash;
 use clvmr::NodePtr;
 
+use crate::chain::{SingletonIndex, walk_singleton};
 use crate::config::VaultConfig;
 use crate::error::{Error, Result};
 use crate::keys::{MnemonicWordCount, generate_mnemonic, key_from_mnemonic};
@@ -24,6 +26,10 @@ use crate::vault::{
 pub enum VaultPhase {
     Ready,
     InRecovery,
+    /// Unspent singleton is the post-recovery custody puzzle.
+    Finished,
+    /// Unspent singleton is the original custody puzzle, created by the recovery coin.
+    ClawedBack,
     Unknown,
 }
 
@@ -37,6 +43,38 @@ pub struct InspectReport {
     pub phase: VaultPhase,
     pub clawback_timelock: u64,
     pub guidance: String,
+    /// Set when the confirmed coin has a mempool spend. Does not change `phase`.
+    pub pending_note: Option<String>,
+}
+
+pub(crate) const PENDING_FINISH_OR_CLAWBACK: &str =
+    "A pending spend of this vault is in the mempool and may finish recovery or claw it back.";
+
+/// Confirmed singleton tip and the parent record the walk just read.
+pub(crate) struct ObservedSingleton {
+    pub tip: CoinRecord,
+    pub parent: CoinRecord,
+}
+
+pub(crate) async fn load_singleton(
+    index: &impl SingletonIndex,
+    launcher_id: Bytes32,
+) -> Result<ObservedSingleton> {
+    let (_spent, walked) = walk_singleton(index, launcher_id).await?;
+    let parent = index
+        .coin_record(walked.coin.parent_coin_info)
+        .await?
+        .ok_or_else(|| Error::msg("parent coin record not found for the vault singleton"))?;
+    let again = index
+        .coin_record(walked.coin.coin_id())
+        .await?
+        .ok_or_else(|| Error::msg("vault singleton changed while reading; try again"))?;
+    if again.spent || again.coin != walked.coin {
+        return Err(Error::msg(
+            "vault singleton changed while reading; try again",
+        ));
+    }
+    Ok(ObservedSingleton { tip: again, parent })
 }
 
 #[derive(Debug, Clone)]
@@ -71,57 +109,118 @@ pub struct FinishRecoveryParams<'a> {
     pub network: Network,
 }
 
-pub fn inspect_vault(
+pub(crate) fn classify_singleton(
     config: &VaultConfig,
-    on_chain_coin: Option<Coin>,
-    post_recovery_inner: Option<TreeHash>,
+    post_recovery: Option<&VaultConfig>,
+    observed: &ObservedSingleton,
+    pending: bool,
 ) -> Result<InspectReport> {
     let launcher_id = config.launcher_id_bytes()?;
     let keys = config.to_vault_keys()?;
     let ready = get_vault_internals(launcher_id, &keys)?;
+    let tip = &observed.tip;
+    let parent = &observed.parent;
 
-    let expected_recovery_puzzle_hash = if let Some(post_inner) = post_recovery_inner {
-        let amount = on_chain_coin.map(|c| c.amount).unwrap_or(1);
-        Some(
-            recovery_state_hashes(launcher_id, &keys, post_inner, amount)?
-                .internals
-                .full_puzzle_hash,
-        )
-    } else {
-        None
+    let (tip_recovery, parent_recovery, finished_hash) = match post_recovery {
+        Some(post) => {
+            let post_ready = get_vault_internals(launcher_id, &post.to_vault_keys()?)?;
+            let tip_recovery = recovery_state_hashes(
+                launcher_id,
+                &keys,
+                post_ready.inner_puzzle_hash,
+                tip.coin.amount,
+            )?
+            .internals
+            .full_puzzle_hash;
+            let parent_recovery = recovery_state_hashes(
+                launcher_id,
+                &keys,
+                post_ready.inner_puzzle_hash,
+                parent.coin.amount,
+            )?
+            .internals
+            .full_puzzle_hash;
+            (
+                Some(tip_recovery),
+                Some(parent_recovery),
+                Some(post_ready.full_puzzle_hash),
+            )
+        }
+        None => (None, None, None),
     };
 
-    let (phase, guidance) = match &on_chain_coin {
-        None => (
-            VaultPhase::Unknown,
-            "No unspent vault singleton found for this config.".to_string(),
-        ),
-        Some(coin) if coin.puzzle_hash == ready.full_puzzle_hash => (
-            VaultPhase::Ready,
-            "Vault is READY. Use `start` to begin delayed recovery.".to_string(),
-        ),
-        Some(coin) if Some(coin.puzzle_hash) == expected_recovery_puzzle_hash => (
-            VaultPhase::InRecovery,
-            "Vault is already in RECOVERY. Wait for the clawback timelock, then use `finish`."
-                .to_string(),
-        ),
-        Some(_) => (
-            VaultPhase::Unknown,
-            "On-chain puzzle hash does not match READY (or expected RECOVERY if a post-recovery config was provided)."
-                .to_string(),
-        ),
-    };
+    let (phase, guidance) = phase_of(
+        tip.coin.puzzle_hash,
+        ready.full_puzzle_hash,
+        tip_recovery,
+        parent.coin.puzzle_hash,
+        parent_recovery,
+        finished_hash,
+    );
+    let settled = matches!(phase, VaultPhase::Finished | VaultPhase::ClawedBack);
+    if settled && !parent.spent {
+        return Err(Error::msg("parent of the vault singleton is not spent"));
+    }
+
+    let pending_note = (pending && phase == VaultPhase::InRecovery)
+        .then(|| PENDING_FINISH_OR_CLAWBACK.to_string());
 
     Ok(InspectReport {
         launcher_id,
         expected_ready_puzzle_hash: ready.full_puzzle_hash,
-        expected_recovery_puzzle_hash,
-        on_chain_puzzle_hash: on_chain_coin.map(|c| c.puzzle_hash),
-        on_chain_coin,
+        expected_recovery_puzzle_hash: if settled {
+            parent_recovery
+        } else {
+            tip_recovery
+        },
+        on_chain_puzzle_hash: Some(tip.coin.puzzle_hash),
+        on_chain_coin: Some(tip.coin),
         phase,
         clawback_timelock: ready.clawback_timelock,
-        guidance,
+        guidance: guidance.to_string(),
+        pending_note,
     })
+}
+
+fn phase_of(
+    tip_puzzle: Bytes32,
+    ready_hash: Bytes32,
+    tip_recovery: Option<Bytes32>,
+    parent_puzzle: Bytes32,
+    parent_recovery: Option<Bytes32>,
+    finished_hash: Option<Bytes32>,
+) -> (VaultPhase, &'static str) {
+    if Some(tip_puzzle) == tip_recovery {
+        return (
+            VaultPhase::InRecovery,
+            "Vault is already in RECOVERY. Wait for the clawback timelock, then use `finish`.",
+        );
+    }
+
+    let parent_is_recovery = parent_recovery.is_some() && Some(parent_puzzle) == parent_recovery;
+    let finished_is_distinct = finished_hash.is_some() && finished_hash != Some(ready_hash);
+    if finished_is_distinct && Some(tip_puzzle) == finished_hash && parent_is_recovery {
+        return (
+            VaultPhase::Finished,
+            "Vault is under the recovered custody configuration.",
+        );
+    }
+    if tip_puzzle == ready_hash && parent_is_recovery {
+        return (
+            VaultPhase::ClawedBack,
+            "Vault is under the original custody configuration.",
+        );
+    }
+    if tip_puzzle == ready_hash {
+        return (
+            VaultPhase::Ready,
+            "Vault is READY. Use `start` to begin delayed recovery.",
+        );
+    }
+    (
+        VaultPhase::Unknown,
+        "On-chain puzzle hash does not match this config.",
+    )
 }
 
 pub fn start_recovery(params: StartRecoveryParams<'_>) -> Result<StartRecoveryResult> {
@@ -369,170 +468,5 @@ mod key_match_tests {
 }
 
 #[cfg(test)]
-mod finish_tests {
-    use super::*;
-    use chia_sdk_driver::{Launcher, StandardLayer};
-    use chia_sdk_test::{K1Pair, Simulator};
-    use clvmr::NodePtr;
-
-    use crate::config::{Curve, KeyType, VaultConfigMember, VaultConfigRecovery, VaultConfigSide};
-    use crate::keys::{MnemonicWordCount, generate_mnemonic, public_key_to_hex};
-    use crate::vault::{
-        CustodyPath, RecoverySignerSet, SignerSet, get_vault_internals, recovery_state_hashes,
-    };
-
-    fn mint_vault(
-        sim: &mut Simulator,
-        ctx: &mut SpendContext,
-        custody_hash: TreeHash,
-    ) -> anyhow::Result<Vault> {
-        let alice = sim.bls(1);
-        let alice_p2 = StandardLayer::new(alice.pk);
-        let (mint_vault, vault) =
-            Launcher::new(alice.coin.coin_id(), 1).mint_vault(ctx, custody_hash, ())?;
-        alice_p2.spend(ctx, alice.coin, mint_vault)?;
-        sim.spend_coins(ctx.take(), &[alice.sk])?;
-        Ok(vault)
-    }
-
-    struct Started {
-        sim: Simulator,
-        config: VaultConfig,
-        post: VaultConfig,
-        child: Vault,
-        keys: crate::vault::VaultKeys,
-        post_inner: TreeHash,
-    }
-
-    fn start_on_sim() -> anyhow::Result<Started> {
-        let mut sim = Simulator::new();
-        let ctx = &mut SpendContext::new();
-        let custody = K1Pair::default();
-        let recovery = generate_mnemonic(MnemonicWordCount::Words24)?;
-        let words = recovery.words.clone();
-        let keys = crate::vault::VaultKeys {
-            custody: CustodyPath::Signers(SignerSet {
-                keys: vec![VaultMemberKey::K1(custody.pk)],
-                vault_launcher_ids: vec![],
-                threshold: 1,
-            }),
-            recovery: RecoverySignerSet {
-                set: SignerSet {
-                    keys: vec![VaultMemberKey::Bls(recovery.key_pair.public_key)],
-                    vault_launcher_ids: vec![],
-                    threshold: 1,
-                },
-                clawback_timelock: 10,
-            },
-        };
-        let prelim = get_vault_internals(Bytes32::default(), &keys)?;
-        let vault = mint_vault(&mut sim, ctx, prelim.inner_puzzle_hash)?;
-        let launcher_id = vault.info.launcher_id;
-        let config = VaultConfig {
-            launcher_id: format!("0x{}", hex::encode(launcher_id)),
-            custody: VaultConfigSide {
-                threshold: 1,
-                members: vec![VaultConfigMember::PublicKey {
-                    public_key: format!("0x{}", hex::encode(custody.pk.to_bytes())),
-                    curve: Curve::Secp256k1,
-                    key_type: None,
-                }],
-                hash: None,
-            },
-            recovery: VaultConfigRecovery {
-                threshold: 1,
-                clawback_timelock: 10,
-                members: vec![VaultConfigMember::PublicKey {
-                    public_key: public_key_to_hex(&recovery.key_pair.public_key),
-                    curve: Curve::Bls12_381,
-                    key_type: Some(KeyType::RecoveryPhrase),
-                }],
-            },
-            receive_address: None,
-        };
-        let new_custody = generate_mnemonic(MnemonicWordCount::Words24)?;
-        let start = start_recovery(StartRecoveryParams {
-            config: &config,
-            vault_coin: vault.coin,
-            lineage_proof: vault.proof,
-            recovery_mnemonic: &words,
-            new_custody_mnemonic: &new_custody.words,
-            new_recovery_mnemonic: None,
-            new_clawback_timelock: Some(10),
-            new_word_count: MnemonicWordCount::Words24,
-            network: Network::Testnet11,
-        })?;
-        sim.spend_coins(
-            start.spend_bundle.coin_spends,
-            std::slice::from_ref(&recovery.key_pair.secret_key),
-        )?;
-        let post_keys = start.post_recovery_config.to_vault_keys()?;
-        let post_inner = get_vault_internals(launcher_id, &post_keys)?.inner_puzzle_hash;
-        let state = recovery_state_hashes(launcher_id, &keys, post_inner, 1)?;
-        assert_eq!(
-            state.internals.full_puzzle_hash,
-            start.recovery_state_puzzle_hash
-        );
-        let child = vault.child(state.internals.inner_puzzle_hash, 1);
-        Ok(Started {
-            sim,
-            config,
-            post: start.post_recovery_config,
-            child,
-            keys,
-            post_inner,
-        })
-    }
-
-    fn nil_program(ctx: &mut SpendContext) -> anyhow::Result<Spend> {
-        // `(i 1 () ())` returns nil and is a different puzzle.
-        let nil = NodePtr::NIL;
-        let one = ctx.new_atom(&[1])?;
-        let op_if = ctx.new_atom(&[3])?;
-        let tails = ctx.new_pair(nil, nil)?;
-        let tails = ctx.new_pair(nil, tails)?;
-        let args = ctx.new_pair(one, tails)?;
-        let puzzle = ctx.new_pair(op_if, args)?;
-        Ok(Spend::new(puzzle, nil))
-    }
-
-    #[test]
-    fn finish_rejects_a_different_delegated_puzzle() -> anyhow::Result<()> {
-        let mut started = start_on_sim()?;
-        let mut ctx = SpendContext::new();
-        let prepared = prepare_finish(
-            &mut ctx,
-            started.config.launcher_id_bytes()?,
-            &started.keys,
-            started.post_inner,
-            1,
-        )?;
-        let alt = nil_program(&mut ctx)?;
-        let honest = ctx.run(prepared.delegated.puzzle, prepared.delegated.solution)?;
-        let alt_out = ctx.run(alt.puzzle, alt.solution)?;
-        assert_eq!(ctx.tree_hash(honest), ctx.tree_hash(alt_out));
-        assert_ne!(
-            ctx.tree_hash(prepared.delegated.puzzle),
-            ctx.tree_hash(alt.puzzle)
-        );
-        let rejected = build_finish_spend_bundle(
-            &mut ctx,
-            &started.child,
-            &prepared.state.internals,
-            prepared.member,
-            alt,
-        )?;
-        started.sim.pass_time(10);
-        assert!(started.sim.spend_coins(rejected.coin_spends, &[]).is_err());
-
-        let bundle = finish_recovery(FinishRecoveryParams {
-            config: &started.config,
-            post_recovery_config: &started.post,
-            vault_coin: started.child.coin,
-            lineage_proof: started.child.proof,
-            network: Network::Testnet11,
-        })?;
-        started.sim.spend_coins(bundle.coin_spends, &[])?;
-        Ok(())
-    }
-}
+#[path = "recovery_finish_tests.rs"]
+mod finish_tests;

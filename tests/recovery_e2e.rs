@@ -17,8 +17,7 @@ use chia_vault_recover::keys::{
 use chia_vault_recover::locate::launcher_from_spend;
 use chia_vault_recover::network::Network;
 use chia_vault_recover::recovery::{
-    FinishRecoveryParams, StartRecoveryParams, VaultPhase, finish_recovery, inspect_vault,
-    start_recovery,
+    FinishRecoveryParams, StartRecoveryParams, finish_recovery, start_recovery,
 };
 use chia_vault_recover::vault::{
     CustodyPath, RecoverySignerSet, SignerSet, VaultKeys, VaultMemberKey, get_vault_internals,
@@ -94,9 +93,6 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
         receive_address: None,
     };
 
-    let report = inspect_vault(&config, Some(vault.coin), None)?;
-    assert_eq!(report.phase, VaultPhase::Ready);
-
     let new_custody = generate_mnemonic(MnemonicWordCount::Words24)?;
     let start = start_recovery(StartRecoveryParams {
         config: &config,
@@ -125,18 +121,6 @@ fn delayed_recovery_bls_phrase_to_new_bls_custody() -> anyhow::Result<()> {
     let recovery_hashes =
         recovery_state_hashes(launcher_id, &keys, post_ready.inner_puzzle_hash, 1)?;
     let vault_after_start = vault.child(recovery_hashes.internals.inner_puzzle_hash, 1);
-
-    let report2 = inspect_vault(
-        &config,
-        Some(vault_after_start.coin),
-        Some(post_ready.inner_puzzle_hash),
-    )?;
-    assert_eq!(report2.phase, VaultPhase::InRecovery);
-    assert!(report2.guidance.contains("finish"));
-
-    // Without post-recovery config, mismatched PH must be Unknown (not a guessed InRecovery).
-    let report_unknown = inspect_vault(&config, Some(vault_after_start.coin), None)?;
-    assert_eq!(report_unknown.phase, VaultPhase::Unknown);
 
     sim.pass_time(10);
 
