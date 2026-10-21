@@ -178,56 +178,39 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Official macOS and Windows release assets are signed, then uploaded here.
-  # Everything else is uploaded by the publish jobs below. All of them wait
-  # until lint, tests, and every build have succeeded.
-  sign:
-    name: Sign (${{ matrix.os }})
+  # Official release assets are signed, then uploaded here. Everything else is
+  # uploaded by the publish jobs below, and all of them wait until lint, tests,
+  # and every build have succeeded.
+  #
+  # One job per platform: splitting keeps the Apple secrets off the Windows
+  # runner and id-token: write off the macOS runner. The job names are the
+  # branch-protection checks, so they stay "Sign (macos)" / "Sign (windows)".
+  sign-macos:
+    name: Sign (macos)
     needs: [lint, test, build, macos-universal]
     if: ${{ success() && github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' }}
-    runs-on: ${{ matrix.runs-on }}
-    environment: ${{ matrix.environment }}
+    runs-on: macos-latest
     permissions:
       contents: write
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos
-            runs-on: macos-latest
-            artifact: macos-universal
-          - os: windows
-            runs-on: windows-latest
-            artifact: windows-x86_64
-            # Federated credential subject:
-            # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
-            environment: windows-code-signing
     steps:
       - uses: actions/checkout@v7
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
-          name: chia-vault-recover-${{ matrix.artifact }}
+          name: chia-vault-recover-macos-universal
           path: dist
 
       - name: Check for Apple signing credentials
-        if: matrix.os == 'macos'
         id: apple-signing
         shell: bash
         env:
-          APPLE_SIGNING_ENABLED: "true"
           APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
           APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
           APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
           APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [[ "$APPLE_SIGNING_ENABLED" != "true" ]]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           configured=0
           for value in \
             "$APPLE_DEV_ID_APP" \
@@ -248,43 +231,14 @@ jobs:
             exit 1
           fi
 
-      - name: Check for Windows signing credentials
-        if: matrix.os == 'windows'
-        id: windows-signing
-        shell: bash
-        env:
-          WINDOWS_SIGNING_ENABLED: "true"
-          AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
-          AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
-        run: |
-          if [[ "$WINDOWS_SIGNING_ENABLED" != "true" ]]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          else
-            configured=0
-            for value in "$AZURE_SIGNING_CLIENT_ID" "$AZURE_SIGNING_TENANT_ID"; do
-              if [[ -n "$value" ]]; then
-                configured=$((configured + 1))
-              fi
-            done
-            if [[ "$configured" -eq 2 ]]; then
-              echo "available=true" >> "$GITHUB_OUTPUT"
-            elif [[ "$configured" -eq 0 ]]; then
-              echo "available=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "::error::Windows signing is partially configured; both Azure signing secrets are required"
-              exit 1
-            fi
-          fi
-
       # Gatekeeper will not launch the signed GUI Mach-O. Bundle it before
       # the Developer ID signature so the sealed app, not a bare executable,
       # is what gets notarized inside the disk image.
       - name: Bundle macOS GUI
-        if: matrix.os == 'macos'
-        run: bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
+        run: bash build-scripts/macos/package-app.sh macos-universal
 
       - name: Sign macOS binaries
-        if: matrix.os == 'macos' && steps.apple-signing.outputs.available == 'true'
+        if: steps.apple-signing.outputs.available == 'true'
         shell: bash
         env:
           APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
@@ -292,47 +246,83 @@ jobs:
           APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
           APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: bash build-scripts/macos/sign-release.sh ${{ matrix.artifact }}
+        run: bash build-scripts/macos/sign-release.sh macos-universal
+
+      - name: Package macOS disk image
+        run: bash build-scripts/macos/package-dmg.sh macos-universal
+
+      - name: Notarize macOS disk image
+        if: steps.apple-signing.outputs.available == 'true'
+        shell: bash
+        env:
+          APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
+          APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
+          APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
+          APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash build-scripts/macos/notarize-dmg.sh macos-universal
+
+      - name: Upload release assets
+        uses: ./.github/actions/upload-release-assets
+
+  sign-windows:
+    name: Sign (windows)
+    needs: [lint, test, build, macos-universal]
+    if: ${{ success() && github.repository == 'Chia-Network/chia-vault-recover' && github.event_name == 'release' }}
+    runs-on: windows-latest
+    # Federated credential subject:
+    # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
+    environment: windows-code-signing
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: chia-vault-recover-windows-x86_64
+          path: dist
+
+      - name: Check for Windows signing credentials
+        id: azure-signing
+        shell: bash
+        env:
+          AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+        run: |
+          if [[ -z "$AZURE_SIGNING_CLIENT_ID" && -z "$AZURE_SIGNING_TENANT_ID" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$AZURE_SIGNING_CLIENT_ID" && -n "$AZURE_SIGNING_TENANT_ID" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Windows signing is partially configured; both Azure signing secrets are required"
+            exit 1
+          fi
 
       # The org-wide action owns the nuget install, OIDC token, and signtool
-      # flags, so they cannot drift between Chia repos. Tracking @main means
-      # a signing fix lands here without a version bump; the trade-off is that
-      # it also changes what signs our releases without a diff in this repo.
-      # The action needs id-token: write (job permissions above) and the
-      # environment whose federated subject is on the windows matrix entry.
+      # flags, so they cannot drift between Chia repos. Tracking @main means a
+      # signing fix lands here without a version bump; the trade-off is that it
+      # also changes what signs our releases without a diff in this repository.
       - name: Sign Windows binaries
-        if: matrix.os == 'windows' && steps.windows-signing.outputs.available == 'true'
+        if: steps.azure-signing.outputs.available == 'true'
         uses: Chia-Network/actions/sign/azure-windows@main
         with:
           azure_tenant_id: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           azure_client_id: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
           file: |
-            ${{ github.workspace }}/dist/chia-vault-recover-${{ matrix.artifact }}.exe
-            ${{ github.workspace }}/dist/chia-vault-recover-gui-${{ matrix.artifact }}.exe
-
-      - name: Package macOS disk image
-        if: matrix.os == 'macos'
-        run: bash build-scripts/macos/package-dmg.sh ${{ matrix.artifact }}
-
-      - name: Notarize macOS disk image
-        if: matrix.os == 'macos' && steps.apple-signing.outputs.available == 'true'
-        shell: bash
-        env:
-          APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
-          APPLE_DEV_ID_APP_PASS: ${{ secrets.APPLE_DEV_ID_APP_PASS }}
-          APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
-          APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: bash build-scripts/macos/notarize-dmg.sh ${{ matrix.artifact }}
+            ${{ github.workspace }}/dist/chia-vault-recover-windows-x86_64.exe
+            ${{ github.workspace }}/dist/chia-vault-recover-gui-windows-x86_64.exe
 
       - name: Upload release assets
         uses: ./.github/actions/upload-release-assets
 
-  # Wait for sign so a notarization or signing failure does not leave Linux
-  # assets on the release. On an official release, sign is not skipped.
+  # Wait for both sign jobs so a notarization or signing failure does not leave
+  # Linux assets on the release. On an official release, neither is skipped.
   publish-linux:
     name: Publish Linux release assets
-    needs: [lint, test, build, macos-universal, sign]
+    needs: [lint, test, build, macos-universal, sign-macos, sign-windows]
     if: ${{ success() && github.event_name == 'release' && github.repository == 'Chia-Network/chia-vault-recover' }}
     runs-on: ubuntu-latest
     permissions:
