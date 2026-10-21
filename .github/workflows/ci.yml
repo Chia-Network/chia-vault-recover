@@ -197,11 +197,9 @@ jobs:
           - os: macos
             runs-on: macos-latest
             artifact: macos-universal
-            sign: bash build-scripts/macos/sign-release.sh
           - os: windows
             runs-on: windows-latest
             artifact: windows-x86_64
-            sign: pwsh -File ./build-scripts/windows/sign-release.ps1 -Artifact
             # Federated credential subject:
             # repo:Chia-Network/chia-vault-recover:environment:windows-code-signing
             environment: windows-code-signing
@@ -285,8 +283,8 @@ jobs:
         if: matrix.os == 'macos'
         run: bash build-scripts/macos/package-app.sh ${{ matrix.artifact }}
 
-      - name: Sign binaries
-        if: steps.apple-signing.outputs.available == 'true' || steps.windows-signing.outputs.available == 'true'
+      - name: Sign macOS binaries
+        if: matrix.os == 'macos' && steps.apple-signing.outputs.available == 'true'
         shell: bash
         env:
           APPLE_DEV_ID_APP: ${{ secrets.APPLE_DEV_ID_APP }}
@@ -294,9 +292,23 @@ jobs:
           APPLE_NOTARIZE_USERNAME: ${{ secrets.APPLE_NOTARIZE_USERNAME }}
           APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          AZURE_SIGNING_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
-          AZURE_SIGNING_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
-        run: ${{ matrix.sign }} ${{ matrix.artifact }}
+        run: bash build-scripts/macos/sign-release.sh ${{ matrix.artifact }}
+
+      # The org-wide action owns the nuget install, OIDC token, and signtool
+      # flags, so they cannot drift between Chia repos. Tracking @main means
+      # a signing fix lands here without a version bump; the trade-off is that
+      # it also changes what signs our releases without a diff in this repo.
+      # The action needs id-token: write (job permissions above) and the
+      # environment whose federated subject is on the windows matrix entry.
+      - name: Sign Windows binaries
+        if: matrix.os == 'windows' && steps.windows-signing.outputs.available == 'true'
+        uses: Chia-Network/actions/sign/azure-windows@main
+        with:
+          azure_tenant_id: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          azure_client_id: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          file: |
+            ${{ github.workspace }}/dist/chia-vault-recover-${{ matrix.artifact }}.exe
+            ${{ github.workspace }}/dist/chia-vault-recover-gui-${{ matrix.artifact }}.exe
 
       - name: Package macOS disk image
         if: matrix.os == 'macos'
