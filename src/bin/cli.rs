@@ -15,7 +15,9 @@ use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
 use chia_vault_recover::recovery::{StartRecoveryResult, VaultPhase};
-use chia_vault_recover::workflow::{self, LookupReport, PreparedStart, StartWorkflow};
+use chia_vault_recover::workflow::{
+    self, FinishAction, LookupReport, PreparedStart, StartWorkflow,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -323,8 +325,21 @@ async fn main() -> Result<()> {
             let config = VaultConfig::load(&config)?;
             let post = VaultConfig::load(&post_recovery_config)?;
             let (client, network) = client_for(config.recorded_receive_address()?, backend)?;
-            let handle = workflow::finish(&client, &config, &post, network).await?;
-            println!("pushed finish recovery spend (handle): {handle}");
+            let outcome = workflow::finish(&client, &config, &post, network).await?;
+            if let Some(note) = &outcome.pending_note {
+                println!("{note}");
+            }
+            match outcome.action {
+                FinishAction::Pushed(handle) => {
+                    println!("pushed finish recovery spend (handle): {handle}");
+                }
+                FinishAction::AlreadyFinished => {
+                    println!("vault is under the recovered custody configuration");
+                }
+                FinishAction::ClawedBack => {
+                    println!("vault is under the original custody configuration");
+                }
+            }
         }
         Commands::Inspect {
             config,
@@ -350,6 +365,9 @@ async fn main() -> Result<()> {
             println!("phase: {:?}", report.phase);
             println!("clawback_timelock_secs: {}", report.clawback_timelock);
             println!("{}", report.guidance);
+            if let Some(note) = &report.pending_note {
+                println!("{note}");
+            }
             if report.phase == VaultPhase::InRecovery {
                 std::process::exit(2);
             }

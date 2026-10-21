@@ -34,7 +34,7 @@ const START_SUBTITLE: &str =
     "Enter the recovery phrase and a new custody phrase, then start delayed recovery.";
 const WAIT_SUBTITLE: &str =
     "Wait for the clawback window, then finish. You can close the app and come back.";
-const DONE_SUBTITLE: &str = "Recovery finished. Custody is now the new BLS key.";
+const DONE_SUBTITLE: &str = "This recovery session is closed.";
 
 /// Rail steps shown at the top of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,10 +134,7 @@ impl App {
 
     /// No cache → Lookup; started session → Wait; cache only → Start.
     fn resume_from_disk(&mut self) {
-        if let Some(session) = GuiSession::load().filter(|s| s.is_started())
-            && session_files_ready(&session)
-            && session_matches_cache(&self.cache, &session.receive_address)
-        {
+        if let Some(session) = resumable_session(GuiSession::load(), &self.cache) {
             // Address for chain calls; paths live only on Phase::Wait(session).
             self.vault_address = session.receive_address.clone();
             self.set_ok(
@@ -378,6 +375,16 @@ fn default_config_paths() -> (String, String) {
 
 fn session_files_ready(session: &GuiSession) -> bool {
     Path::new(&session.config_path).is_file() && Path::new(&session.post_recovery_path).is_file()
+}
+
+/// A relaunch returns to Wait only for a started session whose config files are still present.
+fn resumable_session(loaded: Option<GuiSession>, cache: &LookupCache) -> Option<GuiSession> {
+    let session = loaded.filter(|session| session.is_started())?;
+    if session_files_ready(&session) && session_matches_cache(cache, &session.receive_address) {
+        Some(session)
+    } else {
+        None
+    }
 }
 
 /// Resume Wait when the cache is empty or names the same receive address.

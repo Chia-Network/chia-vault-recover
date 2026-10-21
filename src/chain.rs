@@ -90,12 +90,32 @@ impl ChainClient {
     }
 
     pub async fn get_children(&self, parent_id: Bytes32) -> Result<Vec<CoinRecord>> {
-        let response = self
-            .inner
-            .get_coin_records_by_parent_ids(vec![parent_id], None, None, Some(true), None)
-            .await
-            .map_err(|e| Error::msg(format!("get_coin_records_by_parent_ids failed: {e}")))?;
-        Ok(response.coin_records.unwrap_or_default())
+        let mut all = Vec::new();
+        let mut cursor = None;
+        for _ in 0..8 {
+            let response = self
+                .inner
+                .get_coin_records_by_parent_ids(vec![parent_id], None, None, Some(true), cursor)
+                .await
+                .map_err(|e| Error::msg(format!("get_coin_records_by_parent_ids failed: {e}")))?;
+            all.extend(response.coin_records.unwrap_or_default());
+            if response.truncated == Some(true) {
+                cursor = response.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    async fn coin_has_pending_spend(&self, coin_id: Bytes32) -> Result<bool> {
+        match self.inner.get_mempool_items_by_coin_name(coin_id).await {
+            Ok(response) => Ok(!response.mempool_items.unwrap_or_default().is_empty()),
+            Err(_) => Ok(false),
+        }
     }
 
     pub async fn get_spend(
@@ -117,22 +137,7 @@ impl ChainClient {
         &self,
         launcher_id: Bytes32,
     ) -> Result<(Vec<CoinRecord>, CoinRecord)> {
-        let mut parent = launcher_id;
-        let mut spent = Vec::new();
-        for _ in 0..1024 {
-            let children = self.get_children(parent).await?;
-            let Some(child) = children.into_iter().find(|r| r.coin.amount % 2 == 1) else {
-                return Err(Error::msg(
-                    "no singleton child found — launcher id may be wrong or the vault was never launched",
-                ));
-            };
-            if !child.spent {
-                return Ok((spent, child));
-            }
-            parent = child.coin.coin_id();
-            spent.push(child);
-        }
-        Err(Error::msg("singleton chain exceeded 1024 coins"))
+        walk_singleton(self, launcher_id).await
     }
 
     /// Build a lineage (or eve) proof for a singleton coin from its parent spend.
@@ -189,6 +194,61 @@ impl ChainClient {
             .unwrap_or_default();
         Ok(id)
     }
+}
+
+/// Coin records needed to follow one singleton. Puzzle-hash search is not part of this.
+pub trait SingletonIndex {
+    fn children_of(
+        &self,
+        parent_id: Bytes32,
+    ) -> impl std::future::Future<Output = Result<Vec<CoinRecord>>> + Send;
+
+    fn coin_record(
+        &self,
+        coin_id: Bytes32,
+    ) -> impl std::future::Future<Output = Result<Option<CoinRecord>>> + Send;
+
+    fn coin_has_pending_spend(
+        &self,
+        coin_id: Bytes32,
+    ) -> impl std::future::Future<Output = Result<bool>> + Send;
+}
+
+impl SingletonIndex for ChainClient {
+    async fn children_of(&self, parent_id: Bytes32) -> Result<Vec<CoinRecord>> {
+        self.get_children(parent_id).await
+    }
+
+    async fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>> {
+        self.get_coin_record(coin_id).await
+    }
+
+    async fn coin_has_pending_spend(&self, coin_id: Bytes32) -> Result<bool> {
+        ChainClient::coin_has_pending_spend(self, coin_id).await
+    }
+}
+
+/// Walk the singleton from `launcher_id` to the current unspent coin.
+pub async fn walk_singleton(
+    index: &impl SingletonIndex,
+    launcher_id: Bytes32,
+) -> Result<(Vec<CoinRecord>, CoinRecord)> {
+    let mut parent = launcher_id;
+    let mut spent = Vec::new();
+    for _ in 0..1024 {
+        let children = index.children_of(parent).await?;
+        let Some(child) = children.into_iter().find(|r| r.coin.amount % 2 == 1) else {
+            return Err(Error::msg(
+                "no singleton child found — launcher id may be wrong or the vault was never launched",
+            ));
+        };
+        if !child.spent {
+            return Ok((spent, child));
+        }
+        parent = child.coin.coin_id();
+        spent.push(child);
+    }
+    Err(Error::msg("singleton chain exceeded 1024 coins"))
 }
 
 fn singleton_inner_puzzle_hash(puzzle: &chia_protocol::Program) -> Result<Bytes32> {

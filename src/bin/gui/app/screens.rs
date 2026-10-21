@@ -193,10 +193,12 @@ impl App {
 
     fn draw_done(&mut self, ui: &mut egui::Ui) {
         theme::card_frame(ui).show(ui, |ui| {
-            ui.colored_label(theme::CHIA_GREEN, "Recovery complete.");
-            ui.label(
-                "Vault custody is now the new BLS key. Keep the new recovery phrase safe if one was generated.",
-            );
+            ui.colored_label(theme::CHIA_GREEN, "Recovery session closed.");
+            let outcome = self.status.text();
+            if !outcome.is_empty() {
+                ui.label(outcome);
+            }
+            ui.label("If a new recovery phrase was shown earlier, it was not saved in the app.");
             if secondary_button(ui, "Look up another vault").clicked() {
                 self.reset_to_lookup();
             }
