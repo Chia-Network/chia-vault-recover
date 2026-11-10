@@ -1,8 +1,10 @@
 //! Resolve a vault launcher id from a receive address or hex launcher id.
 
+use std::fmt::Display;
+
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzles::SINGLETON_LAUNCHER_HASH;
-use chia_sdk_coinset::CoinRecord;
+use chia_sdk_coinset::{ChiaRpcClient, CoinRecord};
 use chia_sdk_driver::{
     CatLayer, Layer, P2SingletonLayer, Puzzle, SingletonLayer, SpendContext, mips_puzzle_hash,
 };
@@ -16,8 +18,10 @@ use crate::address::{decode_address, network_from_address_prefix};
 use crate::chain::ChainClient;
 use crate::config::parse_bytes32;
 use crate::error::{Error, Result};
+use crate::guidance::LookupGap;
 use crate::mips::{CloudWalletP2, alloc_spend};
 use crate::network::{Backend, Network};
+use crate::scan::{HeightRange, LauncherScan};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedLauncher {
@@ -70,149 +74,111 @@ pub fn client_for_vault(vault: &str, backend: &Backend) -> Result<(ChainClient, 
     Ok((ChainClient::new(network, backend), network))
 }
 
-/// Block heights to scan for the vault launcher, `start` inclusive and `end` exclusive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeightRange {
-    pub start: u32,
-    pub end: u32,
-}
-
-impl HeightRange {
-    pub fn new(start: u32, end: u32) -> Result<Self> {
-        if start >= end {
-            return Err(Error::msg(format!(
-                "scan range start height {start} must be below end height {end}"
-            )));
-        }
-        Ok(Self { start, end })
-    }
-
-    /// Refuse ranges over [`MAX_SCAN_DAYS`] unless `force` is set; each 1,000 blocks is a request.
-    pub fn check_limit(self, force: bool) -> Result<Self> {
-        let blocks = self.end - self.start;
-        if !force && blocks > MAX_SCAN_DAYS * BLOCKS_PER_DAY {
-            return Err(Error::msg(format!(
-                "scan range is {blocks} blocks, over the {MAX_SCAN_DAYS}-day limit of {} blocks; narrow it or pass --force-scan",
-                MAX_SCAN_DAYS * BLOCKS_PER_DAY
-            )));
-        }
-        Ok(self)
-    }
-}
-
-/// Heights covering `date` (`YYYY-MM-DD`) in every timezone, UTC-12 to UTC+14, plus an hour each side.
-pub async fn heights_for_created_on(client: &ChainClient, date: &str) -> Result<HeightRange> {
-    let (from, to) = created_on_timestamps(date)?;
-    let start = client.height_at_or_after(from).await?;
-    let end = client.height_at_or_after(to).await?.saturating_add(1);
-    HeightRange::new(start, end)
-}
-
-/// Unix-second bounds for [`heights_for_created_on`].
-fn created_on_timestamps(date: &str) -> Result<(u64, u64)> {
-    const HOUR: i64 = 3600;
-    let bad = || Error::msg(format!("created date must be YYYY-MM-DD, got {date:?}"));
-    let mut parts = date.trim().splitn(3, '-');
-    let mut next = |len: usize| -> Result<i64> {
-        let part = parts.next().filter(|p| p.len() == len).ok_or_else(bad)?;
-        part.parse().map_err(|_| bad())
-    };
-    let (year, month, day) = (next(4)?, next(2)?, next(2)?);
-    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
-        return Err(bad());
-    }
-    let day_start = days_from_civil(year, month, day) * 24 * HOUR;
-    let from = day_start - 14 * HOUR - HOUR;
-    let to = day_start + 24 * HOUR + 12 * HOUR + HOUR;
-    Ok((from.max(0) as u64, to.max(0) as u64))
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// `scan` opts in to checking every launcher in that range when no spend reveals the launcher.
-pub async fn resolve_launcher_id(
-    client: &ChainClient,
+/// `scan` opts in to checking every launcher in a block range when no spend reveals
+/// the launcher. `Err(gap)` means the lookup ran but found no launcher.
+pub async fn resolve_launcher_id<C>(
+    client: &ChainClient<C>,
     locator: &VaultLocator,
-    scan: Option<HeightRange>,
-) -> Result<Option<ResolvedLauncher>> {
-    match locator {
-        VaultLocator::LauncherId(id) => Ok(Some(ResolvedLauncher {
-            launcher_id: *id,
-            source: format!("launcher id 0x{}", hex::encode(id)),
-        })),
+    scan: Option<&LauncherScan>,
+) -> Result<std::result::Result<ResolvedLauncher, LookupGap>>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    let (original, puzzle_hash) = match locator {
+        VaultLocator::LauncherId(id) => {
+            return Ok(Ok(ResolvedLauncher {
+                launcher_id: *id,
+                source: format!("launcher id 0x{}", hex::encode(id)),
+            }));
+        }
         VaultLocator::Address {
             original,
             puzzle_hash,
             ..
-        } => Ok(launcher_from_puzzle_hash(client, *puzzle_hash, scan)
-            .await?
-            .map(|id| ResolvedLauncher {
-                launcher_id: id,
-                source: format!("address {original}"),
-            })),
+        } => (original, *puzzle_hash),
+    };
+    let resolved = |launcher_id, source| {
+        Ok(Ok(ResolvedLauncher {
+            launcher_id,
+            source,
+        }))
+    };
+    match launcher_from_puzzle_hash(client, puzzle_hash, scan).await? {
+        Found::Launcher(id) => resolved(id, format!("address {original}")),
+        Found::InScan(id, range) => {
+            resolved(id, format!("address {original}, launcher scan of {range}"))
+        }
+        Found::Nothing(None) => Ok(Err(LookupGap::LauncherNotFound)),
+        Found::Nothing(Some(range)) => Ok(Err(LookupGap::NoLauncherInScan {
+            start: range.start(),
+            end: range.end(),
+        })),
     }
 }
 
-/// Highest receive-address nonce tried when rebuilding an address. Cloud Wallet derives
-/// addresses at nonces 1 to 100 on top of the default address at 0.
+/// Highest receive-address nonce tried when rebuilding an address. Cloud Wallet
+/// derives addresses at nonces 1 to 100 on top of the default address at 0. An
+/// address above that is still found from any spend that reveals its puzzle.
 const MAX_P2_NONCE: usize = 100;
-/// Chia targets 4608 blocks a day.
-const BLOCKS_PER_DAY: u32 = 4608;
-/// Largest launcher scan without `force`.
-pub const MAX_SCAN_DAYS: u32 = 5;
 
-async fn launcher_from_puzzle_hash(
-    client: &ChainClient,
+enum Found {
+    Launcher(Bytes32),
+    InScan(Bytes32, HeightRange),
+    /// Holds the scanned range when a scan ran.
+    Nothing(Option<HeightRange>),
+}
+
+async fn launcher_from_puzzle_hash<C>(
+    client: &ChainClient<C>,
     puzzle_hash: Bytes32,
-    scan: Option<HeightRange>,
-) -> Result<Option<Bytes32>> {
+    scan: Option<&LauncherScan>,
+) -> Result<Found>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let exact = client.find_coins_by_puzzle_hash(puzzle_hash, true).await?;
     if let Some(id) = launcher_from_spent_records(client, &exact, puzzle_hash).await? {
-        return Ok(Some(id));
+        return Ok(Found::Launcher(id));
     }
 
     let hinted = client.find_coins_by_hint(puzzle_hash, true).await?;
     if let Some(id) = launcher_from_spent_records(client, &hinted, puzzle_hash).await? {
-        return Ok(Some(id));
+        return Ok(Found::Launcher(id));
     }
 
     // A vault that has only received funds never reveals its launcher at the address.
     // When asked, check every launcher in the given range against the address.
-    if let Some(range) = scan
-        && let Some(id) = scan_launchers(client, puzzle_hash, range).await?
-    {
-        return Ok(Some(id));
+    let mut scanned = None;
+    if let Some(scan) = scan {
+        let range = scan.resolve(client).await?;
+        if let Some(id) = scan_launchers(client, puzzle_hash, range).await? {
+            return Ok(Found::InScan(id, range));
+        }
+        scanned = Some(range);
     }
 
     if let Some(id) = launcher_from_unspent_records(client, &exact, puzzle_hash).await? {
-        return Ok(Some(id));
+        return Ok(Found::Launcher(id));
     }
-    launcher_from_unspent_records(client, &hinted, puzzle_hash).await
+    Ok(
+        match launcher_from_unspent_records(client, &hinted, puzzle_hash).await? {
+            Some(id) => Found::Launcher(id),
+            None => Found::Nothing(scanned),
+        },
+    )
 }
 
-async fn launcher_from_spent_records(
-    client: &ChainClient,
+async fn launcher_from_spent_records<C>(
+    client: &ChainClient<C>,
     records: &[CoinRecord],
     puzzle_hash: Bytes32,
-) -> Result<Option<Bytes32>> {
+) -> Result<Option<Bytes32>>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     for rec in records.iter().filter(|r| r.spent) {
         if let Some(spend) = client
             .get_spend(rec.coin.coin_id(), rec.spent_block_index)
@@ -226,25 +192,47 @@ async fn launcher_from_spent_records(
     Ok(None)
 }
 
-async fn launcher_from_unspent_records(
-    client: &ChainClient,
+/// Fetches each unspent coin's parent once. A parent spend that reveals a launcher is
+/// checked against the address. For an odd (singleton) coin whose parent spend reveals
+/// none, the walk goes on toward the launcher.
+async fn launcher_from_unspent_records<C>(
+    client: &ChainClient<C>,
     records: &[CoinRecord],
     puzzle_hash: Bytes32,
-) -> Result<Option<Bytes32>> {
+) -> Result<Option<Bytes32>>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     for rec in records.iter().filter(|r| !r.spent) {
-        if rec.coin.amount % 2 == 1
-            && let Some(id) = walk_parents_to_launcher(client, rec.coin.parent_coin_info).await?
-            && launcher_matches_address(id, puzzle_hash)
-        {
-            return Ok(Some(id));
-        }
-        if let Some(parent) = client.get_coin_record(rec.coin.parent_coin_info).await?
-            && parent.spent
-            && let Some(spend) = client
+        let Some(parent) = client.get_coin_record(rec.coin.parent_coin_info).await? else {
+            continue;
+        };
+        let spend = if parent.spent {
+            client
                 .get_spend(parent.coin.coin_id(), parent.spent_block_index)
                 .await?
-            && let Some(id) = launcher_from_spend(&spend)
-            && spend_belongs_to_address(&spend, id, puzzle_hash)
+        } else {
+            None
+        };
+        if let Some(spend) = &spend
+            && let Some(id) = launcher_from_spend(spend)
+        {
+            if spend_belongs_to_address(spend, id, puzzle_hash) {
+                return Ok(Some(id));
+            }
+            continue;
+        }
+        if rec.coin.amount % 2 == 0 {
+            continue;
+        }
+        let walked = if parent.coin.puzzle_hash == SINGLETON_LAUNCHER_HASH.into() {
+            Some(parent.coin.coin_id())
+        } else {
+            walk_parents_to_launcher(client, parent.coin.parent_coin_info).await?
+        };
+        if let Some(id) = walked
+            && launcher_matches_address(id, puzzle_hash)
         {
             return Ok(Some(id));
         }
@@ -252,13 +240,17 @@ async fn launcher_from_unspent_records(
     Ok(None)
 }
 
-async fn scan_launchers(
-    client: &ChainClient,
+async fn scan_launchers<C>(
+    client: &ChainClient<C>,
     puzzle_hash: Bytes32,
     range: HeightRange,
-) -> Result<Option<Bytes32>> {
+) -> Result<Option<Bytes32>>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let launchers = client
-        .find_launchers_between(range.start, range.end)
+        .find_launchers_between(range.start(), range.end())
         .await?;
     Ok(launchers
         .iter()
@@ -311,10 +303,14 @@ fn cloud_wallet_p2_hash(launcher_id: Bytes32, nonce: usize) -> Bytes32 {
     .into()
 }
 
-async fn walk_parents_to_launcher(
-    client: &ChainClient,
+async fn walk_parents_to_launcher<C>(
+    client: &ChainClient<C>,
     mut parent_id: Bytes32,
-) -> Result<Option<Bytes32>> {
+) -> Result<Option<Bytes32>>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     for _ in 0..64 {
         let Some(parent) = client.get_coin_record(parent_id).await? else {
             return Ok(None);
@@ -385,11 +381,14 @@ fn launcher_from_puzzle(
 
 #[cfg(test)]
 mod tests {
+    use chia_protocol::Coin;
     use chia_sdk_driver::SpendContext;
     use chia_sdk_types::puzzles::{DelegatedPuzzleFeederArgs, IndexWrapperArgs};
+    use serde_json::json;
 
     use super::*;
     use crate::address::encode_address;
+    use crate::test_rpc::{ScriptedRpc, hex_id, page, record};
 
     #[test]
     fn parse_locator_accepts_address_and_hex() {
@@ -492,44 +491,203 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn created_on_covers_the_date_in_every_timezone() {
-        // 2026-01-15 00:00 UTC is 1_768_435_200.
-        let (from, to) = created_on_timestamps("2026-01-15").unwrap();
-        assert_eq!(from, 1_768_435_200 - 15 * 3600);
-        assert_eq!(to, 1_768_435_200 + 37 * 3600);
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(2024, 2, 29), 19_782);
-        for bad in [
-            "2026-8-03",
-            "2026-13-01",
-            "2026-02-29",
-            "2026/08/03",
-            "",
-            "2026-01-15-1",
-        ] {
-            assert!(created_on_timestamps(bad).is_err(), "{bad}");
+    fn vault_launcher() -> Coin {
+        Coin::new(Bytes32::new([0x50; 32]), SINGLETON_LAUNCHER_HASH.into(), 1)
+    }
+
+    fn nft_launcher() -> Coin {
+        Coin::new(Bytes32::new([0x60; 32]), SINGLETON_LAUNCHER_HASH.into(), 1)
+    }
+
+    /// A spent singleton of `launcher_id` and its spend, as an NFT reveals when it moves.
+    fn singleton_spend(launcher_id: Bytes32, parent: Bytes32) -> CoinSpend {
+        let mut ctx = SpendContext::new();
+        let inner = ctx.alloc(&1).unwrap();
+        let puzzle = SingletonLayer::new(launcher_id, Puzzle::parse(&ctx, inner))
+            .construct_puzzle(&mut ctx)
+            .unwrap();
+        CoinSpend::new(
+            Coin::new(parent, ctx.tree_hash(puzzle).into(), 1),
+            ctx.serialize(&puzzle).unwrap(),
+            ctx.serialize(&NodePtr::NIL).unwrap(),
+        )
+    }
+
+    fn address(locator_ph: Bytes32) -> VaultLocator {
+        VaultLocator::Address {
+            original: "test address".into(),
+            hrp: "xch".into(),
+            puzzle_hash: locator_ph,
         }
     }
 
-    #[test]
-    fn height_range_rejects_empty_ranges() {
-        assert!(HeightRange::new(10, 10).is_err());
-        assert!(HeightRange::new(11, 10).is_err());
-        assert_eq!(
-            HeightRange::new(1, 2).unwrap(),
-            HeightRange { start: 1, end: 2 }
+    async fn resolve(
+        rpc: ScriptedRpc,
+        puzzle_hash: Bytes32,
+        scan: Option<&LauncherScan>,
+    ) -> Result<std::result::Result<ResolvedLauncher, LookupGap>> {
+        resolve_launcher_id(&ChainClient::with_rpc(rpc), &address(puzzle_hash), scan).await
+    }
+
+    #[tokio::test]
+    async fn nft_at_the_address_is_not_the_vault_launcher() {
+        let address_ph = cloud_wallet_p2_hash(vault_launcher().coin_id(), 0);
+        let nft_id = nft_launcher().coin_id();
+        // A moved NFT: its parent spend reveals the NFT singleton.
+        let moved_parent = singleton_spend(nft_id, nft_id);
+        let moved = Coin::new(moved_parent.coin.coin_id(), Bytes32::new([0x61; 32]), 1);
+        // A fresh NFT: its parent is the NFT launcher itself.
+        let fresh = Coin::new(nft_id, Bytes32::new([0x62; 32]), 1);
+        // The spent NFT coin is hinted too, as the NFT moved through the address.
+        let hinted = [
+            record(moved_parent.coin, Some(5)),
+            record(moved, None),
+            record(fresh, None),
+        ];
+        let parents = [
+            record(moved_parent.coin, Some(5)),
+            record(nft_launcher(), Some(4)),
+        ];
+        let rpc = ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&[], None, false)),
+            "get_coin_records_by_hint" => Some(page(&hinted, None, false)),
+            "get_coin_record_by_name" => parents
+                .iter()
+                .find(|r| body["name"] == hex_id(r.coin.coin_id()))
+                .map(|r| json!({ "coin_record": r, "success": true })),
+            "get_puzzle_and_solution" if body["coin_id"] == hex_id(moved_parent.coin.coin_id()) => {
+                Some(json!({ "coin_solution": moved_parent, "success": true }))
+            }
+            "get_puzzle_and_solution" => Some(json!({ "coin_solution": null, "success": true })),
+            _ => None,
+        });
+        let found = resolve(rpc, address_ph, None).await.unwrap();
+        assert!(
+            matches!(found, Err(LookupGap::LauncherNotFound)),
+            "{found:?}"
         );
     }
 
-    #[test]
-    fn scan_limit_is_five_days_unless_forced() {
-        let limit = MAX_SCAN_DAYS * BLOCKS_PER_DAY;
-        let at_limit = HeightRange::new(100, 100 + limit).unwrap();
-        let over = HeightRange::new(100, 101 + limit).unwrap();
-        assert!(at_limit.check_limit(false).is_ok());
-        assert!(over.check_limit(false).is_err());
-        assert!(over.check_limit(true).is_ok());
+    #[tokio::test]
+    async fn vault_singleton_hinted_to_its_address_is_found() {
+        let vault = vault_launcher().coin_id();
+        let address_ph = cloud_wallet_p2_hash(vault, 0);
+        let eve = Coin::new(vault, Bytes32::new([0x63; 32]), 1);
+        let rpc = ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&[], None, false)),
+            "get_coin_records_by_hint" => Some(page(&[record(eve, None)], None, false)),
+            "get_coin_record_by_name" if body["name"] == hex_id(vault) => {
+                Some(json!({ "coin_record": record(vault_launcher(), Some(4)), "success": true }))
+            }
+            "get_puzzle_and_solution" => Some(json!({ "coin_solution": null, "success": true })),
+            _ => None,
+        });
+        let found = resolve(rpc, address_ph, None).await.unwrap().unwrap();
+        assert_eq!(found.launcher_id, vault);
+    }
+
+    #[tokio::test]
+    async fn hinted_cat_spend_proves_its_launcher() {
+        let vault = vault_launcher().coin_id();
+        let mut ctx = SpendContext::new();
+        // Past the rebuilt nonces, so only the revealed inner puzzle can match.
+        let member = ctx.curry(SingletonMember::new(vault)).unwrap();
+        let feeder = ctx.curry(DelegatedPuzzleFeederArgs::new(member)).unwrap();
+        let p2 = ctx
+            .curry(IndexWrapperArgs::new(MAX_P2_NONCE + 1, feeder))
+            .unwrap();
+        let address_ph = Bytes32::from(ctx.tree_hash(p2));
+        let cat = CatLayer::new(Bytes32::new([0x70; 32]), Puzzle::parse(&ctx, p2))
+            .construct_puzzle(&mut ctx)
+            .unwrap();
+        let spend = CoinSpend::new(
+            Coin::new(Bytes32::new([0x71; 32]), ctx.tree_hash(cat).into(), 10),
+            ctx.serialize(&cat).unwrap(),
+            ctx.serialize(&NodePtr::NIL).unwrap(),
+        );
+        assert_eq!(revealed_p2_puzzle_hash(&spend), Some(address_ph));
+        assert!(!launcher_matches_address(vault, address_ph));
+
+        let coin = record(spend.coin, Some(9));
+        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&[], None, false)),
+            "get_coin_records_by_hint" => Some(page(&[coin], None, false)),
+            "get_puzzle_and_solution" => Some(json!({ "coin_solution": spend, "success": true })),
+            _ => None,
+        });
+        let found = resolve(rpc, address_ph, None).await.unwrap().unwrap();
+        assert_eq!(found.launcher_id, vault);
+    }
+
+    /// Launcher pages for blocks 100..200: an NFT launcher, then (behind a cursor) `second`.
+    fn launcher_pages(second: Option<Coin>, cursor: Option<&'static str>) -> ScriptedRpc {
+        ScriptedRpc::new(move |endpoint, body| {
+            let launchers = body["puzzle_hash"] == hex_id(SINGLETON_LAUNCHER_HASH.into());
+            match endpoint {
+                "get_coin_records_by_puzzle_hash" if launchers => {
+                    assert_eq!(
+                        (body["start_height"].as_u64(), body["end_height"].as_u64()),
+                        (Some(100), Some(200))
+                    );
+                    Some(match body.get("cursor") {
+                        None => page(&[record(nft_launcher(), Some(150))], cursor, true),
+                        Some(_) => page(
+                            &second
+                                .map(|c| record(c, Some(160)))
+                                .into_iter()
+                                .collect::<Vec<_>>(),
+                            None,
+                            false,
+                        ),
+                    })
+                }
+                "get_coin_records_by_puzzle_hash" | "get_coin_records_by_hint" => {
+                    Some(page(&[], None, false))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn scan_finds_the_vault_launcher_on_a_later_page() {
+        let vault = vault_launcher().coin_id();
+        let address_ph = cloud_wallet_p2_hash(vault, 3);
+        let scan = LauncherScan::heights(100, 200, false).unwrap();
+        let rpc = launcher_pages(Some(vault_launcher()), Some("next"));
+        let found = resolve(rpc, address_ph, Some(&scan))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.launcher_id, vault);
+        assert!(found.source.contains("blocks 100..200"), "{}", found.source);
+    }
+
+    #[tokio::test]
+    async fn scan_without_a_match_reports_the_range() {
+        let address_ph = cloud_wallet_p2_hash(vault_launcher().coin_id(), 0);
+        let scan = LauncherScan::heights(100, 200, false).unwrap();
+        let rpc = launcher_pages(None, Some("next"));
+        let found = resolve(rpc, address_ph, Some(&scan)).await.unwrap();
+        assert!(
+            matches!(
+                found,
+                Err(LookupGap::NoLauncherInScan {
+                    start: 100,
+                    end: 200
+                })
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_fails_on_a_truncated_page_without_a_cursor() {
+        let address_ph = cloud_wallet_p2_hash(vault_launcher().coin_id(), 0);
+        let scan = LauncherScan::heights(100, 200, false).unwrap();
+        let rpc = launcher_pages(Some(vault_launcher()), None);
+        let err = resolve(rpc, address_ph, Some(&scan)).await.unwrap_err();
+        assert!(err.to_string().contains("narrower range"), "{err}");
     }
 
     #[test]

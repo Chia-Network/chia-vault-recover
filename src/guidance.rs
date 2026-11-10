@@ -14,6 +14,8 @@ pub struct KnownLauncher {
 pub enum LookupGap {
     /// Address unused, never spent, or parent spends did not reveal a launcher.
     LauncherNotFound,
+    /// Same, after an opt-in launcher scan of blocks `start..end` found no match.
+    NoLauncherInScan { start: u32, end: u32 },
     /// Launcher is known but the singleton has never been spent (eve only).
     SingletonNeverSpent(KnownLauncher),
     /// Singleton spends exist but none used the current custody path.
@@ -26,6 +28,9 @@ impl LookupGap {
             Self::LauncherNotFound => {
                 "Could not find this vault’s launcher id from the address alone."
             }
+            Self::NoLauncherInScan { .. } => {
+                "No launcher in the searched blocks matches this address."
+            }
             Self::SingletonNeverSpent(_) => {
                 "Found the launcher, but this vault has never been spent with the current setup."
             }
@@ -35,7 +40,7 @@ impl LookupGap {
         }
     }
 
-    pub fn detail(&self) -> &'static str {
+    pub fn detail(&self) -> String {
         match self {
             Self::LauncherNotFound => {
                 "A Cloud Wallet receive address does not contain the launcher id. \
@@ -43,21 +48,35 @@ impl LookupGap {
                  If the vault has never been spent and you know when it was created, \
                  search launchers from that date: lookup --created-on YYYY-MM-DD \
                  (or --scan-from-height and --scan-to-height; Search launchers in the app)."
+                    .into()
             }
+            Self::NoLauncherInScan { start, end } => format!(
+                "Every singleton launcher in blocks {start}..{end} was checked against the \
+                 address and none matched. Try a nearby date or a wider height range. \
+                 Addresses Cloud Wallet derived past nonce 100 are found only once a coin \
+                 at the address has been spent."
+            ),
             Self::SingletonNeverSpent(_) => {
                 "An unspent eve singleton has no Cloud Wallet recovery hint yet. \
                  One send from the vault publishes that hint."
+                    .into()
             }
             Self::NoCustodySpend(_) => {
                 "This vault has no Cloud Wallet recovery hint and no custody spend. \
                  A send that uses the vault’s passkey or Chia Signer App publishes the hint."
+                    .into()
             }
         }
     }
 
+    /// Whether another launcher scan could still find the launcher.
+    pub fn launcher_unknown(&self) -> bool {
+        matches!(self, Self::LauncherNotFound | Self::NoLauncherInScan { .. })
+    }
+
     pub fn known_launcher(&self) -> Option<&KnownLauncher> {
         match self {
-            Self::LauncherNotFound => None,
+            Self::LauncherNotFound | Self::NoLauncherInScan { .. } => None,
             Self::SingletonNeverSpent(launcher) | Self::NoCustodySpend(launcher) => Some(launcher),
         }
     }
@@ -142,6 +161,7 @@ mod tests {
     fn fallback_mentions_self_send_not_a_download() {
         for gap in [
             LookupGap::LauncherNotFound,
+            LookupGap::NoLauncherInScan { start: 1, end: 2 },
             LookupGap::SingletonNeverSpent(launcher()),
             LookupGap::NoCustodySpend(launcher()),
         ] {

@@ -75,9 +75,9 @@ chia-vault-recover lookup --vault xch1... --created-on 2026-01-15
 chia-vault-recover lookup --vault xch1... --scan-from-height 9000000 --scan-to-height 9005000
 ```
 
-Ranges are limited to 5 days (23,040 blocks); pass `--force-scan` to go past that. Each 1,000 blocks is one request to coinset. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
+Ranges are limited to 5 days (23,040 blocks); pass `--force-scan` to go past that. The scan runs only if no spend at the address reveals the launcher first. A date is turned into block heights only at that point. If no launcher in the range matches, the result names the blocks it searched. A date before the first block or after the latest one is an error. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
 
-Every Receive address the vault has is matched: the default address (nonce 0) and Cloud Wallet's derived addresses (nonces 1 to 100). The Receive address depends only on the launcher id and nonce, not on the vault singleton's puzzle, so the scan works for every vault puzzle Cloud Wallet has used. If Cloud Wallet changes the Receive (p2) puzzle itself, the scan reports *not found* until that puzzle is added; it never returns another singleton's launcher.
+Every Receive address the vault has is matched: the default address (nonce 0) and Cloud Wallet's derived addresses (nonces 1 to 100). An address above nonce 100 is found only from a spend that reveals its puzzle. The Receive address depends only on the launcher id and nonce, not on the vault singleton's puzzle, so the scan works for every vault puzzle Cloud Wallet has used. If Cloud Wallet changes the Receive (p2) puzzle itself, the scan reports *not found* until that puzzle is added; it never returns another singleton's launcher.
 
 Finding the launcher is not the same as being able to recover. If the vault has never been spent, the lookup still stops at the step below.
 

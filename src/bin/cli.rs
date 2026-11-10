@@ -12,9 +12,10 @@ use chia_vault_recover::guidance::{
     LOOKUP_CAN_RECOVER, LOOKUP_FROM_HINT, fallback_guidance, reconstruct_success_guidance,
 };
 use chia_vault_recover::keys::MnemonicWordCount;
-use chia_vault_recover::locate::{HeightRange, client_for_vault, heights_for_created_on};
+use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
 use chia_vault_recover::recovery::{StartRecoveryResult, VaultPhase};
+use chia_vault_recover::scan::LauncherScan;
 use chia_vault_recover::workflow::{self, LookupReport, PreparedStart, StartWorkflow};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -50,16 +51,16 @@ enum Commands {
         recovery_mnemonic_file: Option<PathBuf>,
         /// Opt-in launcher scan for a vault that has never been spent: the date the vault
         /// was created (`YYYY-MM-DD`). Checks every launcher from that day in any timezone.
-        #[arg(long, conflicts_with_all = ["scan_from_height", "scan_to_height"])]
+        #[arg(long, group = "scan", conflicts_with_all = ["scan_from_height", "scan_to_height"])]
         created_on: Option<String>,
         /// First block height to scan for the vault launcher (use with `--scan-to-height`).
-        #[arg(long, requires = "scan_to_height")]
+        #[arg(long, group = "scan", requires = "scan_to_height")]
         scan_from_height: Option<u32>,
         /// Block height to stop scanning at, exclusive (use with `--scan-from-height`).
         #[arg(long, requires = "scan_from_height")]
         scan_to_height: Option<u32>,
         /// Allow a launcher scan over the 5-day limit.
-        #[arg(long)]
+        #[arg(long, requires = "scan")]
         force_scan: bool,
     },
     /// Start delayed recovery (signs with the 12- or 24-word Cloud Wallet recovery phrase)
@@ -178,19 +179,13 @@ async fn main() -> Result<()> {
             let (client, network) = client_for(&vault, backend)?;
             let extra = clawback_secs.into_iter().collect::<Vec<_>>();
             let scan = match (created_on, scan_from_height, scan_to_height) {
-                (Some(date), _, _) => Some(heights_for_created_on(&client, &date).await?),
-                (None, Some(start), Some(end)) => Some(HeightRange::new(start, end)?),
+                (Some(date), _, _) => Some(LauncherScan::created_on(&date, force_scan)?),
+                (None, Some(start), Some(end)) => {
+                    Some(LauncherScan::heights(start, end, force_scan)?)
+                }
                 _ => None,
-            }
-            .map(|range| range.check_limit(force_scan))
-            .transpose()?;
-            if let Some(range) = scan {
-                println!(
-                    "scanning launchers in blocks {}..{}",
-                    range.start, range.end
-                );
-            }
-            let report = workflow::lookup(&client, &vault, &extra, scan).await?;
+            };
+            let report = workflow::lookup(&client, &vault, &extra, scan.as_ref()).await?;
             match report {
                 LookupReport::NeedFallback(gap) => {
                     print_fallback(network, &gap);

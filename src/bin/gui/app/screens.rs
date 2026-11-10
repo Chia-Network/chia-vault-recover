@@ -5,8 +5,7 @@ use eframe::egui;
 
 use crate::theme::{self, DANGER, muted, primary_button, secondary_button};
 
-use chia_vault_recover::LookupGap;
-use chia_vault_recover::locate::MAX_SCAN_DAYS;
+use chia_vault_recover::MAX_SCAN_DAYS;
 
 use super::{App, LauncherScan, Phase};
 
@@ -118,15 +117,15 @@ impl App {
             ui.label(detail);
             ui.add_space(6.0);
             ui.label("Send any amount from the vault back to the same Receive address, wait for confirmation, then look up again. That spend publishes the recovery hint.");
+            if matches!(&self.phase, Phase::Fallback(gap) if gap.launcher_unknown()) {
+                ui.add_space(6.0);
+                ui.collapsing("Search launchers", |ui| self.draw_scan_options(ui));
+            }
             ui.add_space(4.0);
             if primary_button(ui, "Look up again").clicked() {
                 self.run_lookup();
             }
         });
-        if matches!(self.phase, Phase::Fallback(LookupGap::LauncherNotFound)) {
-            ui.add_space(10.0);
-            ui.collapsing("Search launchers", |ui| self.draw_scan_options(ui));
-        }
         ui.collapsing("Details", |ui| {
             ui.label(guidance);
         });
