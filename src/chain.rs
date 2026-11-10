@@ -145,7 +145,7 @@ where
     }
 
     /// Lowest height whose transaction block is at or after `timestamp` (unix seconds).
-    /// Returns the peak height when every block is earlier.
+    /// Returns one past the peak when every block is earlier, so an exclusive end keeps the tip.
     pub async fn height_at_or_after(&self, timestamp: u64) -> Result<u32> {
         let state = self
             .call("get_blockchain_state", self.inner.get_blockchain_state())
@@ -332,7 +332,7 @@ where
     }
 }
 
-/// Binary search over `0..=peak`. `timestamp_from(h)` is the timestamp of the first
+/// Binary search over `0..=peak + 1`. `timestamp_from(h)` is the timestamp of the first
 /// transaction block at or above `h`, or `None` when there is none up to `peak`.
 async fn first_height_at_or_after<F, Fut>(
     peak: u32,
@@ -343,7 +343,7 @@ where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<Option<u64>>>,
 {
-    let (mut lo, mut hi) = (0, peak);
+    let (mut lo, mut hi) = (0, peak.saturating_add(1));
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         match timestamp_from(mid).await? {
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(height_for(1030).await, 1);
         assert_eq!(height_for(1031).await, 4);
         assert_eq!(height_for(1990).await, 97);
-        // Every block is earlier: the peak, so a future window is empty.
-        assert_eq!(height_for(5000).await, 99);
+        // Every block is earlier: one past the peak, so a window ending later keeps the tip.
+        assert_eq!(height_for(5000).await, 100);
     }
 }
