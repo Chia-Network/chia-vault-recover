@@ -2,6 +2,7 @@
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzle_types::{EveProof, LineageProof, Proof};
+use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_sdk_coinset::{ChiaRpcClient, CoinRecord, CoinsetClient};
 use chia_sdk_driver::{Layer, SingletonLayer, SpendContext};
 
@@ -62,6 +63,94 @@ impl ChainClient {
             }
         }
         Ok(all)
+    }
+
+    /// Every singleton launcher coin confirmed in `[start_height, end_height)`.
+    pub async fn find_launchers_between(
+        &self,
+        start_height: u32,
+        end_height: u32,
+    ) -> Result<Vec<CoinRecord>> {
+        const CHUNK: u32 = 1000;
+        let mut all = Vec::new();
+        let mut from = start_height;
+        while from < end_height {
+            let to = from.saturating_add(CHUNK).min(end_height);
+            let mut cursor = None;
+            loop {
+                let response = self
+                    .inner
+                    .get_coin_records_by_puzzle_hash(
+                        SINGLETON_LAUNCHER_HASH.into(),
+                        Some(from),
+                        Some(to),
+                        Some(true),
+                        cursor,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::msg(format!("get_coin_records_by_puzzle_hash failed: {e}"))
+                    })?;
+                all.extend(response.coin_records.unwrap_or_default());
+                match (response.truncated, response.next_cursor) {
+                    (Some(true), Some(next)) => cursor = Some(next),
+                    _ => break,
+                }
+            }
+            from = to;
+        }
+        Ok(all)
+    }
+
+    /// Lowest height whose transaction block is at or after `timestamp` (unix seconds).
+    /// Returns the peak height when every block is earlier.
+    pub async fn height_at_or_after(&self, timestamp: u64) -> Result<u32> {
+        let state = self
+            .inner
+            .get_blockchain_state()
+            .await
+            .map_err(|e| Error::msg(format!("get_blockchain_state failed: {e}")))?;
+        let peak = state
+            .blockchain_state
+            .ok_or_else(|| Error::msg("get_blockchain_state returned no state"))?
+            .peak
+            .height;
+        let (mut lo, mut hi) = (0, peak);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.transaction_timestamp_from(mid, peak).await? {
+                Some(ts) if ts >= timestamp => hi = mid,
+                Some(_) => lo = mid + 1,
+                None => hi = mid,
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Timestamp of the first transaction block at or above `height` (only those carry one).
+    async fn transaction_timestamp_from(&self, height: u32, peak: u32) -> Result<Option<u64>> {
+        const WINDOW: u32 = 32;
+        let mut start = height;
+        while start <= peak {
+            let end = start.saturating_add(WINDOW).min(peak + 1);
+            let response = self
+                .inner
+                .get_block_records(start, end)
+                .await
+                .map_err(|e| Error::msg(format!("get_block_records failed: {e}")))?;
+            if let Some(ts) = response
+                .block_records
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.height >= height && r.timestamp.is_some())
+                .min_by_key(|r| r.height)
+                .and_then(|r| r.timestamp)
+            {
+                return Ok(Some(ts));
+            }
+            start = end;
+        }
+        Ok(None)
     }
 
     /// Hint index is optional; backends that lack it return an empty list.

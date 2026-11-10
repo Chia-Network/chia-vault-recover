@@ -39,8 +39,10 @@ impl LookupGap {
         match self {
             Self::LauncherNotFound => {
                 "A Cloud Wallet receive address does not contain the launcher id. \
-                 The tool can only recover it from a spent coin at that address \
-                 (or from a parent vault spend)."
+                 The tool looks for it in spent coins at that address and their parents. \
+                 If the vault has never been spent and you know when it was created, \
+                 search launchers from that date: lookup --created-on YYYY-MM-DD \
+                 (or --scan-from-height and --scan-to-height; Search launchers in the app)."
             }
             Self::SingletonNeverSpent(_) => {
                 "An unspent eve singleton has no Cloud Wallet recovery hint yet. \

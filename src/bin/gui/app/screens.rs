@@ -5,7 +5,10 @@ use eframe::egui;
 
 use crate::theme::{self, DANGER, muted, primary_button, secondary_button};
 
-use super::{App, Phase};
+use chia_vault_recover::LookupGap;
+use chia_vault_recover::locate::MAX_SCAN_DAYS;
+
+use super::{App, LauncherScan, Phase};
 
 impl App {
     pub(super) fn draw_current_screen(&mut self, ui: &mut egui::Ui) {
@@ -37,7 +40,69 @@ impl App {
         ui.collapsing("Advanced", |ui| {
             ui.label("Full node URL (optional; empty = coinset):");
             ui.text_edit_singleline(&mut self.full_node_url);
+            ui.add_space(6.0);
+            self.draw_scan_options(ui);
         });
+    }
+
+    /// Opt-in launcher scan, matching `lookup --created-on` / `--scan-from-height` / `--force-scan`.
+    fn draw_scan_options(&mut self, ui: &mut egui::Ui) {
+        let mut enabled = self.launcher_scan != LauncherScan::Off;
+        if ui
+            .checkbox(&mut enabled, "Search launchers (vault never spent)")
+            .changed()
+        {
+            self.launcher_scan = if enabled {
+                LauncherScan::CreatedOn
+            } else {
+                LauncherScan::Off
+            };
+        }
+        if self.launcher_scan == LauncherScan::Off {
+            return;
+        }
+        ui.label(muted(
+            "Checks every launcher in a range against the Receive address. Use the date the vault was created.",
+        ));
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.launcher_scan,
+                LauncherScan::CreatedOn,
+                "Created on",
+            );
+            ui.radio_value(
+                &mut self.launcher_scan,
+                LauncherScan::Heights,
+                "Block heights",
+            );
+        });
+        match self.launcher_scan {
+            LauncherScan::CreatedOn => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.scan_created_on)
+                        .hint_text("YYYY-MM-DD (any timezone)"),
+                );
+            }
+            LauncherScan::Heights => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.scan_from_height)
+                            .desired_width(110.0)
+                            .hint_text("from height"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.scan_to_height)
+                            .desired_width(110.0)
+                            .hint_text("to height (exclusive)"),
+                    );
+                });
+            }
+            LauncherScan::Off => {}
+        }
+        ui.checkbox(
+            &mut self.force_scan,
+            format!("Allow a range over {MAX_SCAN_DAYS} days"),
+        );
     }
 
     fn draw_fallback(&mut self, ui: &mut egui::Ui) {
@@ -58,6 +123,10 @@ impl App {
                 self.run_lookup();
             }
         });
+        if matches!(self.phase, Phase::Fallback(LookupGap::LauncherNotFound)) {
+            ui.add_space(10.0);
+            ui.collapsing("Search launchers", |ui| self.draw_scan_options(ui));
+        }
         ui.collapsing("Details", |ui| {
             ui.label(guidance);
         });

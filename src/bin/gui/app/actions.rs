@@ -4,18 +4,19 @@ use std::path::Path;
 
 use chia_vault_recover::LookupGap;
 use chia_vault_recover::cache::VaultLookup;
+use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::config::VaultConfig;
 use chia_vault_recover::discover::{ClawbackCheck, check_clawback, confirm_hinted_config};
 use chia_vault_recover::error::Result;
 use chia_vault_recover::keys::MnemonicWordCount;
-use chia_vault_recover::locate::client_for_vault;
+use chia_vault_recover::locate::{HeightRange, client_for_vault, heights_for_created_on};
 use chia_vault_recover::network::Network;
 use chia_vault_recover::recovery::VaultPhase;
 use chia_vault_recover::workflow::{self, LookupReport, StartWorkflow};
 
 use crate::session::GuiSession;
 
-use super::{App, Phase, runtime};
+use super::{App, LauncherScan, Phase, runtime};
 
 impl App {
     pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network) {
@@ -73,12 +74,28 @@ impl App {
         }
         let (client, network) = client_for_vault(vault, &self.backend())?;
         let extra = self.parsed_clawback()?.into_iter().collect::<Vec<_>>();
-        let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
+        let scan = runtime().block_on(self.scan_range(&client))?;
+        let report = runtime().block_on(workflow::lookup(&client, vault, &extra, scan))?;
         match report {
             LookupReport::Ready(lookup) => self.apply_lookup(lookup, network),
             LookupReport::NeedFallback(gap) => self.apply_fallback(gap),
         }
         Ok(())
+    }
+
+    /// The opted-in launcher scan range, held to the 5-day limit unless forced.
+    async fn scan_range(&self, client: &ChainClient) -> Result<Option<HeightRange>> {
+        let range = match self.launcher_scan {
+            LauncherScan::Off => return Ok(None),
+            LauncherScan::CreatedOn => {
+                heights_for_created_on(client, self.scan_created_on.trim()).await?
+            }
+            LauncherScan::Heights => HeightRange::new(
+                Self::parsed_height(&self.scan_from_height, "scan from height")?,
+                Self::parsed_height(&self.scan_to_height, "scan to height")?,
+            )?,
+        };
+        range.check_limit(self.force_scan).map(Some)
     }
 
     pub(super) fn run_confirm_clawback(&mut self) {
