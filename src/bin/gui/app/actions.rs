@@ -19,7 +19,7 @@ use crate::session::GuiSession;
 use super::{App, LookupTask, Phase, ScanMode, runtime};
 
 impl App {
-    pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network) {
+    pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network, address: &str) {
         let secs = lookup.clawback().secs();
         let summary = match &lookup {
             VaultLookup::Hinted(config) => {
@@ -31,7 +31,7 @@ impl App {
                 found.launcher_source
             ),
         };
-        let address = self.vault_address.trim().to_string();
+        let address = address.trim().to_string();
         GuiSession::clear();
         self.generated_recovery_mnemonic = None;
         match self.cache.persist(&address, network, lookup) {

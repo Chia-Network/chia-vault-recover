@@ -2,6 +2,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
@@ -24,27 +25,50 @@ const MAX_SCAN_PAGES: usize = 100;
 const MAX_TIMESTAMP_WINDOWS: u32 = 8;
 /// Most coin records buffered for one paged request. A busy 5-day launcher scan
 /// stays well below this.
-const MAX_SCAN_RECORDS: usize = 500_000;
+const MAX_RECORDS: usize = 500_000;
+/// How often a launcher match yields to the runtime so a cancelled task or a
+/// deadline can take effect.
+const YIELD_AFTER_RECORDS: usize = 64;
 
-/// Per-page timeout and error hint for one paged coin-record request.
+/// Per-page limits and error hint for one paged coin-record request.
 #[derive(Debug, Clone, Copy)]
 struct PageLimits {
     timeout: Duration,
     hint: &'static str,
+    max_pages: usize,
     max_records: usize,
 }
 
 const COIN_PAGE_LIMITS: PageLimits = PageLimits {
     timeout: REQUEST_TIMEOUT,
     hint: "",
-    max_records: MAX_SCAN_RECORDS,
+    max_pages: 8,
+    max_records: MAX_RECORDS,
 };
 
 const SCAN_PAGE_LIMITS: PageLimits = PageLimits {
     timeout: SCAN_REQUEST_TIMEOUT,
     hint: "; try a narrower range",
-    max_records: MAX_SCAN_RECORDS,
+    max_pages: MAX_SCAN_PAGES,
+    max_records: MAX_RECORDS,
 };
+
+/// How one paged request ended: the listing finished, ran out of pages or
+/// records, or a visitor stopped it with a match.
+enum Paged {
+    Complete,
+    Incomplete,
+    Matched(Bytes32),
+}
+
+/// The coin records to page through.
+#[derive(Debug, Clone, Copy)]
+struct CoinQuery {
+    puzzle_hash: Bytes32,
+    start_height: Option<u32>,
+    end_height: Option<u32>,
+    include_spent: bool,
+}
 
 pub struct ChainClient<C = CoinsetClient> {
     inner: C,
@@ -89,12 +113,28 @@ where
         timeout_hint: &str,
         request: impl Future<Output = std::result::Result<T, C::Error>>,
     ) -> Result<T> {
+        self.call_within_raw(method, limit, timeout_hint, request)
+            .await
+            .map_err(RpcFailure::into_error)
+    }
+
+    /// Like [`Self::call_within`], but keeps a timeout distinguishable from another failure.
+    async fn call_within_raw<T>(
+        &self,
+        method: &str,
+        limit: Duration,
+        timeout_hint: &str,
+        request: impl Future<Output = std::result::Result<T, C::Error>>,
+    ) -> std::result::Result<T, RpcFailure> {
         match tokio::time::timeout(limit, request).await {
-            Ok(response) => response.map_err(|e| Error::msg(format!("{method} failed: {e}"))),
-            Err(_) => Err(Error::msg(format!(
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(RpcFailure::Failed(Error::msg(format!(
+                "{method} failed: {e}"
+            )))),
+            Err(_) => Err(RpcFailure::Timeout(Error::msg(format!(
                 "{method} timed out after {}s{timeout_hint}",
                 limit.as_secs()
-            ))),
+            )))),
         }
     }
 
@@ -107,89 +147,132 @@ where
             .map(|r| r.coin))
     }
 
-    /// Coins at `puzzle_hash`, following the cursor for at most 8 pages.
+    /// Coins at `puzzle_hash`, following the cursor for at most 8 pages and
+    /// stopping at the record cap.
     ///
     /// A partial list is acceptable for every caller: each needs only one matching
     /// record, every candidate is checked against the address, and when none matches
     /// the lookup falls through to its next step or the opt-in launcher scan. When
-    /// the node leaves pages unread, the records read so far are returned.
+    /// the node leaves pages unread, the record cap is reached, or the node truncates
+    /// without a new cursor, the records read so far are returned.
     pub async fn find_coins_by_puzzle_hash(
         &self,
         puzzle_hash: Bytes32,
         include_spent: bool,
     ) -> Result<Vec<CoinRecord>> {
-        let (records, _) = self
-            .paged_coin_records(puzzle_hash, None, None, include_spent, 8, COIN_PAGE_LIMITS)
-            .await?;
-        Ok(records)
+        self.find_coins_by_puzzle_hash_with(puzzle_hash, include_spent, COIN_PAGE_LIMITS)
+            .await
     }
 
-    /// Every singleton launcher coin confirmed in `range`.
-    /// Fails rather than return a partial list.
-    pub async fn find_launchers_between(&self, range: HeightRange) -> Result<Vec<CoinRecord>> {
-        let (records, complete) = self
-            .paged_coin_records(
-                SINGLETON_LAUNCHER_HASH.into(),
-                Some(range.start()),
-                Some(range.end()),
-                true,
-                MAX_SCAN_PAGES,
-                SCAN_PAGE_LIMITS,
-            )
-            .await?;
-        if !complete {
-            return Err(Error::msg(format!(
-                "could not list every launcher in {range}: the node stopped paging or sent over \
-                 {MAX_SCAN_PAGES} pages; try a narrower range"
-            )));
-        }
-        Ok(records)
-    }
-
-    /// Coin records at `puzzle_hash`, following the cursor for at most `max_pages`.
-    /// The flag is false when pages remain, or the node truncated without a new cursor.
-    async fn paged_coin_records(
+    async fn find_coins_by_puzzle_hash_with(
         &self,
         puzzle_hash: Bytes32,
-        start_height: Option<u32>,
-        end_height: Option<u32>,
         include_spent: bool,
-        max_pages: usize,
         limits: PageLimits,
-    ) -> Result<(Vec<CoinRecord>, bool)> {
-        let mut all = Vec::new();
+    ) -> Result<Vec<CoinRecord>> {
+        let query = CoinQuery {
+            puzzle_hash,
+            start_height: None,
+            end_height: None,
+            include_spent,
+        };
+        let mut records = Vec::new();
+        self.paged_coin_records(query, limits, |record| {
+            records.push(*record);
+            ControlFlow::Continue(())
+        })
+        .await?;
+        Ok(records)
+    }
+
+    /// The first singleton launcher in `range` for which `matches` is true.
+    /// Fails rather than report no match when the listing was incomplete.
+    pub async fn find_launcher_matching(
+        &self,
+        range: HeightRange,
+        matches: impl FnMut(Bytes32) -> bool,
+    ) -> Result<Option<Bytes32>> {
+        self.find_launcher_matching_with(range, SCAN_PAGE_LIMITS, matches)
+            .await
+    }
+
+    async fn find_launcher_matching_with(
+        &self,
+        range: HeightRange,
+        limits: PageLimits,
+        mut matches: impl FnMut(Bytes32) -> bool,
+    ) -> Result<Option<Bytes32>> {
+        let query = CoinQuery {
+            puzzle_hash: SINGLETON_LAUNCHER_HASH.into(),
+            start_height: Some(range.start()),
+            end_height: Some(range.end()),
+            include_spent: true,
+        };
+        let paged = self
+            .paged_coin_records(query, limits, |record| {
+                let id = record.coin.coin_id();
+                if matches(id) {
+                    ControlFlow::Break(id)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .await?;
+        match paged {
+            Paged::Matched(launcher) => Ok(Some(launcher)),
+            Paged::Complete => Ok(None),
+            Paged::Incomplete => Err(incomplete_scan(range, limits)),
+        }
+    }
+
+    /// Page through coin records, calling `visit` for each one until it returns
+    /// [`ControlFlow::Break`]. Yields to the runtime every few records so a
+    /// cancelled task or a deadline can take effect.
+    async fn paged_coin_records(
+        &self,
+        query: CoinQuery,
+        limits: PageLimits,
+        mut visit: impl FnMut(&CoinRecord) -> ControlFlow<Bytes32>,
+    ) -> Result<Paged> {
+        let mut count = 0;
         let mut cursor: Option<String> = None;
-        for _ in 0..max_pages {
+        for _ in 0..limits.max_pages {
             let response = self
                 .call_within(
                     "get_coin_records_by_puzzle_hash",
                     limits.timeout,
                     limits.hint,
                     self.inner.get_coin_records_by_puzzle_hash(
-                        puzzle_hash,
-                        start_height,
-                        end_height,
-                        Some(include_spent),
+                        query.puzzle_hash,
+                        query.start_height,
+                        query.end_height,
+                        Some(query.include_spent),
                         cursor.clone(),
                     ),
                 )
                 .await?;
-            all.extend(response.coin_records.unwrap_or_default());
-            if all.len() > limits.max_records {
-                return Err(Error::msg(format!(
-                    "the node returned over {} coin records; narrow the request",
-                    limits.max_records
-                )));
+            let page = response.coin_records.unwrap_or_default();
+            for record in &page {
+                if count % YIELD_AFTER_RECORDS == 0 {
+                    tokio::task::yield_now().await;
+                }
+                count += 1;
+                if let ControlFlow::Break(id) = visit(record) {
+                    return Ok(Paged::Matched(id));
+                }
+            }
+            if count > limits.max_records {
+                return Ok(Paged::Incomplete);
             }
             if response.truncated != Some(true) {
-                return Ok((all, true));
+                return Ok(Paged::Complete);
             }
             match response.next_cursor {
                 Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
-                _ => return Ok((all, false)),
+                _ => return Ok(Paged::Incomplete),
             }
         }
-        Ok((all, false))
+        Ok(Paged::Incomplete)
     }
 
     async fn peak_height(&self) -> Result<u32> {
@@ -203,30 +286,19 @@ where
             .height)
     }
 
-    /// Lowest height whose transaction block is at or after `timestamp` (unix seconds).
-    /// Returns one past the peak when every block is earlier, so an exclusive end keeps the tip.
-    pub async fn height_at_or_after(&self, timestamp: u64) -> Result<u32> {
+    /// Block-height bounds from a `from` timestamp (inclusive) to a `to` timestamp
+    /// (exclusive). Reads the peak once so both bounds use the same chain tip.
+    /// `None` when the timestamps fall outside the chain's block times.
+    pub async fn height_range_for_timestamps(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<HeightRange>> {
         let peak = self.peak_height().await?;
-        first_height_at_or_after(peak, timestamp, |height| {
-            self.transaction_timestamp_from(height, peak)
-        })
-        .await
-    }
-
-    /// Block-height bounds `(start, end)` from a `from` timestamp (inclusive) to a
-    /// `to` timestamp (exclusive). Reads the peak once so both bounds use the same
-    /// chain tip. `start >= end` when the timestamps fall outside the chain's block times.
-    pub async fn height_range_for_timestamps(&self, from: u64, to: u64) -> Result<(u32, u32)> {
-        let peak = self.peak_height().await?;
-        let start = first_height_at_or_after(peak, from, |height| {
-            self.transaction_timestamp_from(height, peak)
-        })
-        .await?;
-        let end = first_height_at_or_after(peak, to, |height| {
-            self.transaction_timestamp_from(height, peak)
-        })
-        .await?;
-        Ok((start, end))
+        let timestamp_from = |height| self.transaction_timestamp_from(height, peak);
+        let start = first_height_at_or_after(peak, from, timestamp_from).await?;
+        let end = first_height_at_or_after(peak, to, timestamp_from).await?;
+        Ok(HeightRange::new(start, end).ok())
     }
 
     /// Timestamp of the first transaction block at or above `height` (only those carry one).
@@ -286,13 +358,13 @@ where
         let request =
             self.inner
                 .get_coin_records_by_hint(hint, None, None, Some(include_spent), None);
-        match tokio::time::timeout(limit, request).await {
-            Ok(Ok(response)) => Ok(response.coin_records.unwrap_or_default()),
-            Ok(Err(_)) => Ok(Vec::new()),
-            Err(_) => Err(Error::msg(format!(
-                "get_coin_records_by_hint timed out after {}s",
-                limit.as_secs()
-            ))),
+        match self
+            .call_within_raw("get_coin_records_by_hint", limit, "", request)
+            .await
+        {
+            Ok(response) => Ok(response.coin_records.unwrap_or_default()),
+            Err(RpcFailure::Timeout(e)) => Err(e),
+            Err(RpcFailure::Failed(_)) => Ok(Vec::new()),
         }
     }
 
@@ -418,6 +490,26 @@ where
     }
 }
 
+enum RpcFailure {
+    Timeout(Error),
+    Failed(Error),
+}
+
+impl RpcFailure {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Timeout(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
+fn incomplete_scan(range: HeightRange, limits: PageLimits) -> Error {
+    Error::msg(format!(
+        "could not list every launcher in {range}: the node stopped paging or sent over {} pages or {} coin records; try a narrower range",
+        limits.max_pages, limits.max_records
+    ))
+}
+
 /// Binary search over `0..=peak + 1`. `timestamp_from(h)` is the timestamp of the first
 /// transaction block at or above `h`, or `None` when there is none up to `peak`.
 async fn first_height_at_or_after<F, Fut>(
@@ -464,29 +556,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test_rpc::{ScriptedRpc, block_record, page, record};
-
-    struct NeverRpc;
-
-    impl ChiaRpcClient for NeverRpc {
-        type Error = String;
-
-        fn base_url(&self) -> &str {
-            "never"
-        }
-
-        async fn make_post_request<R, B>(
-            &self,
-            _endpoint: &str,
-            _body: B,
-        ) -> std::result::Result<R, String>
-        where
-            B: serde::Serialize + Send,
-            R: serde::de::DeserializeOwned + Send,
-        {
-            std::future::pending().await
-        }
-    }
+    use crate::test_rpc::{NeverRpc, ScriptedRpc, block_record, page, record};
 
     struct FailingRpc(&'static str);
 
@@ -535,15 +605,18 @@ mod tests {
     #[tokio::test]
     async fn call_within_times_out_when_the_node_does_not_respond() {
         let client = ChainClient::with_rpc(NeverRpc);
-        let err = client
-            .call_within(
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_within(
                 "get_blockchain_state",
                 Duration::from_millis(10),
                 "",
                 client.inner.get_blockchain_state(),
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("call_within should apply its timeout")
+        .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 
@@ -554,7 +627,7 @@ mod tests {
             _ => None,
         });
         let err = ChainClient::with_rpc(rpc)
-            .find_launchers_between(HeightRange::new(1, 2).unwrap())
+            .find_launcher_matching(HeightRange::new(1, 2).unwrap(), |_| false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("narrower range"), "{err}");
@@ -573,7 +646,7 @@ mod tests {
             _ => None,
         });
         let err = ChainClient::with_rpc(rpc)
-            .find_launchers_between(HeightRange::new(1, 2).unwrap())
+            .find_launcher_matching(HeightRange::new(1, 2).unwrap(), |_| false)
             .await
             .unwrap_err();
         assert_eq!(calls.load(Ordering::Relaxed), MAX_SCAN_PAGES);
@@ -600,36 +673,73 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
-    #[tokio::test]
-    async fn paged_records_stop_at_the_record_cap() {
-        let records = [
-            record(
-                Coin::new(Bytes32::new([1; 32]), Bytes32::default(), 1),
-                None,
-            ),
-            record(
-                Coin::new(Bytes32::new([2; 32]), Bytes32::default(), 1),
-                None,
-            ),
-            record(
-                Coin::new(Bytes32::new([3; 32]), Bytes32::default(), 1),
-                None,
-            ),
-        ];
-        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+    fn capped_page(records: &[CoinRecord]) -> ScriptedRpc {
+        let records = records.to_vec();
+        ScriptedRpc::new(move |endpoint, _| match endpoint {
             "get_coin_records_by_puzzle_hash" => Some(page(&records, None, false)),
             _ => None,
-        });
-        let limits = PageLimits {
+        })
+    }
+
+    fn small_limits(max_records: usize) -> PageLimits {
+        PageLimits {
             timeout: Duration::from_secs(1),
             hint: "",
-            max_records: 2,
-        };
-        let err = ChainClient::with_rpc(rpc)
-            .paged_coin_records(Bytes32::default(), None, None, false, 1, limits)
+            max_pages: 8,
+            max_records,
+        }
+    }
+
+    fn coins(count: usize) -> Vec<CoinRecord> {
+        (0..count)
+            .map(|index| {
+                record(
+                    Coin::new(Bytes32::new([index as u8; 32]), Bytes32::default(), 1),
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn record_cap_accepts_exactly_the_cap_for_address() {
+        let records = ChainClient::with_rpc(capped_page(&coins(2)))
+            .find_coins_by_puzzle_hash_with(Bytes32::default(), false, small_limits(2))
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn record_cap_accepts_exactly_the_cap_for_scan() {
+        let launcher = ChainClient::with_rpc(capped_page(&coins(2)))
+            .find_launcher_matching_with(HeightRange::new(1, 2).unwrap(), small_limits(2), |_| {
+                false
+            })
+            .await
+            .unwrap();
+        assert_eq!(launcher, None);
+    }
+
+    #[tokio::test]
+    async fn record_cap_makes_a_launcher_scan_error() {
+        let err = ChainClient::with_rpc(capped_page(&coins(3)))
+            .find_launcher_matching_with(HeightRange::new(1, 2).unwrap(), small_limits(2), |_| {
+                false
+            })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("over 2 coin records"), "{err}");
+        assert!(err.to_string().contains("2 coin records"), "{err}");
+        assert!(err.to_string().contains("narrower range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn record_cap_returns_a_partial_address_list() {
+        let records = ChainClient::with_rpc(capped_page(&coins(3)))
+            .find_coins_by_puzzle_hash_with(Bytes32::default(), false, small_limits(2))
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 3);
     }
 
     #[tokio::test]
@@ -670,10 +780,13 @@ mod tests {
     #[tokio::test]
     async fn hint_timeout_is_returned() {
         let client = ChainClient::with_rpc(NeverRpc);
-        let err = client
-            .find_coins_by_hint_within(Bytes32::default(), false, Duration::from_millis(10))
-            .await
-            .unwrap_err();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.find_coins_by_hint_within(Bytes32::default(), false, Duration::from_millis(10)),
+        )
+        .await
+        .expect("hint lookup should apply its timeout")
+        .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 }

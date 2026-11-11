@@ -40,6 +40,25 @@ impl ChiaRpcClient for ScriptedRpc {
     }
 }
 
+/// An RPC client that never answers, for timeout tests.
+pub struct NeverRpc;
+
+impl ChiaRpcClient for NeverRpc {
+    type Error = String;
+
+    fn base_url(&self) -> &str {
+        "never"
+    }
+
+    async fn make_post_request<R, B>(&self, _endpoint: &str, _body: B) -> Result<R, String>
+    where
+        B: Serialize + Send,
+        R: DeserializeOwned + Send,
+    {
+        std::future::pending().await
+    }
+}
+
 pub fn hex_id(id: Bytes32) -> String {
     format!("0x{}", hex::encode(id))
 }

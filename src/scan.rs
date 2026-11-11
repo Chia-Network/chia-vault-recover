@@ -92,13 +92,12 @@ impl LauncherScan {
         match &self.0 {
             Window::Heights(range) => Ok(*range),
             Window::CreatedOn { date, from, to } => {
-                let (start, end) = client.height_range_for_timestamps(*from, *to).await?;
-                let range = HeightRange::new(start, end).map_err(|_| {
-                    Error::msg(format!(
+                match client.height_range_for_timestamps(*from, *to).await? {
+                    Some(range) => check_created_on_range(range, date),
+                    None => Err(Error::msg(format!(
                         "no blocks found for {date}: it is before the first block or after the latest"
-                    ))
-                })?;
-                check_created_on_range(range, date)
+                    ))),
+                }
             }
         }
     }

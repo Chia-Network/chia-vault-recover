@@ -198,8 +198,10 @@ async fn main() -> Result<()> {
             .await?;
             match report {
                 LookupReport::NeedFallback(gap) => {
-                    LookupCache::open().discard(&vault)?;
                     print_fallback(network, &gap);
+                    if let Err(e) = LookupCache::open().discard(&vault) {
+                        eprintln!("could not clear the saved lookup: {e}");
+                    }
                     std::process::exit(2);
                 }
                 LookupReport::Ready(lookup) => {

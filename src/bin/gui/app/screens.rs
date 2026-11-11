@@ -50,7 +50,7 @@ impl App {
             ui.strong("Looking up…");
             let minutes = LOOKUP_DEADLINE.as_secs() / 60;
             ui.label(muted(format!(
-                "Checking the chain for the vault launcher. The lookup stops after {minutes} minutes.",
+                "Checking the chain for the vault launcher. The lookup stops after {minutes} minutes, or when you click Cancel.",
             )));
             ui.add_space(4.0);
             if secondary_button(ui, "Cancel").clicked() {

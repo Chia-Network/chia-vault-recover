@@ -154,7 +154,8 @@ where
         if let Some(spend) = client
             .get_spend(rec.coin.coin_id(), rec.spent_block_index)
             .await?
-            && let Some((id, true)) = launcher_from_spend_for_address(&spend, puzzle_hash)
+            && let SpendLauncher::Accepted(id) =
+                launcher_from_spend_for_address(&spend, puzzle_hash)
         {
             return Ok(Some(id));
         }
@@ -187,9 +188,9 @@ where
         };
         if let Some(spend) = &spend {
             match launcher_from_spend_for_address(spend, puzzle_hash) {
-                Some((id, true)) => return Ok(Some(id)),
-                Some((_, false)) => continue,
-                None => {}
+                SpendLauncher::Accepted(id) => return Ok(Some(id)),
+                SpendLauncher::Other => continue,
+                SpendLauncher::None => {}
             }
         }
         if rec.coin.amount % 2 == 0 {
@@ -218,11 +219,17 @@ where
     C: ChiaRpcClient,
     C::Error: Display,
 {
-    let launchers = client.find_launchers_between(range).await?;
-    Ok(launchers
-        .iter()
-        .map(|r| r.coin.coin_id())
-        .find(|id| launcher_matches_address(*id, puzzle_hash)))
+    client
+        .find_launcher_matching(range, |launcher| {
+            launcher_matches_address(launcher, puzzle_hash)
+        })
+        .await
+}
+
+enum SpendLauncher {
+    Accepted(Bytes32),
+    Other,
+    None,
 }
 
 /// The launcher a spend reveals, with whether it is accepted for `puzzle_hash`.
@@ -231,15 +238,20 @@ where
 /// launcher directly, whatever receive puzzle Cloud Wallet used. Otherwise fall back
 /// to rebuilding the known receive puzzles. The revealed hash deliberately does not
 /// unwrap a `SingletonLayer`: a vault singleton spend falls through to the rebuild.
-fn launcher_from_spend_for_address(
-    spend: &CoinSpend,
-    puzzle_hash: Bytes32,
-) -> Option<(Bytes32, bool)> {
-    let (ctx, puzzle, solution_ptr) = alloc_spend(spend).ok()?;
-    let launcher_id = launcher_from_puzzle(&ctx, puzzle, solution_ptr)?;
+fn launcher_from_spend_for_address(spend: &CoinSpend, puzzle_hash: Bytes32) -> SpendLauncher {
+    let Ok((ctx, puzzle, solution_ptr)) = alloc_spend(spend) else {
+        return SpendLauncher::None;
+    };
+    let Some(launcher_id) = launcher_from_puzzle(&ctx, puzzle, solution_ptr) else {
+        return SpendLauncher::None;
+    };
     let accepted = revealed_p2_hash(&ctx, puzzle) == puzzle_hash
         || launcher_matches_address(launcher_id, puzzle_hash);
-    Some((launcher_id, accepted))
+    if accepted {
+        SpendLauncher::Accepted(launcher_id)
+    } else {
+        SpendLauncher::Other
+    }
 }
 
 fn revealed_p2_hash(ctx: &clvmr::Allocator, puzzle: Puzzle) -> Bytes32 {
@@ -393,14 +405,14 @@ mod tests {
         );
         assert_eq!(launcher_from_spend(&spend), Some(launcher));
         assert!(!launcher_matches_address(launcher, address));
-        assert_eq!(
+        assert!(matches!(
             launcher_from_spend_for_address(&spend, address),
-            Some((launcher, true))
-        );
-        assert_eq!(
+            SpendLauncher::Accepted(id) if id == launcher
+        ));
+        assert!(matches!(
             launcher_from_spend_for_address(&spend, Bytes32::new([0x47; 32])),
-            Some((launcher, false))
-        );
+            SpendLauncher::Other
+        ));
     }
 
     fn vault_launcher() -> Coin {
@@ -512,10 +524,10 @@ mod tests {
             ctx.serialize(&cat).unwrap(),
             ctx.serialize(&NodePtr::NIL).unwrap(),
         );
-        assert_eq!(
+        assert!(matches!(
             launcher_from_spend_for_address(&spend, address_ph),
-            Some((vault, true))
-        );
+            SpendLauncher::Accepted(id) if id == vault
+        ));
         assert!(!launcher_matches_address(vault, address_ph));
 
         let coin = record(spend.coin, Some(9));
@@ -600,6 +612,37 @@ mod tests {
             .unwrap();
         assert_eq!(found.launcher_id, vault);
         assert!(found.source.contains("blocks 100..200"), "{}", found.source);
+    }
+
+    #[tokio::test]
+    async fn scan_stops_after_a_match_on_the_first_page() {
+        let vault = vault_launcher().coin_id();
+        let address_ph = address_of(vault, 0);
+        let scan = LauncherScan::heights(100, 200, false).unwrap();
+        let rpc = ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_coin_records_by_puzzle_hash"
+                if body["puzzle_hash"] == hex_id(SINGLETON_LAUNCHER_HASH.into()) =>
+            {
+                assert!(
+                    body.get("cursor").is_none(),
+                    "a match on the first page must not fetch a later page"
+                );
+                Some(page(
+                    &[record(vault_launcher(), Some(150))],
+                    Some("next"),
+                    true,
+                ))
+            }
+            "get_coin_records_by_puzzle_hash" | "get_coin_records_by_hint" => {
+                Some(page(&[], None, false))
+            }
+            _ => None,
+        });
+        let found = resolve(rpc, address_ph, Some(&scan))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.launcher_id, vault);
     }
 
     #[tokio::test]

@@ -218,7 +218,9 @@ impl App {
             Ok(Ok(report)) => {
                 self.phase = Phase::Lookup;
                 match report {
-                    LookupReport::Ready(lookup) => self.apply_lookup(lookup, task.network),
+                    LookupReport::Ready(lookup) => {
+                        self.apply_lookup(lookup, task.network, &task.address)
+                    }
                     LookupReport::NeedFallback(gap) => self.apply_fallback(gap, &task.address),
                 }
             }
