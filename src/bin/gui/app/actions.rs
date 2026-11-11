@@ -10,9 +10,8 @@ use chia_vault_recover::error::Result;
 use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::Network;
-use chia_vault_recover::recovery::VaultPhase;
 use chia_vault_recover::scan;
-use chia_vault_recover::workflow::{self, StartWorkflow};
+use chia_vault_recover::workflow::{self, FinishAction, StartWorkflow};
 
 use crate::session::GuiSession;
 
@@ -190,10 +189,12 @@ impl App {
         let (client, _) = self.chain_client()?;
         let report = runtime().block_on(workflow::inspect(&client, &config, post.as_ref()))?;
         self.detail = report.guidance.clone();
-        self.set_ok(match report.phase {
-            VaultPhase::InRecovery => format!("Phase: InRecovery — {}", report.guidance),
-            phase => format!("Phase: {phase:?}"),
-        });
+        let mut message = format!("Phase: {:?} — {}", report.phase, report.guidance);
+        if let Some(note) = &report.pending_note {
+            message.push(' ');
+            message.push_str(note);
+        }
+        self.set_ok(message);
         Ok(())
     }
 
@@ -301,13 +302,143 @@ impl App {
         let config = VaultConfig::load(&config_path)?;
         let post = VaultConfig::load(&post_path)?;
         let (client, network) = self.chain_client()?;
-        let handle = runtime().block_on(workflow::finish(&client, &config, &post, network))?;
-        GuiSession::clear();
+        let outcome = runtime().block_on(workflow::finish(&client, &config, &post, network))?;
+        self.settle_finish(
+            outcome.action,
+            outcome.pending_note.as_deref(),
+            &GuiSession::default_path(),
+        );
+        Ok(())
+    }
+
+    /// Every settled finish leaves the wizard on Done and deletes the on-disk session.
+    fn settle_finish(
+        &mut self,
+        action: FinishAction,
+        pending_note: Option<&str>,
+        session_path: &Path,
+    ) {
+        GuiSession::clear_at(session_path);
         self.generated_recovery_mnemonic = None;
         self.phase = Phase::Done;
-        self.set_ok(format!(
-            "Finish pushed ({handle}). Vault custody is now the new BLS key."
-        ));
-        Ok(())
+        self.set_ok(finish_status(&action, pending_note));
+    }
+}
+
+fn finish_status(action: &FinishAction, pending_note: Option<&str>) -> String {
+    let text = match action {
+        FinishAction::Pushed(handle) => {
+            format!("Finish pushed ({handle}). Vault custody is now the new BLS key.")
+        }
+        FinishAction::AlreadyFinished => {
+            "Vault is under the recovered custody configuration.".to_string()
+        }
+        FinishAction::ClawedBack => {
+            "Vault is under the original custody configuration.".to_string()
+        }
+    };
+    match pending_note.map(str::trim).filter(|note| !note.is_empty()) {
+        Some(note) => format!("{note} {text}"),
+        None => text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use chia_vault_recover::cache::LookupCache;
+    use chia_vault_recover::workflow::FinishAction;
+
+    use super::super::{App, Phase, resumable_session};
+    use super::finish_status;
+    use crate::session::GuiSession;
+
+    fn temp_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "cvr-gui-finish-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn started_session(dir: &Path) -> GuiSession {
+        let config = dir.join("vault-config.json");
+        let post = dir.join("post.json");
+        fs::write(&config, "{}").unwrap();
+        fs::write(&post, "{}").unwrap();
+        GuiSession {
+            receive_address: "txch1test".into(),
+            config_path: config.display().to_string(),
+            post_recovery_path: post.display().to_string(),
+            clawback_secs: Some(60),
+            started_at: Some(1_700_000_000),
+        }
+    }
+
+    fn app_waiting(session: GuiSession) -> App {
+        let mut app = App::base(LookupCache::open_at(temp_dir().join("cache.json")), true);
+        app.vault_address = session.receive_address.clone();
+        app.generated_recovery_mnemonic = Some("shown recovery phrase".into());
+        app.phase = Phase::Wait(session);
+        app.logged_first_frame = true;
+        app
+    }
+
+    #[test]
+    fn settled_finish_closes_the_recovery_session() {
+        let cases = [
+            (
+                FinishAction::Pushed("tx-1".into()),
+                "Finish pushed (tx-1). Vault custody is now the new BLS key.",
+            ),
+            (
+                FinishAction::AlreadyFinished,
+                "Vault is under the recovered custody configuration.",
+            ),
+            (
+                FinishAction::ClawedBack,
+                "Vault is under the original custody configuration.",
+            ),
+        ];
+        for (action, expected) in cases {
+            let dir = temp_dir();
+            fs::create_dir_all(&dir).unwrap();
+            let session_path = dir.join("gui-session.json");
+            let session = started_session(&dir);
+            session.save_at(&session_path).unwrap();
+
+            let mut app = app_waiting(session.clone());
+            assert!(resumable_session(Some(session), &app.cache).is_some());
+            assert!(app.waiting_session().is_some());
+
+            app.settle_finish(action, None, &session_path);
+
+            assert!(matches!(app.phase, Phase::Done));
+            assert!(app.waiting_session().is_none());
+            assert!(app.generated_recovery_mnemonic.is_none());
+            assert_eq!(app.status.text(), expected);
+            assert_eq!(app.subtitle(), super::super::DONE_SUBTITLE);
+            assert!(!app.subtitle().contains("new BLS"));
+            assert!(resumable_session(GuiSession::load_at(&session_path), &app.cache).is_none());
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn finish_status_prefixes_a_pending_note() {
+        let note = "A pending spend of this vault is in the mempool and may finish recovery or claw it back.";
+        let status = finish_status(&FinishAction::ClawedBack, Some(note));
+        assert_eq!(
+            status,
+            format!("{note} Vault is under the original custody configuration.")
+        );
+        assert_eq!(
+            finish_status(&FinishAction::ClawedBack, Some("  ")),
+            "Vault is under the original custody configuration."
+        );
     }
 }
