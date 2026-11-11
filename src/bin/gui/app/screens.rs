@@ -5,14 +5,15 @@ use eframe::egui;
 
 use crate::theme::{self, DANGER, muted, primary_button, secondary_button};
 
-use chia_vault_recover::MAX_SCAN_DAYS;
+use chia_vault_recover::{LOOKUP_DEADLINE, MAX_SCAN_DAYS};
 
-use super::{App, LauncherScan, Phase};
+use super::{App, Phase, ScanMode};
 
 impl App {
     pub(super) fn draw_current_screen(&mut self, ui: &mut egui::Ui) {
         match &self.phase {
             Phase::Lookup => self.draw_lookup(ui),
+            Phase::LookingUp => self.draw_looking_up(ui),
             Phase::Fallback(_) => self.draw_fallback(ui),
             Phase::Start => self.draw_start(ui),
             Phase::Wait(_) => self.draw_wait_finish(ui),
@@ -44,45 +45,51 @@ impl App {
         });
     }
 
+    fn draw_looking_up(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame(ui).show(ui, |ui| {
+            ui.strong("Looking up…");
+            let minutes = LOOKUP_DEADLINE.as_secs() / 60;
+            ui.label(muted(format!(
+                "Checking the chain for the vault launcher. The lookup stops after {minutes} minutes.",
+            )));
+            ui.add_space(4.0);
+            if secondary_button(ui, "Cancel").clicked() {
+                self.cancel_lookup();
+            }
+        });
+    }
+
     /// Opt-in launcher scan, matching `lookup --created-on` / `--scan-from-height` / `--force-scan`.
     fn draw_scan_options(&mut self, ui: &mut egui::Ui) {
-        let mut enabled = self.launcher_scan != LauncherScan::Off;
+        let mut enabled = self.scan_mode != ScanMode::Off;
         if ui
             .checkbox(&mut enabled, "Search launchers (vault never spent)")
             .changed()
         {
-            self.launcher_scan = if enabled {
-                LauncherScan::CreatedOn
+            self.scan_mode = if enabled {
+                ScanMode::CreatedOn
             } else {
-                LauncherScan::Off
+                ScanMode::Off
             };
         }
-        if self.launcher_scan == LauncherScan::Off {
+        if self.scan_mode == ScanMode::Off {
             return;
         }
         ui.label(muted(
             "Checks every launcher in a range against the Receive address. Use the date the vault was created.",
         ));
         ui.horizontal(|ui| {
-            ui.radio_value(
-                &mut self.launcher_scan,
-                LauncherScan::CreatedOn,
-                "Created on",
-            );
-            ui.radio_value(
-                &mut self.launcher_scan,
-                LauncherScan::Heights,
-                "Block heights",
-            );
+            ui.radio_value(&mut self.scan_mode, ScanMode::CreatedOn, "Created on");
+            ui.radio_value(&mut self.scan_mode, ScanMode::Heights, "Block heights");
         });
-        match self.launcher_scan {
-            LauncherScan::CreatedOn => {
+        match self.scan_mode {
+            ScanMode::CreatedOn => {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.scan_created_on)
                         .hint_text("YYYY-MM-DD (any timezone)"),
                 );
             }
-            LauncherScan::Heights => {
+            ScanMode::Heights => {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.scan_from_height)
@@ -100,7 +107,7 @@ impl App {
                     format!("Allow a range over {MAX_SCAN_DAYS} days"),
                 );
             }
-            LauncherScan::Off => {}
+            ScanMode::Off => {}
         }
     }
 

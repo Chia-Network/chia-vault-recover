@@ -12,6 +12,7 @@ use chia_sdk_driver::{Layer, SingletonLayer, SpendContext};
 
 use crate::error::{Error, Result};
 use crate::network::{Backend, Network};
+use crate::scan::HeightRange;
 
 /// Longest wait for one RPC response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -21,6 +22,29 @@ const SCAN_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SCAN_PAGES: usize = 100;
 /// Most 32-block windows searched for a transaction block's timestamp.
 const MAX_TIMESTAMP_WINDOWS: u32 = 8;
+/// Most coin records buffered for one paged request. A busy 5-day launcher scan
+/// stays well below this.
+const MAX_SCAN_RECORDS: usize = 500_000;
+
+/// Per-page timeout and error hint for one paged coin-record request.
+#[derive(Debug, Clone, Copy)]
+struct PageLimits {
+    timeout: Duration,
+    hint: &'static str,
+    max_records: usize,
+}
+
+const COIN_PAGE_LIMITS: PageLimits = PageLimits {
+    timeout: REQUEST_TIMEOUT,
+    hint: "",
+    max_records: MAX_SCAN_RECORDS,
+};
+
+const SCAN_PAGE_LIMITS: PageLimits = PageLimits {
+    timeout: SCAN_REQUEST_TIMEOUT,
+    hint: "; try a narrower range",
+    max_records: MAX_SCAN_RECORDS,
+};
 
 pub struct ChainClient<C = CoinsetClient> {
     inner: C,
@@ -83,57 +107,47 @@ where
             .map(|r| r.coin))
     }
 
-    /// Coins at `puzzle_hash`, at most 8 pages; later pages are dropped.
+    /// Coins at `puzzle_hash`, following the cursor for at most 8 pages.
+    ///
+    /// A partial list is acceptable for every caller: each needs only one matching
+    /// record, every candidate is checked against the address, and when none matches
+    /// the lookup falls through to its next step or the opt-in launcher scan. When
+    /// the node leaves pages unread, the records read so far are returned.
     pub async fn find_coins_by_puzzle_hash(
         &self,
         puzzle_hash: Bytes32,
         include_spent: bool,
     ) -> Result<Vec<CoinRecord>> {
-        let (records, _complete) = self
-            .paged_coin_records(
-                puzzle_hash,
-                None,
-                None,
-                include_spent,
-                8,
-                REQUEST_TIMEOUT,
-                "",
-            )
+        let (records, _) = self
+            .paged_coin_records(puzzle_hash, None, None, include_spent, 8, COIN_PAGE_LIMITS)
             .await?;
         Ok(records)
     }
 
-    /// Every singleton launcher coin confirmed in `[start_height, end_height)`.
+    /// Every singleton launcher coin confirmed in `range`.
     /// Fails rather than return a partial list.
-    pub async fn find_launchers_between(
-        &self,
-        start_height: u32,
-        end_height: u32,
-    ) -> Result<Vec<CoinRecord>> {
+    pub async fn find_launchers_between(&self, range: HeightRange) -> Result<Vec<CoinRecord>> {
         let (records, complete) = self
             .paged_coin_records(
                 SINGLETON_LAUNCHER_HASH.into(),
-                Some(start_height),
-                Some(end_height),
+                Some(range.start()),
+                Some(range.end()),
                 true,
                 MAX_SCAN_PAGES,
-                SCAN_REQUEST_TIMEOUT,
-                "; try a narrower range",
+                SCAN_PAGE_LIMITS,
             )
             .await?;
         if !complete {
             return Err(Error::msg(format!(
-                "could not list every launcher in blocks {start_height}..{end_height}: the node \
-                 stopped paging or sent over {MAX_SCAN_PAGES} pages; try a narrower range"
+                "could not list every launcher in {range}: the node stopped paging or sent over \
+                 {MAX_SCAN_PAGES} pages; try a narrower range"
             )));
         }
         Ok(records)
     }
 
-    /// Coin records at `puzzle_hash`, following the cursor for at most `max_pages`,
-    /// each page within `page_timeout`.
+    /// Coin records at `puzzle_hash`, following the cursor for at most `max_pages`.
     /// The flag is false when pages remain, or the node truncated without a new cursor.
-    #[allow(clippy::too_many_arguments)]
     async fn paged_coin_records(
         &self,
         puzzle_hash: Bytes32,
@@ -141,8 +155,7 @@ where
         end_height: Option<u32>,
         include_spent: bool,
         max_pages: usize,
-        page_timeout: Duration,
-        timeout_hint: &str,
+        limits: PageLimits,
     ) -> Result<(Vec<CoinRecord>, bool)> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
@@ -150,8 +163,8 @@ where
             let response = self
                 .call_within(
                     "get_coin_records_by_puzzle_hash",
-                    page_timeout,
-                    timeout_hint,
+                    limits.timeout,
+                    limits.hint,
                     self.inner.get_coin_records_by_puzzle_hash(
                         puzzle_hash,
                         start_height,
@@ -162,6 +175,12 @@ where
                 )
                 .await?;
             all.extend(response.coin_records.unwrap_or_default());
+            if all.len() > limits.max_records {
+                return Err(Error::msg(format!(
+                    "the node returned over {} coin records; narrow the request",
+                    limits.max_records
+                )));
+            }
             if response.truncated != Some(true) {
                 return Ok((all, true));
             }
@@ -173,21 +192,41 @@ where
         Ok((all, false))
     }
 
-    /// Lowest height whose transaction block is at or after `timestamp` (unix seconds).
-    /// Returns one past the peak when every block is earlier, so an exclusive end keeps the tip.
-    pub async fn height_at_or_after(&self, timestamp: u64) -> Result<u32> {
+    async fn peak_height(&self) -> Result<u32> {
         let state = self
             .call("get_blockchain_state", self.inner.get_blockchain_state())
             .await?;
-        let peak = state
+        Ok(state
             .blockchain_state
             .ok_or_else(|| Error::msg("get_blockchain_state returned no state"))?
             .peak
-            .height;
+            .height)
+    }
+
+    /// Lowest height whose transaction block is at or after `timestamp` (unix seconds).
+    /// Returns one past the peak when every block is earlier, so an exclusive end keeps the tip.
+    pub async fn height_at_or_after(&self, timestamp: u64) -> Result<u32> {
+        let peak = self.peak_height().await?;
         first_height_at_or_after(peak, timestamp, |height| {
             self.transaction_timestamp_from(height, peak)
         })
         .await
+    }
+
+    /// Block-height bounds `(start, end)` from a `from` timestamp (inclusive) to a
+    /// `to` timestamp (exclusive). Reads the peak once so both bounds use the same
+    /// chain tip. `start >= end` when the timestamps fall outside the chain's block times.
+    pub async fn height_range_for_timestamps(&self, from: u64, to: u64) -> Result<(u32, u32)> {
+        let peak = self.peak_height().await?;
+        let start = first_height_at_or_after(peak, from, |height| {
+            self.transaction_timestamp_from(height, peak)
+        })
+        .await?;
+        let end = first_height_at_or_after(peak, to, |height| {
+            self.transaction_timestamp_from(height, peak)
+        })
+        .await?;
+        Ok((start, end))
     }
 
     /// Timestamp of the first transaction block at or above `height` (only those carry one).
@@ -226,22 +265,34 @@ where
         )))
     }
 
-    /// Hint index is optional; backends that lack it return an empty list.
+    /// Hint index is optional. Any RPC failure other than a timeout is treated as
+    /// "hint index unavailable" and returns an empty list. A timeout is reported as
+    /// an error.
     pub async fn find_coins_by_hint(
         &self,
         hint: Bytes32,
         include_spent: bool,
     ) -> Result<Vec<CoinRecord>> {
-        match self
-            .call(
-                "get_coin_records_by_hint",
-                self.inner
-                    .get_coin_records_by_hint(hint, None, None, Some(include_spent), None),
-            )
+        self.find_coins_by_hint_within(hint, include_spent, REQUEST_TIMEOUT)
             .await
-        {
-            Ok(response) => Ok(response.coin_records.unwrap_or_default()),
-            Err(_) => Ok(Vec::new()),
+    }
+
+    async fn find_coins_by_hint_within(
+        &self,
+        hint: Bytes32,
+        include_spent: bool,
+        limit: Duration,
+    ) -> Result<Vec<CoinRecord>> {
+        let request =
+            self.inner
+                .get_coin_records_by_hint(hint, None, None, Some(include_spent), None);
+        match tokio::time::timeout(limit, request).await {
+            Ok(Ok(response)) => Ok(response.coin_records.unwrap_or_default()),
+            Ok(Err(_)) => Ok(Vec::new()),
+            Err(_) => Err(Error::msg(format!(
+                "get_coin_records_by_hint timed out after {}s",
+                limit.as_secs()
+            ))),
         }
     }
 
@@ -406,7 +457,58 @@ fn singleton_inner_puzzle_hash(puzzle: &chia_protocol::Program) -> Result<Bytes3
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chia_sdk_coinset::ChiaRpcClient;
+    use serde_json::json;
+
     use super::*;
+    use crate::test_rpc::{ScriptedRpc, block_record, page, record};
+
+    struct NeverRpc;
+
+    impl ChiaRpcClient for NeverRpc {
+        type Error = String;
+
+        fn base_url(&self) -> &str {
+            "never"
+        }
+
+        async fn make_post_request<R, B>(
+            &self,
+            _endpoint: &str,
+            _body: B,
+        ) -> std::result::Result<R, String>
+        where
+            B: serde::Serialize + Send,
+            R: serde::de::DeserializeOwned + Send,
+        {
+            std::future::pending().await
+        }
+    }
+
+    struct FailingRpc(&'static str);
+
+    impl ChiaRpcClient for FailingRpc {
+        type Error = String;
+
+        fn base_url(&self) -> &str {
+            "failing"
+        }
+
+        async fn make_post_request<R, B>(
+            &self,
+            _endpoint: &str,
+            _body: B,
+        ) -> std::result::Result<R, String>
+        where
+            B: serde::Serialize + Send,
+            R: serde::de::DeserializeOwned + Send,
+        {
+            Err(self.0.to_string())
+        }
+    }
 
     /// Transaction blocks at every third height up to 99, timestamped `1000 + 10 * height`.
     async fn height_for(timestamp: u64) -> u32 {
@@ -428,5 +530,150 @@ mod tests {
         assert_eq!(height_for(1990).await, 97);
         // Every block is earlier: one past the peak, so a window ending later keeps the tip.
         assert_eq!(height_for(5000).await, 100);
+    }
+
+    #[tokio::test]
+    async fn call_within_times_out_when_the_node_does_not_respond() {
+        let client = ChainClient::with_rpc(NeverRpc);
+        let err = client
+            .call_within(
+                "get_blockchain_state",
+                Duration::from_millis(10),
+                "",
+                client.inner.get_blockchain_state(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn repeated_cursor_stops_the_scan() {
+        let rpc = ScriptedRpc::new(|endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&[], Some("same"), true)),
+            _ => None,
+        });
+        let err = ChainClient::with_rpc(rpc)
+            .find_launchers_between(HeightRange::new(1, 2).unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("narrower range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn scan_stops_after_the_page_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => {
+                let next = counter.fetch_add(1, Ordering::Relaxed);
+                let cursor = format!("cursor-{next}");
+                Some(page(&[], Some(&cursor), true))
+            }
+            _ => None,
+        });
+        let err = ChainClient::with_rpc(rpc)
+            .find_launchers_between(HeightRange::new(1, 2).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::Relaxed), MAX_SCAN_PAGES);
+        assert!(err.to_string().contains("narrower range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn repeated_cursor_returns_coin_records_read_so_far() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let coin = Coin::new(Bytes32::new([1; 32]), Bytes32::default(), 1);
+        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Some(page(&[record(coin, None)], Some("same"), true))
+            }
+            _ => None,
+        });
+        let records = ChainClient::with_rpc(rpc)
+            .find_coins_by_puzzle_hash(Bytes32::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn paged_records_stop_at_the_record_cap() {
+        let records = [
+            record(
+                Coin::new(Bytes32::new([1; 32]), Bytes32::default(), 1),
+                None,
+            ),
+            record(
+                Coin::new(Bytes32::new([2; 32]), Bytes32::default(), 1),
+                None,
+            ),
+            record(
+                Coin::new(Bytes32::new([3; 32]), Bytes32::default(), 1),
+                None,
+            ),
+        ];
+        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&records, None, false)),
+            _ => None,
+        });
+        let limits = PageLimits {
+            timeout: Duration::from_secs(1),
+            hint: "",
+            max_records: 2,
+        };
+        let err = ChainClient::with_rpc(rpc)
+            .paged_coin_records(Bytes32::default(), None, None, false, 1, limits)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("over 2 coin records"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn timestamp_search_stops_after_the_window_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let rpc = ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_block_records" => {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let start = body["start"].as_u64()? as u32;
+                let end = body["end"].as_u64()? as u32;
+                let records: Vec<_> = (start..end).map(|h| block_record(h, None)).collect();
+                Some(json!({ "block_records": records, "success": true }))
+            }
+            _ => None,
+        });
+        let err = ChainClient::with_rpc(rpc)
+            .transaction_timestamp_from(0, 10_000)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            MAX_TIMESTAMP_WINDOWS as usize
+        );
+        assert!(err.to_string().contains("no block timestamps"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hint_rpc_error_is_empty() {
+        let client = ChainClient::with_rpc(FailingRpc("connection reset"));
+        let records = client
+            .find_coins_by_hint(Bytes32::default(), false)
+            .await
+            .unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hint_timeout_is_returned() {
+        let client = ChainClient::with_rpc(NeverRpc);
+        let err = client
+            .find_coins_by_hint_within(Bytes32::default(), false, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 }

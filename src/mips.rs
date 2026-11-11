@@ -15,9 +15,12 @@ pub type CloudWalletP2 = IndexWrapperLayer<usize, DelegatedPuzzleFeederLayer<Sin
 pub type VaultMipsInner = IndexWrapperLayer<usize, DelegatedPuzzleFeederLayer<Puzzle>>;
 pub type VaultSingleton = SingletonLayer<VaultMipsInner>;
 
-/// Highest receive-address nonce tried when rebuilding an address. Cloud Wallet
-/// derives addresses at nonces 1 to 100 on top of the default address at 0. An
-/// address above that is still found from any spend that reveals its puzzle.
+/// Highest receive-address nonce tried when rebuilding an address.
+///
+/// The repository does not record a Cloud Wallet limit behind this value, so 100
+/// is a chosen search bound for the address-derived walk. Cloud Wallet's default
+/// address is nonce 0. An address at a higher nonce is still found from any spend
+/// that reveals its puzzle, which does not depend on this bound.
 pub const MAX_P2_NONCE: usize = 100;
 
 // Receive addresses. The parser and the matcher below are the only places that know
@@ -100,6 +103,7 @@ mod tests {
         ctx.tree_hash(ptr).into()
     }
 
+    /// Pins the chosen nonce bound and the revealed-puzzle fallback for higher nonces.
     #[test]
     fn address_matches_its_own_launcher_only() {
         let launcher = Bytes32::new([0x44; 32]);

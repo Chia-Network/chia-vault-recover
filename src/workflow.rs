@@ -1,6 +1,8 @@
 //! End-to-end recovery workflows shared by CLI and GUI.
 
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use chia_protocol::{Bytes32, Coin};
 use chia_puzzle_types::Proof;
@@ -190,6 +192,29 @@ pub async fn finish(
     client.push_tx(&bundle).await
 }
 
+/// Lookup inputs beyond the vault address.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LookupOptions<'a> {
+    /// Clawback seconds tried before the common Cloud Wallet values.
+    pub extra_timelocks: &'a [u64],
+    /// Opt-in launcher scan when nothing at the address reveals the launcher.
+    pub scan: Option<&'a LauncherScan>,
+}
+
+/// Overall limit for the address lookup and its optional launcher scan.
+pub const LOOKUP_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+async fn with_deadline<T>(limit: Duration, work: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(limit, work).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::msg(format!(
+            "lookup did not finish within {} minutes; the node may be slow, or narrow the \
+             launcher scan range",
+            limit.as_secs() / 60
+        ))),
+    }
+}
+
 /// Result of looking up a vault from its receive address (or launcher id).
 ///
 /// A hint is a finished public layout. A found vault still needs
@@ -252,29 +277,34 @@ pub async fn resolve_found(
     cache: &mut LookupCache,
     vault: &str,
     network: Network,
-    extra_timelocks: &[u64],
+    options: LookupOptions<'_>,
 ) -> Result<LookupReport> {
     if let Some(cached) = cache.matching(vault) {
         return Ok(LookupReport::Ready(cached.lookup.clone()));
     }
-    let report = lookup(client, vault, extra_timelocks, None).await?;
+    let report = lookup(client, vault, options).await?;
     persist_report(cache, vault, network, &report)?;
     Ok(report)
 }
 
 /// Address-first lookup. The parent spend is the only hint source.
 ///
-/// `extra_timelocks` are tried before the common Cloud Wallet values. Seconds
-/// outside that set are not recovered from the hint. `scan` opts in to checking every
-/// launcher in a block range when no spend reveals the launcher (a never-spent vault).
+/// `options.extra_timelocks` are tried before the common Cloud Wallet values.
+/// Seconds outside that set are not recovered from the hint. `options.scan` opts in
+/// to checking every launcher in a block range when no spend reveals the launcher
+/// (a never-spent vault). The whole launcher resolve and scan share one deadline.
 pub async fn lookup(
     client: &ChainClient,
     vault: &str,
-    extra_timelocks: &[u64],
-    scan: Option<&LauncherScan>,
+    options: LookupOptions<'_>,
 ) -> Result<LookupReport> {
     let locator = parse_vault_locator(vault)?;
-    let resolved = match resolve_launcher_id(client, &locator, scan).await? {
+    let resolved = match with_deadline(
+        LOOKUP_DEADLINE,
+        resolve_launcher_id(client, &locator, options.scan),
+    )
+    .await?
+    {
         Ok(resolved) => resolved,
         Err(gap) => return Ok(LookupReport::NeedFallback(gap)),
     };
@@ -282,7 +312,7 @@ pub async fn lookup(
     let (spent, current) = client.walk_singleton_chain(resolved.launcher_id).await?;
     let ancestor_puzzle_hashes: Vec<chia_protocol::Bytes32> =
         spent.iter().map(|r| r.coin.puzzle_hash).collect();
-    let candidates = timelock_candidates(extra_timelocks);
+    let candidates = timelock_candidates(options.extra_timelocks);
 
     if let Some(config) =
         hinted_config_from_parent(client, resolved.launcher_id, &current, &candidates).await?
@@ -414,6 +444,17 @@ mod tests {
             members: vec![],
             vault_launcher_ids: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn lookup_deadline_reports_a_clear_error() {
+        let err = with_deadline(
+            Duration::from_millis(10),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("did not finish within"), "{err}");
     }
 
     #[test]

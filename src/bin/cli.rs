@@ -16,7 +16,9 @@ use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
 use chia_vault_recover::recovery::{StartRecoveryResult, VaultPhase};
 use chia_vault_recover::scan::LauncherScan;
-use chia_vault_recover::workflow::{self, LookupReport, PreparedStart, StartWorkflow};
+use chia_vault_recover::workflow::{
+    self, LookupOptions, LookupReport, PreparedStart, StartWorkflow,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -185,9 +187,18 @@ async fn main() -> Result<()> {
                 }
                 _ => None,
             };
-            let report = workflow::lookup(&client, &vault, &extra, scan.as_ref()).await?;
+            let report = workflow::lookup(
+                &client,
+                &vault,
+                LookupOptions {
+                    extra_timelocks: &extra,
+                    scan: scan.as_ref(),
+                },
+            )
+            .await?;
             match report {
                 LookupReport::NeedFallback(gap) => {
+                    LookupCache::open().discard(&vault)?;
                     print_fallback(network, &gap);
                     std::process::exit(2);
                 }
@@ -262,9 +273,17 @@ async fn main() -> Result<()> {
                     let mut cache = LookupCache::open();
                     let from_cache = cache.matching(&vault).is_some();
                     let extra = clawback_secs.into_iter().collect::<Vec<_>>();
-                    let resolved =
-                        workflow::resolve_found(&client, &mut cache, &vault, network, &extra)
-                            .await?;
+                    let resolved = workflow::resolve_found(
+                        &client,
+                        &mut cache,
+                        &vault,
+                        network,
+                        LookupOptions {
+                            extra_timelocks: &extra,
+                            scan: None,
+                        },
+                    )
+                    .await?;
                     if matches!(resolved, LookupReport::NeedFallback(_)) {
                         require_layout(network, resolved)?;
                     }
