@@ -28,7 +28,7 @@ The GUI is a short wizard: **Look up → Start → Finish**. Only one step is on
 2. If lookup asks for a self-send, follow the on-screen steps (same as the CLI notes below). That spend publishes the recovery hint.
 3. **Start** — When the hint is present, the clawback window is already filled in. Paste the recovery phrase and a new custody phrase, then **Start recovery**. Public configs are written under `~/.chia-vault-recover/` by default (override with Browse).
 4. You can **close the app** after lookup or after Start. The next launch skips any home screen and opens **Start** (saved lookup) or **Finish** (recovery already started).
-5. **Finish** — After the clawback window, click **Finish recovery**. Remaining time is shown when Start was recorded in this app.
+5. **Finish** — After the clawback window, click **Finish recovery**. Remaining time is shown when Start was recorded in this app. If the vault already finished or was clawed back, Finish reports which and closes the session without broadcasting a spend.
 
 `xch1…` / `txch1…` selects mainnet or testnet11 automatically.
 
@@ -121,6 +121,8 @@ chia-vault-recover finish \
 
 Default destination: a new **12- or 24-word** custody phrase you supply, plus an **auto-generated** recovery phrase (24 words by default, or 12). The generated recovery phrase is shown once (CLI print / GUI clipboard) and is **not** written into the public post-recovery config file.
 
+`finish` and `inspect` follow the vault from its launcher. A vault that already finished is reported as `Finished` and one clawed back as `ClawedBack`; `finish` does not push a spend for either. `inspect` also notes a pending finish or clawback, or says it could not check. Both commands run under an overall deadline.
+
 ## Install / build
 
 ```bash
@@ -187,7 +189,7 @@ Cloud Wallet vaults are MIPS 1-of-2 singletons (custody | recovery). This tool r
 1. **lookup** — address → launcher → on-chain recovery hint (or a prior custody spend if the hint is absent); writes the lookup cache. No recovery phrase
 2. **start** — reuse cache when present; recovery phrase signs. The hint supplies the public layout and clawback. Without a hint, `--clawback-secs` or the cache / common values rebuild the layout. Vault enters RECOVERY
 3. wait for `clawbackTimelock` seconds
-4. **finish** — permissionless rekey to the new custody configuration
+4. **finish** — permissionless rekey to the new custody configuration; follows the vault from its launcher and reports an already `Finished` or `ClawedBack` vault without a spend
 
 ## Key derivation (Cloud Wallet compatible)
 

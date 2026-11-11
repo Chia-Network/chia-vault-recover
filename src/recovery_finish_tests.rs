@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use chia_bls::SecretKey;
@@ -21,6 +23,7 @@ use crate::vault::{
     CustodyPath, RecoverySignerSet, SignerSet, VaultMemberKey, get_vault_internals,
     recovery_state_hashes,
 };
+use crate::workflow::FinishAction;
 
 fn mint_vault(
     sim: &mut Simulator,
@@ -291,6 +294,7 @@ fn clawback_during_timelock_requires_the_custody_key() -> anyhow::Result<()> {
 struct SimRpc<'a> {
     sim: &'a Simulator,
     pending: Option<Bytes32>,
+    pushes: Arc<AtomicUsize>,
 }
 
 fn record_of(state: chia_protocol::CoinState) -> CoinRecord {
@@ -371,6 +375,14 @@ impl ChiaRpcClient for SimRpc<'_> {
                 };
                 json!({"mempool_items": items, "success": true})
             }
+            "get_puzzle_and_solution" => {
+                let id = body_id(&body, "coin_id").ok_or_else(|| "missing coin id".to_string())?;
+                json!({"coin_solution": self.sim.coin_spend(id), "success": true})
+            }
+            "push_tx" => {
+                self.pushes.fetch_add(1, Ordering::Relaxed);
+                json!({"status": "SUCCESS", "success": true})
+            }
             _ => return Err(format!("unscripted {endpoint}")),
         };
         serde_json::from_value(response).map_err(|e| e.to_string())
@@ -385,8 +397,34 @@ fn inspect_sim(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let client = ChainClient::with_rpc(SimRpc { sim, pending: None });
+    let client = ChainClient::with_rpc(SimRpc {
+        sim,
+        pending: None,
+        pushes: Arc::new(AtomicUsize::new(0)),
+    });
     runtime.block_on(crate::workflow::inspect(&client, config, post))
+}
+
+fn finish_sim(
+    sim: &Simulator,
+    pushes: &Arc<AtomicUsize>,
+    config: &VaultConfig,
+    post: &VaultConfig,
+) -> Result<crate::workflow::FinishOutcome> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = ChainClient::with_rpc(SimRpc {
+        sim,
+        pending: None,
+        pushes: Arc::clone(pushes),
+    });
+    runtime.block_on(crate::workflow::finish(
+        &client,
+        config,
+        post,
+        Network::Testnet11,
+    ))
 }
 
 fn stored(coin: Coin, spent: bool) -> CoinRecord {
@@ -473,6 +511,7 @@ fn walk_reports_the_recovery_coin_not_dust_at_the_same_hash() -> anyhow::Result<
     let dust_client = ChainClient::with_rpc(SimRpc {
         sim: &started.sim,
         pending: None,
+        pushes: Arc::new(AtomicUsize::new(0)),
     });
     let dust_observed = runtime.block_on(load_singleton(&dust_client, dust_parent.coin_id()))?;
     assert_eq!(dust_observed.tip.coin.coin_id(), dust.coin_id());
@@ -487,6 +526,7 @@ fn walk_reports_the_recovery_coin_not_dust_at_the_same_hash() -> anyhow::Result<
     let pending_client = ChainClient::with_rpc(SimRpc {
         sim: &started.sim,
         pending: Some(started.child.coin.coin_id()),
+        pushes: Arc::new(AtomicUsize::new(0)),
     });
     let pending = runtime.block_on(crate::workflow::inspect(
         &pending_client,
@@ -646,6 +686,7 @@ fn pending_check_failure_is_reported_without_failing_inspect() -> anyhow::Result
     let client = ChainClient::with_rpc(SimRpc {
         sim: &started.sim,
         pending: None,
+        pushes: Arc::new(AtomicUsize::new(0)),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -663,5 +704,58 @@ fn pending_check_failure_is_reported_without_failing_inspect() -> anyhow::Result
         note.contains("Could not check for a pending spend"),
         "{note}"
     );
+    Ok(())
+}
+
+#[test]
+fn finish_after_recovery_finished_pushes_nothing() -> anyhow::Result<()> {
+    let mut started = start_on_sim()?;
+    started.sim.pass_time(10);
+    let bundle = finish_recovery(FinishRecoveryParams {
+        config: &started.config,
+        post_recovery_config: &started.post,
+        vault_coin: started.child.coin,
+        lineage_proof: started.child.proof,
+        network: Network::Testnet11,
+    })?;
+    started.sim.spend_coins(bundle.coin_spends, &[])?;
+
+    let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
+    assert_eq!(report.phase, VaultPhase::Finished);
+
+    let pushes = Arc::new(AtomicUsize::new(0));
+    let outcome = finish_sim(&started.sim, &pushes, &started.config, &started.post)?;
+    assert_eq!(outcome.action, FinishAction::AlreadyFinished);
+    assert_eq!(pushes.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn finish_after_clawback_pushes_nothing() -> anyhow::Result<()> {
+    let mut started = start_on_sim()?;
+    let spends = custody_clawback_spends(&started)?;
+    started
+        .sim
+        .spend_coins(spends, std::slice::from_ref(&started.custody_sk))?;
+
+    let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
+    assert_eq!(report.phase, VaultPhase::ClawedBack);
+
+    let pushes = Arc::new(AtomicUsize::new(0));
+    let outcome = finish_sim(&started.sim, &pushes, &started.config, &started.post)?;
+    assert_eq!(outcome.action, FinishAction::ClawedBack);
+    assert_eq!(pushes.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn finish_in_recovery_pushes_once() -> anyhow::Result<()> {
+    let mut started = start_on_sim()?;
+    started.sim.pass_time(10);
+
+    let pushes = Arc::new(AtomicUsize::new(0));
+    let outcome = finish_sim(&started.sim, &pushes, &started.config, &started.post)?;
+    assert!(matches!(outcome.action, FinishAction::Pushed(_)));
+    assert_eq!(pushes.load(Ordering::Relaxed), 1);
     Ok(())
 }

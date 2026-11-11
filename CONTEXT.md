@@ -65,5 +65,17 @@ Broadcast the delayed-recovery spend that moves the vault into RECOVERY.
 _Avoid_: recover (the whole process)
 
 **Finish recovery**:
-The permissionless rekey after the clawback timelock, to new BLS custody.
+The permissionless rekey after the clawback timelock, to new BLS custody. Finish and inspect follow the vault from its launcher; a settled vault is reported, not spent.
 _Avoid_: complete, claim
+
+**Finished**:
+The vault under the recovered custody configuration after finish recovery.
+_Avoid_: complete
+
+**Clawed back**:
+The vault back under the original custody configuration, created by the recovery coin after old custody cancelled recovery.
+_Avoid_: cancelled, reverted
+
+**Inspect**:
+Report the vault's phase from its launcher, with a note when a finish or clawback spend is pending or cannot be checked.
+_Avoid_: check, status
