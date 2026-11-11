@@ -45,3 +45,8 @@ The package version is bumped at release time; it is not changed by this entry.
   take a generic `ChainClient<C>`. Finish returns `FinishOutcome` /
   `FinishAction`, `VaultPhase` adds `Finished` and `ClawedBack`, and
   `INSPECT_DEADLINE` is public.
+- `resolve_vault` is replaced by `resolve_ready(client, config)`;
+  `ChainClient::find_unspent_by_puzzle_hash` is removed. `InspectReport` drops
+  `expected_recovery_puzzle_hash` and `on_chain_puzzle_hash`,
+  `InspectReport::on_chain_coin` is a `Coin` rather than an `Option<Coin>`, and
+  `ResolvedVault` drops `phase` (library API changes).

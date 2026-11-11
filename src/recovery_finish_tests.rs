@@ -321,10 +321,7 @@ fn returning_the_vault_needs_the_custody_signature() -> anyhow::Result<()> {
     );
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::ClawedBack);
-    assert_eq!(
-        report.on_chain_coin.map(|coin| coin.coin_id()),
-        Some(restored.coin.coin_id())
-    );
+    assert_eq!(report.on_chain_coin.coin_id(), restored.coin.coin_id());
     Ok(())
 }
 
@@ -386,6 +383,18 @@ impl ChiaRpcClient for SimRpc<'_> {
                     .sim
                     .children(parent)
                     .into_iter()
+                    .map(record_of)
+                    .collect();
+                json!({"coin_records": records, "success": true})
+            }
+            "get_coin_records_by_puzzle_hash" => {
+                let puzzle_hash = body_id(&body, "puzzle_hash")
+                    .ok_or_else(|| "missing puzzle hash".to_string())?;
+                let records: Vec<_> = self
+                    .sim
+                    .unspent_coins(puzzle_hash, false)
+                    .into_iter()
+                    .filter_map(|coin| self.sim.coin_state(coin.coin_id()))
                     .map(record_of)
                     .collect();
                 json!({"coin_records": records, "success": true})
@@ -538,10 +547,7 @@ fn inspect_notes_a_pending_spend_during_recovery() -> anyhow::Result<()> {
 
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::InRecovery);
-    assert_eq!(
-        report.on_chain_coin.map(|coin| coin.coin_id()),
-        Some(started.child.coin.coin_id())
-    );
+    assert_eq!(report.on_chain_coin.coin_id(), started.child.coin.coin_id());
     assert!(report.pending_note.is_none());
 
     let no_post = inspect_sim(&started.sim, &started.config, None)?;
@@ -564,6 +570,43 @@ fn inspect_notes_a_pending_spend_during_recovery() -> anyhow::Result<()> {
     assert_eq!(
         pending.pending_note.as_deref(),
         Some(PENDING_FINISH_OR_CLAWBACK)
+    );
+    Ok(())
+}
+
+#[test]
+fn unrelated_coin_at_the_post_recovery_hash_is_not_the_vault() -> anyhow::Result<()> {
+    let mut started = start_on_sim()?;
+    let launcher = started.config.launcher_id_bytes()?;
+    let post = get_vault_internals(launcher, &started.post.to_vault_keys()?)?;
+    let unrelated_parent = Coin::new(Bytes32::new([4; 32]), Bytes32::new([5; 32]), 2);
+    let unrelated = Coin::new(unrelated_parent.coin_id(), post.full_puzzle_hash, 3);
+    started.sim.insert_coin(unrelated_parent);
+    started.sim.insert_coin(unrelated);
+
+    let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
+    assert_eq!(report.phase, VaultPhase::InRecovery);
+    assert_eq!(report.on_chain_coin.coin_id(), started.child.coin.coin_id());
+    Ok(())
+}
+
+#[test]
+fn resolve_ready_rejects_a_vault_that_is_not_ready() -> anyhow::Result<()> {
+    let started = start_on_sim()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = ChainClient::with_rpc(SimRpc {
+        sim: &started.sim,
+        pending: None,
+        pushes: Arc::new(AtomicUsize::new(0)),
+    });
+    let err = runtime
+        .block_on(crate::workflow::resolve_ready(&client, &started.config))
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "on-chain vault does not match this config or is not READY"
     );
     Ok(())
 }
@@ -614,7 +657,7 @@ fn settled_coin_uses_the_parent_amount() -> anyhow::Result<()> {
 
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::ClawedBack);
-    let coin = report.on_chain_coin.expect("walked coin");
+    let coin = report.on_chain_coin;
     assert_eq!(coin.amount, 3);
     assert_eq!(coin.puzzle_hash, ready.full_puzzle_hash);
     Ok(())
@@ -807,7 +850,7 @@ fn recovery_tip_uses_the_tip_amount() -> anyhow::Result<()> {
     };
     let report = inspect_map(&chain, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::InRecovery);
-    assert_eq!(report.on_chain_coin.map(|coin| coin.amount), Some(3));
+    assert_eq!(report.on_chain_coin.amount, 3);
     Ok(())
 }
 
@@ -854,7 +897,7 @@ fn finished_vault_spent_again_stays_finished() -> anyhow::Result<()> {
     )?;
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::Finished);
-    let tip = report.on_chain_coin.expect("walked coin");
+    let tip = report.on_chain_coin;
     let parent = started
         .sim
         .coin_state(tip.parent_coin_info)

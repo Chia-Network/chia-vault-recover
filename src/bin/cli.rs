@@ -406,10 +406,10 @@ async fn main() -> Result<()> {
                 "expected_ready_ph: 0x{}",
                 hex::encode(report.expected_ready_puzzle_hash)
             );
-            match report.on_chain_puzzle_hash {
-                Some(ph) => println!("on_chain_ph: 0x{}", hex::encode(ph)),
-                None => println!("on_chain_ph: (not found)"),
-            }
+            println!(
+                "on_chain_ph: 0x{}",
+                hex::encode(report.on_chain_coin.puzzle_hash)
+            );
             println!("phase: {:?}", report.phase);
             println!("clawback_timelock_secs: {}", report.clawback_timelock);
             println!("{}", report.guidance);
