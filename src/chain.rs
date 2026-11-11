@@ -701,6 +701,55 @@ mod tests {
             .collect()
     }
 
+    struct CountPendings<F> {
+        inner: std::pin::Pin<Box<F>>,
+        pending: Arc<AtomicUsize>,
+    }
+
+    impl<F: Future> Future for CountPendings<F> {
+        type Output = F::Output;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let this = self.get_mut();
+            match this.inner.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    this.pending.fetch_add(1, Ordering::Relaxed);
+                    std::task::Poll::Pending
+                }
+                ready => ready,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn launcher_scan_yields_between_records() {
+        let record_count = YIELD_AFTER_RECORDS * 4;
+        let page_records = coins(record_count);
+        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&page_records, None, false)),
+            _ => None,
+        });
+        let pending = Arc::new(AtomicUsize::new(0));
+        let client = ChainClient::with_rpc(rpc);
+        let scan = CountPendings {
+            inner: Box::pin(client.find_launcher_matching_with(
+                HeightRange::new(1, 2).unwrap(),
+                SCAN_PAGE_LIMITS,
+                |_| false,
+            )),
+            pending: Arc::clone(&pending),
+        };
+        assert_eq!(scan.await.unwrap(), None);
+        let pendings = pending.load(Ordering::Relaxed);
+        assert!(
+            pendings >= record_count / YIELD_AFTER_RECORDS,
+            "scan yielded {pendings} times for {record_count} records"
+        );
+    }
+
     #[tokio::test]
     async fn record_cap_accepts_exactly_the_cap_for_address() {
         let records = ChainClient::with_rpc(capped_page(&coins(2)))
@@ -735,11 +784,23 @@ mod tests {
 
     #[tokio::test]
     async fn record_cap_returns_a_partial_address_list() {
-        let records = ChainClient::with_rpc(capped_page(&coins(3)))
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let page_records = coins(3);
+        let rpc = ScriptedRpc::new(move |endpoint, _| match endpoint {
+            "get_coin_records_by_puzzle_hash" => {
+                let next = counter.fetch_add(1, Ordering::Relaxed);
+                let cursor = format!("cursor-{next}");
+                Some(page(&page_records, Some(&cursor), true))
+            }
+            _ => None,
+        });
+        let records = ChainClient::with_rpc(rpc)
             .find_coins_by_puzzle_hash_with(Bytes32::default(), false, small_limits(2))
             .await
             .unwrap();
         assert_eq!(records.len(), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
