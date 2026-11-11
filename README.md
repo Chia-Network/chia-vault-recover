@@ -45,7 +45,7 @@ chia-vault-recover lookup --vault xch1...
 The tool:
 
 1. Decodes the Receive address
-2. Finds the vault launcher id from spent coins at that address (or their parents)
+2. Finds the vault launcher id from spent coins at that address (or their parents), keeping only a launcher whose rebuilt Receive address matches. For a vault that has never been spent, you can opt in to a launcher scan (see [Finding the launcher of a never-spent vault](#finding-the-launcher-of-a-never-spent-vault))
 3. Walks the vault singleton and reads the Cloud Wallet recovery hint from the CHIP-0043 memo
 4. If that hint is missing, falls back to a previous **custody** spend
 
@@ -61,9 +61,29 @@ chia-vault-recover lookup --vault xch1... --clawback-secs 43200 \
 
 The recovery phrase is used only in memory. It is never written to the cache.
 
+#### Finding the launcher of a never-spent vault
+
+The Receive address does **not** contain the launcher id, and a vault that has only ever received funds reveals nothing at that address. Its launcher was still created on chain, though, and the Receive address can be rebuilt from any launcher id. So you can ask `lookup` to list every singleton launcher in a block range and keep the one whose rebuilt Receive address matches. NFT and other launchers never match.
+
+The scan only runs when you ask for it. Give the date the vault was created (not the date of the address, for a derived address), or a block range:
+
+```bash
+# Every launcher from that date in any timezone (UTC-12 to UTC+14, plus an hour each side)
+chia-vault-recover lookup --vault xch1... --created-on 2026-01-15
+
+# Or an explicit block range (end exclusive)
+chia-vault-recover lookup --vault xch1... --scan-from-height 9000000 --scan-to-height 9005000
+```
+
+A `--created-on` scan covers about two days of blocks. Height ranges are limited to 5 days (23,040 blocks); pass `--force-scan` with them to go past that. The scan is the last step of the lookup: it runs only if nothing at the address reveals the launcher, and a date is turned into block heights only then. If no launcher in the range matches, the result names the blocks it searched. A date before the first block or after the latest one is an error. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
+
+Every Receive address the vault has is matched: the default address (nonce 0) and Cloud Wallet's derived addresses (nonces 1 to 100). An address above nonce 100 is found only from a spend that reveals its puzzle. The Receive address depends only on the launcher id and nonce, not on the vault singleton's puzzle, so the scan works for every vault puzzle Cloud Wallet has used. If Cloud Wallet changes the Receive (p2) puzzle itself, the scan reports *not found* until that puzzle is added; it never returns another singleton's launcher.
+
+Finding the launcher is not the same as being able to recover. If the vault has never been spent, the lookup still stops at the step below.
+
 #### 2. If lookup cannot recover the vault
 
-The Receive address does **not** contain the launcher id. An unused vault, or a vault that has only ever received funds, has nothing on chain for this tool to parse. A vault that has not yet been spent with the recovery hint also cannot be rebuilt from the address alone.
+A vault that has not yet been spent with the recovery hint cannot be rebuilt from the address alone, even once its launcher id is known. The lookup prints the launcher id it found and the step to take.
 
 **If you can still open the vault at [vault.chia.net](https://vault.chia.net):**
 
@@ -147,6 +167,9 @@ Useful flags:
 | `--vault` | Receive address. `xch1…` is mainnet and `txch1…` is testnet11. Alias: `--address` |
 | `--backend coinset\|rpc` | Default **coinset**; with `rpc` set `--full-node-url` |
 | `--word-count 12\|24` | Length for an auto-generated recovery phrase (default 24) |
+| `--created-on YYYY-MM-DD` | On `lookup`, opt in to scanning launchers created on that date in any timezone. See [Finding the launcher of a never-spent vault](#finding-the-launcher-of-a-never-spent-vault) |
+| `--scan-from-height` / `--scan-to-height` | On `lookup`, opt in to scanning launchers in this block range (end exclusive). Use both, and not with `--created-on` |
+| `--force-scan` | Allow a `--scan-from-height` / `--scan-to-height` range over 5 days |
 | `--clawback-secs` | On `lookup`, saved as a user hint unless a recovery phrase is also given (then verified). Ignored when the on-chain hint already has the timelock, unless the value disagrees with that hint. On `start --vault` without an on-chain hint, an explicit value is tried alone; if omitted, a verified cache value, then a user hint, then common Cloud Wallet values (including 43200 / 12h) |
 
 Fees are not supported yet (zero-fee spends only).
@@ -220,7 +243,8 @@ Or point `--backend rpc --full-node-url https://localhost:8555` at a synced full
 ## Caveats
 
 - Instant recovery (spend/passkey or Chia Signer App key) is out of scope — use delayed recovery with the recovery phrase.
-- A never-spent Receive address cannot yield a launcher id. One Cloud Wallet send (including a self-send) is enough.
+- A never-spent vault's launcher id can be found with an opt-in launcher scan (`--created-on`, or `--scan-from-height` / `--scan-to-height`). Recovery still needs one Cloud Wallet send (including a self-send) to publish the hint.
+- Cloud Wallet has changed its vault puzzle more than once. Changes to the vault singleton's puzzle do not affect finding the launcher, because the Receive address does not depend on it. A change to the Receive (p2) puzzle needs the new shape added in `src/locate.rs` (`launcher_from_puzzle` and `launcher_matches_address`).
 - `lookup` reads the Cloud Wallet CHIP-0043 recovery hint from the spend that created the current singleton (including the launcher mint). An unspent eve singleton or a vault spent before that hint existed has no memo to read. One custody send publishes it. A previous custody spend is the fallback when the hint is absent.
 - Clawback during the window still requires the old custody passkey or Chia Signer App (not implemented here).
 - After finish, custody is on-chain BLS; Cloud Wallet’s product UI may not re-import that vault as a normal passkey or Chia Signer App vault.

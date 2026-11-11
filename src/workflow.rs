@@ -23,6 +23,7 @@ use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
     finish_recovery, inspect_vault, start_recovery,
 };
+use crate::scan::LauncherScan;
 use crate::vault::{VaultKeys, get_vault_internals, recovery_state_hashes};
 
 #[derive(Debug, Clone)]
@@ -256,7 +257,7 @@ pub async fn resolve_found(
     if let Some(cached) = cache.matching(vault) {
         return Ok(LookupReport::Ready(cached.lookup.clone()));
     }
-    let report = lookup(client, vault, extra_timelocks).await?;
+    let report = lookup(client, vault, extra_timelocks, None).await?;
     persist_report(cache, vault, network, &report)?;
     Ok(report)
 }
@@ -264,15 +265,18 @@ pub async fn resolve_found(
 /// Address-first lookup. The parent spend is the only hint source.
 ///
 /// `extra_timelocks` are tried before the common Cloud Wallet values. Seconds
-/// outside that set are not recovered from the hint.
+/// outside that set are not recovered from the hint. `scan` opts in to checking every
+/// launcher in a block range when no spend reveals the launcher (a never-spent vault).
 pub async fn lookup(
     client: &ChainClient,
     vault: &str,
     extra_timelocks: &[u64],
+    scan: Option<&LauncherScan>,
 ) -> Result<LookupReport> {
     let locator = parse_vault_locator(vault)?;
-    let Some(resolved) = resolve_launcher_id(client, &locator).await? else {
-        return Ok(LookupReport::NeedFallback(LookupGap::LauncherNotFound));
+    let resolved = match resolve_launcher_id(client, &locator, scan).await? {
+        Ok(resolved) => resolved,
+        Err(gap) => return Ok(LookupReport::NeedFallback(gap)),
     };
 
     let (spent, current) = client.walk_singleton_chain(resolved.launcher_id).await?;

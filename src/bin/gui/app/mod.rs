@@ -79,6 +79,14 @@ impl Status {
     }
 }
 
+/// Opt-in launcher scan for a vault that has never been spent (same as the CLI flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherScan {
+    Off,
+    CreatedOn,
+    Heights,
+}
+
 pub struct App {
     vault_address: String,
     config_path: String,
@@ -89,6 +97,11 @@ pub struct App {
     new_recovery_mnemonic: String,
     generate_12_words: bool,
     full_node_url: String,
+    launcher_scan: LauncherScan,
+    scan_created_on: String,
+    scan_from_height: String,
+    scan_to_height: String,
+    force_scan: bool,
     status: Status,
     generated_recovery_mnemonic: Option<String>,
     phase: Phase,
@@ -120,6 +133,11 @@ impl App {
             new_recovery_mnemonic: String::new(),
             generate_12_words: false,
             full_node_url: String::new(),
+            launcher_scan: LauncherScan::Off,
+            scan_created_on: String::new(),
+            scan_from_height: String::new(),
+            scan_to_height: String::new(),
+            force_scan: false,
             status: Status::Empty,
             generated_recovery_mnemonic: None,
             phase: Phase::Lookup,
@@ -300,6 +318,13 @@ impl App {
                 .map(Some)
                 .map_err(|_| chia_vault_recover::Error::msg("clawback seconds must be a number"))
         }
+    }
+
+    fn parsed_height(value: &str, label: &str) -> Result<u32> {
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| chia_vault_recover::Error::msg(format!("{label} must be a block height")))
     }
 
     fn ensure_parent_dir(path: &Path) -> Result<()> {

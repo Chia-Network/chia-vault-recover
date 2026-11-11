@@ -11,11 +11,12 @@ use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::Network;
 use chia_vault_recover::recovery::VaultPhase;
+use chia_vault_recover::scan;
 use chia_vault_recover::workflow::{self, LookupReport, StartWorkflow};
 
 use crate::session::GuiSession;
 
-use super::{App, Phase, runtime};
+use super::{App, LauncherScan, Phase, runtime};
 
 impl App {
     pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network) {
@@ -73,12 +74,26 @@ impl App {
         }
         let (client, network) = client_for_vault(vault, &self.backend())?;
         let extra = self.parsed_clawback()?.into_iter().collect::<Vec<_>>();
-        let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
+        let scan = self.launcher_scan()?;
+        let report = runtime().block_on(workflow::lookup(&client, vault, &extra, scan.as_ref()))?;
         match report {
             LookupReport::Ready(lookup) => self.apply_lookup(lookup, network),
             LookupReport::NeedFallback(gap) => self.apply_fallback(gap),
         }
         Ok(())
+    }
+
+    /// The opted-in launcher scan; lookup holds it to the 5-day limit unless forced.
+    fn launcher_scan(&self) -> Result<Option<scan::LauncherScan>> {
+        Ok(Some(match self.launcher_scan {
+            LauncherScan::Off => return Ok(None),
+            LauncherScan::CreatedOn => scan::LauncherScan::created_on(&self.scan_created_on)?,
+            LauncherScan::Heights => scan::LauncherScan::heights(
+                Self::parsed_height(&self.scan_from_height, "scan from height")?,
+                Self::parsed_height(&self.scan_to_height, "scan to height")?,
+                self.force_scan,
+            )?,
+        }))
     }
 
     pub(super) fn run_confirm_clawback(&mut self) {

@@ -9,7 +9,7 @@ A Cloud Wallet MIPS 1-of-2 singleton (custody | recovery) identified by a launch
 _Avoid_: wallet, account
 
 **Receive address**:
-The bech32m `xch1…` / `txch1…` address shown in Cloud Wallet. It does not contain the launcher id.
+The bech32m `xch1…` / `txch1…` address shown in Cloud Wallet. It does not contain the launcher id, but it can be rebuilt from one (its p2 puzzle curries the launcher id), which is how the launcher scan recognizes the vault. A vault has one at nonce 0 and may derive more at nonces 1 to 100. It does not depend on the vault singleton's puzzle, which Cloud Wallet has changed over time.
 _Avoid_: wallet address (ambiguous)
 
 **Recovery phrase**:
@@ -31,6 +31,10 @@ _Avoid_: timeout, wait period
 **Lookup**:
 Resolving a Receive address to the launcher and the on-chain recovery hint, or to a prior custody spend when that hint is absent. Does not need the recovery phrase.
 _Avoid_: discover, resolve (CLI aliases only)
+
+**Launcher scan**:
+Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Runs last, only when nothing at the address reveals the launcher. Height ranges are limited to 5 days unless `--force-scan`.
+_Avoid_: deep search, brute force
 
 **Found vault**:
 The public chain facts from a successful lookup: launcher, custody path, current coin, ancestor puzzle hashes. No recovery phrase and no clawback timelock.
