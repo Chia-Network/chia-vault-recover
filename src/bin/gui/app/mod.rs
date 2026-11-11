@@ -6,12 +6,14 @@ mod widgets;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use chia_vault_recover::cache::{CachedLookup, LookupCache};
 use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::error::Result;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
+use chia_vault_recover::workflow::LookupReport;
 use chia_vault_recover::{LookupGap, app_dir};
 use eframe::egui;
 
@@ -34,7 +36,7 @@ const START_SUBTITLE: &str =
     "Enter the recovery phrase and a new custody phrase, then start delayed recovery.";
 const WAIT_SUBTITLE: &str =
     "Wait for the clawback window, then finish. You can close the app and come back.";
-const DONE_SUBTITLE: &str = "Recovery finished. Custody is now the new BLS key.";
+const DONE_SUBTITLE: &str = "This recovery session is closed.";
 
 /// Rail steps shown at the top of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +50,18 @@ enum RailStep {
 #[derive(Debug, Clone)]
 enum Phase {
     Lookup,
+    LookingUp,
     Fallback(LookupGap),
     Start,
     Wait(GuiSession),
     Done,
+}
+
+struct LookupTask {
+    receiver: Receiver<std::result::Result<LookupReport, String>>,
+    handle: tokio::task::JoinHandle<()>,
+    network: Network,
+    address: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -79,6 +89,14 @@ impl Status {
     }
 }
 
+/// Opt-in launcher scan for a vault that has never been spent (same as the CLI flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    Off,
+    CreatedOn,
+    Heights,
+}
+
 pub struct App {
     vault_address: String,
     config_path: String,
@@ -89,12 +107,18 @@ pub struct App {
     new_recovery_mnemonic: String,
     generate_12_words: bool,
     full_node_url: String,
+    scan_mode: ScanMode,
+    scan_created_on: String,
+    scan_from_height: String,
+    scan_to_height: String,
+    force_scan: bool,
     status: Status,
     generated_recovery_mnemonic: Option<String>,
     phase: Phase,
     /// Last inspect / wait guidance (collapsible Details).
     detail: String,
     cache: LookupCache,
+    lookup_task: Option<LookupTask>,
     /// `--smoke`: paint one frame, then close.
     smoke: bool,
     logged_first_frame: bool,
@@ -107,10 +131,10 @@ impl Default for App {
 }
 
 impl App {
-    pub fn new(smoke: bool) -> Self {
-        let cache = LookupCache::open();
+    /// All default fields. Tests build from this base and then set what they need.
+    fn base(cache: LookupCache, smoke: bool) -> Self {
         let (config_path, post_recovery_path) = default_config_paths();
-        let mut app = Self {
+        Self {
             vault_address: String::new(),
             config_path,
             post_recovery_path,
@@ -120,24 +144,31 @@ impl App {
             new_recovery_mnemonic: String::new(),
             generate_12_words: false,
             full_node_url: String::new(),
+            scan_mode: ScanMode::Off,
+            scan_created_on: String::new(),
+            scan_from_height: String::new(),
+            scan_to_height: String::new(),
+            force_scan: false,
             status: Status::Empty,
             generated_recovery_mnemonic: None,
             phase: Phase::Lookup,
             detail: String::new(),
             cache,
+            lookup_task: None,
             smoke,
             logged_first_frame: false,
-        };
+        }
+    }
+
+    pub fn new(smoke: bool) -> Self {
+        let mut app = Self::base(LookupCache::open(), smoke);
         app.resume_from_disk();
         app
     }
 
     /// No cache → Lookup; started session → Wait; cache only → Start.
     fn resume_from_disk(&mut self) {
-        if let Some(session) = GuiSession::load().filter(|s| s.is_started())
-            && session_files_ready(&session)
-            && session_matches_cache(&self.cache, &session.receive_address)
-        {
+        if let Some(session) = resumable_session(GuiSession::load(), &self.cache) {
             // Address for chain calls; paths live only on Phase::Wait(session).
             self.vault_address = session.receive_address.clone();
             self.set_ok(
@@ -172,6 +203,47 @@ impl App {
         if let Err(e) = result {
             self.set_err(format!("{label}: {e}"));
         }
+    }
+
+    fn abort_lookup(&mut self) {
+        if let Some(task) = self.lookup_task.take() {
+            task.handle.abort();
+        }
+    }
+
+    pub(super) fn poll_lookup(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.lookup_task.take() else {
+            return;
+        };
+        match task.receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.phase = Phase::Lookup;
+                match report {
+                    LookupReport::Ready(lookup) => {
+                        self.apply_lookup(lookup, task.network, &task.address)
+                    }
+                    LookupReport::NeedFallback(gap) => self.apply_fallback(gap, &task.address),
+                }
+            }
+            Ok(Err(message)) => {
+                self.phase = Phase::Lookup;
+                self.set_err(format!("Lookup error: {message}"));
+            }
+            Err(TryRecvError::Empty) => {
+                self.lookup_task = Some(task);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.phase = Phase::Lookup;
+                self.set_err("Lookup stopped before it returned a result.");
+            }
+        }
+    }
+
+    pub(super) fn cancel_lookup(&mut self) {
+        self.abort_lookup();
+        self.phase = Phase::Lookup;
+        self.set_ok("Lookup cancelled. Enter a Receive address to look up a vault.");
     }
 
     fn backend(&self) -> Backend {
@@ -241,7 +313,7 @@ impl App {
 
     fn rail_step(&self) -> RailStep {
         match &self.phase {
-            Phase::Lookup | Phase::Fallback(_) => RailStep::Lookup,
+            Phase::Lookup | Phase::LookingUp | Phase::Fallback(_) => RailStep::Lookup,
             Phase::Start => RailStep::Start,
             Phase::Wait(_) | Phase::Done => RailStep::Finish,
         }
@@ -249,7 +321,7 @@ impl App {
 
     fn subtitle(&self) -> &'static str {
         match &self.phase {
-            Phase::Lookup | Phase::Fallback(_) => LOOKUP_SUBTITLE,
+            Phase::Lookup | Phase::LookingUp | Phase::Fallback(_) => LOOKUP_SUBTITLE,
             Phase::Start => START_SUBTITLE,
             Phase::Wait(_) => WAIT_SUBTITLE,
             Phase::Done => DONE_SUBTITLE,
@@ -257,6 +329,7 @@ impl App {
     }
 
     fn reset_to_lookup(&mut self) {
+        self.abort_lookup();
         GuiSession::clear();
         self.vault_address.clear();
         self.clawback_secs.clear();
@@ -302,6 +375,13 @@ impl App {
         }
     }
 
+    fn parsed_height(value: &str, label: &str) -> Result<u32> {
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| chia_vault_recover::Error::msg(format!("{label} must be a block height")))
+    }
+
     fn ensure_parent_dir(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -341,6 +421,7 @@ impl eframe::App for App {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        self.poll_lookup(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.heading("Chia Vault Recover");
@@ -378,6 +459,16 @@ fn default_config_paths() -> (String, String) {
 
 fn session_files_ready(session: &GuiSession) -> bool {
     Path::new(&session.config_path).is_file() && Path::new(&session.post_recovery_path).is_file()
+}
+
+/// A relaunch returns to Wait only for a started session whose config files are still present.
+fn resumable_session(loaded: Option<GuiSession>, cache: &LookupCache) -> Option<GuiSession> {
+    let session = loaded.filter(|session| session.is_started())?;
+    if session_files_ready(&session) && session_matches_cache(cache, &session.receive_address) {
+        Some(session)
+    } else {
+        None
+    }
 }
 
 /// Resume Wait when the cache is empty or names the same receive address.

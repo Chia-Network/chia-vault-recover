@@ -14,6 +14,9 @@ pub mod locate;
 pub mod mips;
 pub mod network;
 pub mod recovery;
+pub mod scan;
+#[cfg(test)]
+mod test_rpc;
 pub mod vault;
 pub mod workflow;
 
@@ -35,11 +38,12 @@ pub use locate::{
 pub use network::{Backend, Network};
 pub use recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
-    finish_recovery, inspect_vault, start_recovery,
+    finish_recovery, start_recovery,
 };
+pub use scan::{LauncherScan, MAX_SCAN_DAYS};
 pub use vault::{CustodyPath, VaultInternals, VaultKeys, VaultMemberKey};
 pub use workflow::{
-    LookupReport, PreparedStart, StartWorkflow, finish as finish_workflow,
-    inspect as inspect_workflow, lookup as lookup_workflow, prepare_start, resolve_found,
-    start as start_workflow,
+    FinishAction, FinishOutcome, INSPECT_DEADLINE, LOOKUP_DEADLINE, LookupOptions, LookupReport,
+    PreparedStart, StartWorkflow, finish as finish_workflow, inspect as inspect_workflow,
+    lookup as lookup_workflow, prepare_start, resolve_found, start as start_workflow,
 };
