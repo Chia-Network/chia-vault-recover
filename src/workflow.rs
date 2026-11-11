@@ -50,7 +50,6 @@ pub enum FinishAction {
 pub struct ResolvedVault {
     pub coin: Coin,
     pub proof: Proof,
-    pub phase: VaultPhase,
 }
 
 /// Find the live singleton from its launcher and its lineage proof.
@@ -65,20 +64,14 @@ where
     C::Error: Display,
 {
     let report = inspect(client, config, None).await?;
-    let coin = match (report.phase, report.on_chain_coin) {
-        (VaultPhase::Ready, Some(coin)) => coin,
-        _ => {
-            return Err(Error::msg(
-                "on-chain vault does not match this config or is not READY",
-            ));
-        }
-    };
+    if report.phase != VaultPhase::Ready {
+        return Err(Error::msg(
+            "on-chain vault does not match this config or is not READY",
+        ));
+    }
+    let coin = report.on_chain_coin;
     let proof = client.lineage_proof_for_coin(&coin).await?;
-    Ok(ResolvedVault {
-        coin,
-        proof,
-        phase: report.phase,
-    })
+    Ok(ResolvedVault { coin, proof })
 }
 
 pub async fn inspect<C>(
@@ -206,9 +199,7 @@ where
     let pending_note = report.pending_note.clone();
     let step = match report.phase {
         VaultPhase::InRecovery => {
-            let coin = report
-                .on_chain_coin
-                .ok_or_else(|| Error::msg("vault singleton not found on chain for this config"))?;
+            let coin = report.on_chain_coin;
             let proof = client.lineage_proof_for_coin(&coin).await?;
             let bundle = finish_recovery(FinishRecoveryParams {
                 config,

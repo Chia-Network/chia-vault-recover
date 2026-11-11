@@ -373,7 +373,11 @@ async fn child_listing_reports_incomplete_at_the_page_cap() {
         err.to_string().contains("could not list every child"),
         "{err}"
     );
-    assert!(err.to_string().contains("stopped paging after"), "{err}");
+    assert!(
+        err.to_string()
+            .contains(&format!("after {} pages", COIN_PAGE_LIMITS.max_pages)),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -386,7 +390,10 @@ async fn child_listing_reports_the_record_cap() {
         .get_children_with(Bytes32::default(), small_limits(2))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("coin records"), "{err}");
+    assert!(
+        err.to_string().contains("more than 2 coin records"),
+        "{err}"
+    );
     assert!(!err.to_string().contains("stopped paging after"), "{err}");
 }
 
