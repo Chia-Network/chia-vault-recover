@@ -39,7 +39,6 @@ pub enum VaultPhase {
 pub struct InspectReport {
     pub launcher_id: Bytes32,
     pub expected_ready_puzzle_hash: Bytes32,
-    pub expected_recovery_puzzle_hash: Option<Bytes32>,
     pub on_chain_puzzle_hash: Option<Bytes32>,
     pub on_chain_coin: Option<Coin>,
     pub phase: VaultPhase,
@@ -180,11 +179,6 @@ pub(crate) fn classify_singleton(
     Ok(InspectReport {
         launcher_id,
         expected_ready_puzzle_hash: ready.full_puzzle_hash,
-        expected_recovery_puzzle_hash: if settled {
-            parent_recovery
-        } else {
-            tip_recovery
-        },
         on_chain_puzzle_hash: Some(tip.coin.puzzle_hash),
         on_chain_coin: Some(tip.coin),
         phase,

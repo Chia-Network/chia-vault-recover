@@ -65,19 +65,14 @@ where
     C::Error: Display,
 {
     let report = inspect(client, config, None).await?;
-    let Some(coin) = report.on_chain_coin else {
-        return Err(Error::msg(
-            "vault singleton not found on chain for this config",
-        ));
+    let coin = match (report.phase, report.on_chain_coin) {
+        (VaultPhase::Ready, Some(coin)) => coin,
+        _ => {
+            return Err(Error::msg(
+                "on-chain vault does not match this config or is not READY",
+            ));
+        }
     };
-    if report.phase == VaultPhase::Unknown {
-        return Err(Error::msg("on-chain vault does not match this config"));
-    }
-    if report.phase != VaultPhase::Ready {
-        return Err(Error::msg(
-            "vault is not in READY state; cannot start recovery",
-        ));
-    }
     let proof = client.lineage_proof_for_coin(&coin).await?;
     Ok(ResolvedVault {
         coin,

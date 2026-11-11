@@ -432,23 +432,35 @@ where
 
     /// Every child of `parent_id`, or an error when the listing was truncated.
     pub async fn get_children(&self, parent_id: Bytes32) -> Result<Vec<CoinRecord>> {
+        self.get_children_with(parent_id, COIN_PAGE_LIMITS).await
+    }
+
+    async fn get_children_with(
+        &self,
+        parent_id: Bytes32,
+        limits: PageLimits,
+    ) -> Result<Vec<CoinRecord>> {
         let query = CoinQuery::ParentIds {
             parent_id,
             include_spent: true,
         };
         let mut records = Vec::new();
         let paged = self
-            .paged_coin_records(query, COIN_PAGE_LIMITS, |record| {
+            .paged_coin_records(query, limits, |record| {
                 records.push(*record);
                 ControlFlow::Continue(())
             })
             .await?;
         match paged {
-            Paged::Complete | Paged::Matched(_) => Ok(records),
+            Paged::Complete => Ok(records),
+            Paged::Matched(_) => Err(Error::msg(format!(
+                "could not list every child of {}: the listing stopped before it completed",
+                hex::encode(parent_id)
+            ))),
             Paged::Incomplete(reason) => Err(Error::msg(format!(
                 "could not list every child of {}: {}",
                 hex::encode(parent_id),
-                reason.child_listing_reason(COIN_PAGE_LIMITS)
+                reason.child_listing_reason(limits)
             ))),
         }
     }

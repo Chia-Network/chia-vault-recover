@@ -569,6 +569,46 @@ fn inspect_notes_a_pending_spend_during_recovery() -> anyhow::Result<()> {
 }
 
 #[test]
+fn unrelated_coin_at_the_post_recovery_hash_is_not_the_vault() -> anyhow::Result<()> {
+    let mut started = start_on_sim()?;
+    let launcher = started.config.launcher_id_bytes()?;
+    let post = get_vault_internals(launcher, &started.post.to_vault_keys()?)?;
+    let unrelated_parent = Coin::new(Bytes32::new([4; 32]), Bytes32::new([5; 32]), 2);
+    let unrelated = Coin::new(unrelated_parent.coin_id(), post.full_puzzle_hash, 3);
+    started.sim.insert_coin(unrelated_parent);
+    started.sim.insert_coin(unrelated);
+
+    let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
+    assert_eq!(report.phase, VaultPhase::InRecovery);
+    assert_eq!(
+        report.on_chain_coin.map(|coin| coin.coin_id()),
+        Some(started.child.coin.coin_id())
+    );
+    Ok(())
+}
+
+#[test]
+fn resolve_ready_rejects_a_vault_that_is_not_ready() -> anyhow::Result<()> {
+    let started = start_on_sim()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = ChainClient::with_rpc(SimRpc {
+        sim: &started.sim,
+        pending: None,
+        pushes: Arc::new(AtomicUsize::new(0)),
+    });
+    let err = runtime
+        .block_on(crate::workflow::resolve_ready(&client, &started.config))
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "on-chain vault does not match this config or is not READY"
+    );
+    Ok(())
+}
+
+#[test]
 fn settled_coin_uses_the_parent_amount() -> anyhow::Result<()> {
     let mut started = start_with_amount(5)?;
     let launcher = started.config.launcher_id_bytes()?;
