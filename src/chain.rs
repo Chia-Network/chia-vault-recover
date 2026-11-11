@@ -53,12 +53,32 @@ const SCAN_PAGE_LIMITS: PageLimits = PageLimits {
     max_records: MAX_RECORDS,
 };
 
-/// How one paged request ended: the listing finished, ran out of pages or
-/// records, or a visitor stopped it with a match.
+/// How one paged request ended: the listing finished, stopped before it was
+/// complete, or a visitor stopped it with a match.
 enum Paged {
     Complete,
-    Incomplete,
+    Incomplete(Incomplete),
     Matched(Bytes32),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Incomplete {
+    Pages,
+    Records,
+    Stopped,
+}
+
+impl Incomplete {
+    fn child_listing_reason(self, limits: PageLimits) -> String {
+        match self {
+            Self::Pages => format!("the node stopped paging after {} pages", limits.max_pages),
+            Self::Records => format!(
+                "the node returned more than {} coin records",
+                limits.max_records
+            ),
+            Self::Stopped => "the node stopped paging before the listing completed".to_string(),
+        }
+    }
 }
 
 /// The coin records to page through.
@@ -153,15 +173,6 @@ where
         }
     }
 
-    pub async fn find_unspent_by_puzzle_hash(&self, puzzle_hash: Bytes32) -> Result<Option<Coin>> {
-        Ok(self
-            .find_coins_by_puzzle_hash(puzzle_hash, false)
-            .await?
-            .into_iter()
-            .find(|r| !r.spent)
-            .map(|r| r.coin))
-    }
-
     /// Coins at `puzzle_hash`, following the cursor for at most 8 pages and
     /// stopping at the record cap.
     ///
@@ -236,7 +247,7 @@ where
         match paged {
             Paged::Matched(launcher) => Ok(Some(launcher)),
             Paged::Complete => Ok(None),
-            Paged::Incomplete => Err(incomplete_scan(range, limits)),
+            Paged::Incomplete(_) => Err(incomplete_scan(range, limits)),
         }
     }
 
@@ -303,17 +314,17 @@ where
                 }
             }
             if count > limits.max_records {
-                return Ok(Paged::Incomplete);
+                return Ok(Paged::Incomplete(Incomplete::Records));
             }
             if response.truncated != Some(true) {
                 return Ok(Paged::Complete);
             }
             match response.next_cursor {
                 Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
-                _ => return Ok(Paged::Incomplete),
+                _ => return Ok(Paged::Incomplete(Incomplete::Stopped)),
             }
         }
-        Ok(Paged::Incomplete)
+        Ok(Paged::Incomplete(Incomplete::Pages))
     }
 
     async fn peak_height(&self) -> Result<u32> {
@@ -433,12 +444,11 @@ where
             })
             .await?;
         match paged {
-            Paged::Complete => Ok(records),
-            _ => Err(Error::msg(format!(
-                "could not list every child of {}: the node stopped paging after {} pages or {} coin records",
+            Paged::Complete | Paged::Matched(_) => Ok(records),
+            Paged::Incomplete(reason) => Err(Error::msg(format!(
+                "could not list every child of {}: {}",
                 hex::encode(parent_id),
-                COIN_PAGE_LIMITS.max_pages,
-                COIN_PAGE_LIMITS.max_records
+                reason.child_listing_reason(COIN_PAGE_LIMITS)
             ))),
         }
     }
