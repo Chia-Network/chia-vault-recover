@@ -137,7 +137,7 @@ fn start_with_amount(amount: u64) -> anyhow::Result<Started> {
     })
 }
 
-fn custody_clawback_spends(started: &Started) -> anyhow::Result<Vec<CoinSpend>> {
+fn return_to_custody_spends(started: &Started) -> anyhow::Result<Vec<CoinSpend>> {
     let mut ctx = SpendContext::new();
     let launcher = started.config.launcher_id_bytes()?;
     let ready = get_vault_internals(launcher, &started.keys)?;
@@ -224,7 +224,7 @@ fn finish_rejects_a_different_delegated_puzzle() -> anyhow::Result<()> {
 }
 
 #[test]
-fn clawback_during_timelock_requires_the_custody_key() -> anyhow::Result<()> {
+fn returning_the_vault_needs_the_custody_signature() -> anyhow::Result<()> {
     let mut started = start_on_sim()?;
     let launcher = started.config.launcher_id_bytes()?;
     let ready = get_vault_internals(launcher, &started.keys)?;
@@ -259,7 +259,7 @@ fn clawback_during_timelock_requires_the_custody_key() -> anyhow::Result<()> {
             .is_err()
     );
 
-    let spends = custody_clawback_spends(&started)?;
+    let spends = return_to_custody_spends(&started)?;
     assert!(started.sim.spend_coins(spends.clone(), &[]).is_err());
     assert!(
         started
@@ -488,14 +488,14 @@ fn inspect_map(
 }
 
 #[test]
-fn walk_reports_the_recovery_coin_not_dust_at_the_same_hash() -> anyhow::Result<()> {
+fn walk_ignores_an_unrelated_coin_at_the_same_puzzle_hash() -> anyhow::Result<()> {
     let mut started = start_on_sim()?;
     let launcher = started.config.launcher_id_bytes()?;
     let post_ready = get_vault_internals(launcher, &started.post.to_vault_keys()?)?;
-    let dust_parent = Coin::new(Bytes32::new([4; 32]), Bytes32::new([5; 32]), 2);
-    let dust = Coin::new(dust_parent.coin_id(), post_ready.full_puzzle_hash, 1);
-    started.sim.insert_coin(dust_parent);
-    started.sim.insert_coin(dust);
+    let unrelated_parent = Coin::new(Bytes32::new([4; 32]), Bytes32::new([5; 32]), 2);
+    let unrelated = Coin::new(unrelated_parent.coin_id(), post_ready.full_puzzle_hash, 1);
+    started.sim.insert_coin(unrelated_parent);
+    started.sim.insert_coin(unrelated);
 
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::InRecovery);
@@ -508,20 +508,23 @@ fn walk_reports_the_recovery_coin_not_dust_at_the_same_hash() -> anyhow::Result<
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let dust_client = ChainClient::with_rpc(SimRpc {
+    let unrelated_client = ChainClient::with_rpc(SimRpc {
         sim: &started.sim,
         pending: None,
         pushes: Arc::new(AtomicUsize::new(0)),
     });
-    let dust_observed = runtime.block_on(load_singleton(&dust_client, dust_parent.coin_id()))?;
-    assert_eq!(dust_observed.tip.coin.coin_id(), dust.coin_id());
-    let dust_report = classify_singleton(
+    let unrelated_observed = runtime.block_on(load_singleton(
+        &unrelated_client,
+        unrelated_parent.coin_id(),
+    ))?;
+    assert_eq!(unrelated_observed.tip.coin.coin_id(), unrelated.coin_id());
+    let unrelated_report = classify_singleton(
         &started.config,
         Some(&started.post),
-        &dust_observed,
+        &unrelated_observed,
         PendingSpend::None,
     )?;
-    assert_eq!(dust_report.phase, VaultPhase::Unknown);
+    assert_eq!(unrelated_report.phase, VaultPhase::Unknown);
 
     let pending_client = ChainClient::with_rpc(SimRpc {
         sim: &started.sim,
@@ -542,7 +545,7 @@ fn walk_reports_the_recovery_coin_not_dust_at_the_same_hash() -> anyhow::Result<
 }
 
 #[test]
-fn amount_changing_clawback_uses_the_parent_amount() -> anyhow::Result<()> {
+fn settled_coin_uses_the_parent_amount() -> anyhow::Result<()> {
     let mut started = start_with_amount(5)?;
     let launcher = started.config.launcher_id_bytes()?;
     let ready = get_vault_internals(launcher, &started.keys)?;
@@ -733,7 +736,7 @@ fn finish_after_recovery_finished_pushes_nothing() -> anyhow::Result<()> {
 #[test]
 fn finish_after_clawback_pushes_nothing() -> anyhow::Result<()> {
     let mut started = start_on_sim()?;
-    let spends = custody_clawback_spends(&started)?;
+    let spends = return_to_custody_spends(&started)?;
     started
         .sim
         .spend_coins(spends, std::slice::from_ref(&started.custody_sk))?;
