@@ -295,6 +295,7 @@ async fn hint_timeout_is_returned() {
     .unwrap_err();
     assert!(err.to_string().contains("timed out"), "{err}");
 }
+
 #[tokio::test]
 async fn pending_spend_rpc_failure_is_unknown() {
     let client = ChainClient::with_rpc(ScriptedRpc::new(|_, _| None));
@@ -310,6 +311,19 @@ async fn pending_spend_unsuccessful_response_is_unknown() {
         "get_mempool_items_by_coin_name" => {
             Some(json!({"success": false, "error": "method not available"}))
         }
+        _ => None,
+    });
+    let client = ChainClient::with_rpc(rpc);
+    assert_eq!(
+        client.coin_has_pending_spend(Bytes32::default()).await,
+        PendingSpend::Unknown
+    );
+}
+
+#[tokio::test]
+async fn pending_spend_unsuccessful_without_error_is_unknown() {
+    let rpc = ScriptedRpc::new(|endpoint, _| match endpoint {
+        "get_mempool_items_by_coin_name" => Some(json!({"success": false})),
         _ => None,
     });
     let client = ChainClient::with_rpc(rpc);
@@ -359,4 +373,23 @@ async fn child_listing_reports_incomplete_at_the_page_cap() {
         err.to_string().contains("could not list every child"),
         "{err}"
     );
+    assert!(err.to_string().contains("stopped paging after"), "{err}");
+}
+
+#[tokio::test]
+async fn child_listing_reports_a_repeated_cursor() {
+    let rpc = ScriptedRpc::new(|endpoint, _| match endpoint {
+        "get_coin_records_by_parent_ids" => Some(page(&[], Some("same-cursor"), true)),
+        _ => None,
+    });
+    let err = ChainClient::with_rpc(rpc)
+        .get_children(Bytes32::default())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("stopped paging before the listing completed"),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("coin records"), "{err}");
 }

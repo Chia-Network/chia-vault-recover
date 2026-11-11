@@ -41,7 +41,7 @@ The package version is bumped at release time; it is not changed by this entry.
   scan API `find_launcher_matching` takes a `HeightRange` (library API changes).
 - Hint lookups that time out are reported as errors; any other hint-request
   failure reads as no hints.
-- Library API: `workflow::inspect`, `workflow::finish`, and `resolve_vault`
+- Library API: `workflow::inspect`, `workflow::finish`, and `resolve_ready`
   take a generic `ChainClient<C>`. Finish returns `FinishOutcome` /
   `FinishAction`, `VaultPhase` adds `Finished` and `ClawedBack`, and
   `INSPECT_DEADLINE` is public.

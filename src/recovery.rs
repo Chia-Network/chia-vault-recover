@@ -54,6 +54,14 @@ pub(crate) const PENDING_FINISH_OR_CLAWBACK: &str =
 pub(crate) const PENDING_SPEND_UNCHECKED: &str =
     "Could not check for a pending spend of this vault; it may finish recovery or claw it back.";
 
+pub(crate) fn pending_note(pending: PendingSpend) -> Option<String> {
+    match pending {
+        PendingSpend::Pending => Some(PENDING_FINISH_OR_CLAWBACK.to_string()),
+        PendingSpend::Unknown => Some(PENDING_SPEND_UNCHECKED.to_string()),
+        PendingSpend::None => None,
+    }
+}
+
 /// Confirmed singleton tip and the parent record the walk just read.
 pub(crate) struct ObservedSingleton {
     pub tip: CoinRecord,
@@ -121,7 +129,6 @@ pub(crate) fn classify_singleton(
     config: &VaultConfig,
     post_recovery: Option<&VaultConfig>,
     observed: &ObservedSingleton,
-    pending: PendingSpend,
 ) -> Result<InspectReport> {
     let launcher_id = config.launcher_id_bytes()?;
     let keys = config.to_vault_keys()?;
@@ -170,16 +177,6 @@ pub(crate) fn classify_singleton(
         return Err(Error::msg("parent of the vault singleton is not spent"));
     }
 
-    let pending_note = match pending {
-        PendingSpend::Pending if phase == VaultPhase::InRecovery => {
-            Some(PENDING_FINISH_OR_CLAWBACK.to_string())
-        }
-        PendingSpend::Unknown if phase == VaultPhase::InRecovery => {
-            Some(PENDING_SPEND_UNCHECKED.to_string())
-        }
-        _ => None,
-    };
-
     Ok(InspectReport {
         launcher_id,
         expected_ready_puzzle_hash: ready.full_puzzle_hash,
@@ -193,7 +190,7 @@ pub(crate) fn classify_singleton(
         phase,
         clawback_timelock: ready.clawback_timelock,
         guidance: guidance.to_string(),
-        pending_note,
+        pending_note: None,
     })
 }
 
@@ -214,7 +211,7 @@ fn phase_of(
 
     let parent_is_recovery = parent_recovery.is_some() && Some(parent_puzzle) == parent_recovery;
     let finished_is_distinct = finished_hash.is_some() && finished_hash != Some(ready_hash);
-    if finished_is_distinct && Some(tip_puzzle) == finished_hash && parent_is_recovery {
+    if finished_is_distinct && Some(tip_puzzle) == finished_hash {
         return (
             VaultPhase::Finished,
             "Vault is under the recovered custody configuration.",

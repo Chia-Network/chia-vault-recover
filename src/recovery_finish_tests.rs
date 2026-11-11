@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use chia_bls::SecretKey;
+use chia_bls::{PublicKey, SecretKey};
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzle_types::Memos;
 use chia_sdk_coinset::{ChiaRpcClient, CoinRecord, MempoolItem};
@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::chain::{ChainClient, PendingSpend};
+use crate::chain::ChainClient;
 use crate::config::{Curve, KeyType, VaultConfigMember, VaultConfigRecovery, VaultConfigSide};
 use crate::keys::{MnemonicWordCount, generate_mnemonic, public_key_to_hex};
 use crate::test_rpc::{ScriptedRpc, page};
@@ -49,6 +49,8 @@ struct Started {
     post_inner: TreeHash,
     custody_sk: SecretKey,
     recovery_sk: SecretKey,
+    post_custody_sk: SecretKey,
+    post_custody_pk: PublicKey,
 }
 
 fn start_on_sim() -> anyhow::Result<Started> {
@@ -102,6 +104,8 @@ fn start_with_amount(amount: u64) -> anyhow::Result<Started> {
         receive_address: None,
     };
     let new_custody = generate_mnemonic(MnemonicWordCount::Words24)?;
+    let post_custody_sk = new_custody.key_pair.secret_key.clone();
+    let post_custody_pk = new_custody.key_pair.public_key;
     let start = start_recovery(StartRecoveryParams {
         config: &config,
         vault_coin: vault.coin,
@@ -134,6 +138,8 @@ fn start_with_amount(amount: u64) -> anyhow::Result<Started> {
         post_inner,
         custody_sk: custody.key_pair.secret_key,
         recovery_sk: recovery.key_pair.secret_key,
+        post_custody_sk,
+        post_custody_pk,
     })
 }
 
@@ -181,6 +187,37 @@ fn nil_program(ctx: &mut SpendContext) -> anyhow::Result<Spend> {
     let args = ctx.new_pair(one, tails)?;
     let puzzle = ctx.new_pair(op_if, args)?;
     Ok(Spend::new(puzzle, nil))
+}
+
+fn spend_finished_with_post_custody(started: &mut Started) -> anyhow::Result<()> {
+    let mut ctx = SpendContext::new();
+    let launcher = started.config.launcher_id_bytes()?;
+    let post = get_vault_internals(launcher, &started.post.to_vault_keys()?)?;
+    let amount = started.child.coin.amount;
+    let finished = started.child.child(post.inner_puzzle_hash, amount);
+    let conditions =
+        Conditions::new().create_coin(post.inner_puzzle_hash.into(), amount, Memos::None);
+    let mut mips = MipsSpend::new(ctx.delegated_spend(conditions)?);
+    mips.members.insert(
+        post.inner_puzzle_hash,
+        InnerPuzzleSpend::m_of_n(
+            0,
+            Vec::new(),
+            1,
+            vec![post.custody_hash, post.recovery_hash],
+        ),
+    );
+    let puzzle = ctx.curry(BlsMember::new(started.post_custody_pk))?;
+    let solution = ctx.alloc(&NodePtr::NIL)?;
+    mips.members.insert(
+        post.custody_hash,
+        InnerPuzzleSpend::new(0, Vec::new(), Spend::new(puzzle, solution)),
+    );
+    finished.spend(&mut ctx, &mips)?;
+    started
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&started.post_custody_sk))?;
+    Ok(())
 }
 
 #[test]
@@ -308,13 +345,20 @@ fn record_of(state: chia_protocol::CoinState) -> CoinRecord {
     }
 }
 
-fn body_id(body: &Value, field: &str) -> Option<Bytes32> {
-    let text = body.get(field)?.as_str()?;
+fn id_from_text(text: &str) -> Option<Bytes32> {
     let bytes: [u8; 32] = hex::decode(text.trim_start_matches("0x"))
         .ok()?
         .try_into()
         .ok()?;
     Some(Bytes32::new(bytes))
+}
+
+fn body_id(body: &Value, field: &str) -> Option<Bytes32> {
+    id_from_text(body.get(field)?.as_str()?)
+}
+
+fn first_id(body: &Value, field: &str) -> Option<Bytes32> {
+    id_from_text(body.get(field)?.as_array()?.first()?.as_str()?)
 }
 
 impl ChiaRpcClient for SimRpc<'_> {
@@ -336,19 +380,8 @@ impl ChiaRpcClient for SimRpc<'_> {
         let body = serde_json::to_value(body).map_err(|e| e.to_string())?;
         let response = match endpoint {
             "get_coin_records_by_parent_ids" => {
-                let parent = body
-                    .get("parent_ids")
-                    .and_then(Value::as_array)
-                    .and_then(|ids| ids.first())
-                    .and_then(Value::as_str)
-                    .and_then(|text| {
-                        let bytes: [u8; 32] = hex::decode(text.trim_start_matches("0x"))
-                            .ok()?
-                            .try_into()
-                            .ok()?;
-                        Some(Bytes32::new(bytes))
-                    })
-                    .ok_or_else(|| "missing parent id".to_string())?;
+                let parent =
+                    first_id(&body, "parent_ids").ok_or_else(|| "missing parent id".to_string())?;
                 let records: Vec<_> = self
                     .sim
                     .children(parent)
@@ -444,24 +477,17 @@ struct MapChain {
     reread: HashMap<Bytes32, CoinRecord>,
 }
 
-fn map_rpc(chain: &MapChain) -> ScriptedRpc {
+fn map_rpc_with_mempool(
+    chain: &MapChain,
+    mempool: Value,
+    mempool_calls: Arc<AtomicUsize>,
+) -> ScriptedRpc {
     let children = chain.children.clone();
     let records = chain.records.clone();
     let reread = chain.reread.clone();
     ScriptedRpc::new(move |endpoint, body| match endpoint {
         "get_coin_records_by_parent_ids" => {
-            let parent = body
-                .get("parent_ids")
-                .and_then(Value::as_array)
-                .and_then(|ids| ids.first())
-                .and_then(Value::as_str)
-                .and_then(|text| {
-                    let bytes: [u8; 32] = hex::decode(text.trim_start_matches("0x"))
-                        .ok()?
-                        .try_into()
-                        .ok()?;
-                    Some(Bytes32::new(bytes))
-                })?;
+            let parent = first_id(body, "parent_ids")?;
             let page_records = children.get(&parent).map(Vec::as_slice).unwrap_or(&[]);
             Some(page(page_records, None, false))
         }
@@ -470,7 +496,10 @@ fn map_rpc(chain: &MapChain) -> ScriptedRpc {
             let record = reread.get(&id).or_else(|| records.get(&id)).copied();
             Some(json!({"coin_record": record, "success": true}))
         }
-        "get_mempool_items_by_coin_name" => Some(json!({"mempool_items": [], "success": true})),
+        "get_mempool_items_by_coin_name" => {
+            mempool_calls.fetch_add(1, Ordering::Relaxed);
+            Some(mempool.clone())
+        }
         _ => None,
     })
 }
@@ -480,22 +509,32 @@ fn inspect_map(
     config: &VaultConfig,
     post: Option<&VaultConfig>,
 ) -> Result<InspectReport> {
+    inspect_map_with_mempool(
+        chain,
+        config,
+        post,
+        json!({"mempool_items": [], "success": true}),
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+fn inspect_map_with_mempool(
+    chain: &MapChain,
+    config: &VaultConfig,
+    post: Option<&VaultConfig>,
+    mempool: Value,
+    mempool_calls: Arc<AtomicUsize>,
+) -> Result<InspectReport> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let client = ChainClient::with_rpc(map_rpc(chain));
+    let client = ChainClient::with_rpc(map_rpc_with_mempool(chain, mempool, mempool_calls));
     runtime.block_on(crate::workflow::inspect(&client, config, post))
 }
 
 #[test]
-fn walk_ignores_an_unrelated_coin_at_the_same_puzzle_hash() -> anyhow::Result<()> {
-    let mut started = start_on_sim()?;
-    let launcher = started.config.launcher_id_bytes()?;
-    let post_ready = get_vault_internals(launcher, &started.post.to_vault_keys()?)?;
-    let unrelated_parent = Coin::new(Bytes32::new([4; 32]), Bytes32::new([5; 32]), 2);
-    let unrelated = Coin::new(unrelated_parent.coin_id(), post_ready.full_puzzle_hash, 1);
-    started.sim.insert_coin(unrelated_parent);
-    started.sim.insert_coin(unrelated);
+fn inspect_notes_a_pending_spend_during_recovery() -> anyhow::Result<()> {
+    let started = start_on_sim()?;
 
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::InRecovery);
@@ -505,27 +544,12 @@ fn walk_ignores_an_unrelated_coin_at_the_same_puzzle_hash() -> anyhow::Result<()
     );
     assert!(report.pending_note.is_none());
 
+    let no_post = inspect_sim(&started.sim, &started.config, None)?;
+    assert_eq!(no_post.phase, VaultPhase::Unknown);
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let unrelated_client = ChainClient::with_rpc(SimRpc {
-        sim: &started.sim,
-        pending: None,
-        pushes: Arc::new(AtomicUsize::new(0)),
-    });
-    let unrelated_observed = runtime.block_on(load_singleton(
-        &unrelated_client,
-        unrelated_parent.coin_id(),
-    ))?;
-    assert_eq!(unrelated_observed.tip.coin.coin_id(), unrelated.coin_id());
-    let unrelated_report = classify_singleton(
-        &started.config,
-        Some(&started.post),
-        &unrelated_observed,
-        PendingSpend::None,
-    )?;
-    assert_eq!(unrelated_report.phase, VaultPhase::Unknown);
-
     let pending_client = ChainClient::with_rpc(SimRpc {
         sim: &started.sim,
         pending: Some(started.child.coin.coin_id()),
@@ -679,6 +703,27 @@ fn parent_record_and_reread_gate_settled_phases() -> anyhow::Result<()> {
     };
     let ready_report = inspect_map(&untouched, &started.config, Some(&started.config))?;
     assert_eq!(ready_report.phase, VaultPhase::Ready);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = ChainClient::with_rpc(map_rpc_with_mempool(
+        &untouched,
+        json!({"mempool_items": [], "success": true}),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let err = runtime
+        .block_on(crate::workflow::finish(
+            &client,
+            &started.config,
+            &started.config,
+            Network::Testnet11,
+        ))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("vault is READY, not in recovery"),
+        "{err}"
+    );
     Ok(())
 }
 
@@ -686,20 +731,26 @@ fn parent_record_and_reread_gate_settled_phases() -> anyhow::Result<()> {
 fn pending_check_failure_is_reported_without_failing_inspect() -> anyhow::Result<()> {
     let started = start_on_sim()?;
     let launcher = started.config.launcher_id_bytes()?;
-    let client = ChainClient::with_rpc(SimRpc {
-        sim: &started.sim,
-        pending: None,
-        pushes: Arc::new(AtomicUsize::new(0)),
-    });
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let observed = runtime.block_on(load_singleton(&client, launcher))?;
-    let report = classify_singleton(
+    let tip = started.child.coin;
+    let parent = started
+        .sim
+        .coin_state(tip.parent_coin_info)
+        .expect("recovery parent")
+        .coin;
+    let chain = MapChain {
+        children: HashMap::from([(launcher, vec![stored(tip, false)])]),
+        records: HashMap::from([
+            (parent.coin_id(), stored(parent, true)),
+            (tip.coin_id(), stored(tip, false)),
+        ]),
+        reread: HashMap::new(),
+    };
+    let report = inspect_map_with_mempool(
+        &chain,
         &started.config,
         Some(&started.post),
-        &observed,
-        PendingSpend::Unknown,
+        json!({"success": false}),
+        Arc::new(AtomicUsize::new(0)),
     )?;
     assert_eq!(report.phase, VaultPhase::InRecovery);
     let note = report.pending_note.expect("unknown pending note");
@@ -711,24 +762,52 @@ fn pending_check_failure_is_reported_without_failing_inspect() -> anyhow::Result
 }
 
 #[test]
-fn unknown_pending_spend_adds_no_note_outside_recovery() -> anyhow::Result<()> {
+fn inspect_does_not_check_pending_spend_outside_recovery() -> anyhow::Result<()> {
     let started = start_on_sim()?;
     let launcher = started.config.launcher_id_bytes()?;
     let ready = get_vault_internals(launcher, &started.keys)?;
     let tip = Coin::new(Bytes32::new([7; 32]), ready.full_puzzle_hash, 1);
     let parent = Coin::new(Bytes32::new([8; 32]), Bytes32::new([9; 32]), 1);
-    let observed = ObservedSingleton {
-        tip: stored(tip, false),
-        parent: stored(parent, true),
+    let chain = MapChain {
+        children: HashMap::from([(launcher, vec![stored(tip, false)])]),
+        records: HashMap::from([
+            (tip.parent_coin_info, stored(parent, true)),
+            (tip.coin_id(), stored(tip, false)),
+        ]),
+        reread: HashMap::new(),
     };
-    let report = classify_singleton(
+    let calls = Arc::new(AtomicUsize::new(0));
+    let report = inspect_map_with_mempool(
+        &chain,
         &started.config,
         Some(&started.post),
-        &observed,
-        PendingSpend::Unknown,
+        json!({"success": false}),
+        Arc::clone(&calls),
     )?;
     assert_eq!(report.phase, VaultPhase::Ready);
     assert!(report.pending_note.is_none());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn recovery_tip_uses_the_tip_amount() -> anyhow::Result<()> {
+    let started = start_on_sim()?;
+    let launcher = started.config.launcher_id_bytes()?;
+    let at_three = recovery_state_hashes(launcher, &started.keys, started.post_inner, 3)?;
+    let parent = Coin::new(Bytes32::new([11; 32]), Bytes32::new([12; 32]), 5);
+    let tip = Coin::new(parent.coin_id(), at_three.internals.full_puzzle_hash, 3);
+    let chain = MapChain {
+        children: HashMap::from([(launcher, vec![stored(tip, false)])]),
+        records: HashMap::from([
+            (parent.coin_id(), stored(parent, true)),
+            (tip.coin_id(), stored(tip, false)),
+        ]),
+        reread: HashMap::new(),
+    };
+    let report = inspect_map(&chain, &started.config, Some(&started.post))?;
+    assert_eq!(report.phase, VaultPhase::InRecovery);
+    assert_eq!(report.on_chain_coin.map(|coin| coin.amount), Some(3));
     Ok(())
 }
 
@@ -747,6 +826,42 @@ fn finish_after_recovery_finished_pushes_nothing() -> anyhow::Result<()> {
 
     let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
     assert_eq!(report.phase, VaultPhase::Finished);
+
+    let pushes = Arc::new(AtomicUsize::new(0));
+    let outcome = finish_sim(&started.sim, &pushes, &started.config, &started.post)?;
+    assert_eq!(outcome.action, FinishAction::AlreadyFinished);
+    assert_eq!(pushes.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn finished_vault_spent_again_stays_finished() -> anyhow::Result<()> {
+    let mut started = start_on_sim()?;
+    started.sim.pass_time(10);
+    let bundle = finish_recovery(FinishRecoveryParams {
+        config: &started.config,
+        post_recovery_config: &started.post,
+        vault_coin: started.child.coin,
+        lineage_proof: started.child.proof,
+        network: Network::Testnet11,
+    })?;
+    started.sim.spend_coins(bundle.coin_spends, &[])?;
+    spend_finished_with_post_custody(&mut started)?;
+
+    let post = get_vault_internals(
+        started.config.launcher_id_bytes()?,
+        &started.post.to_vault_keys()?,
+    )?;
+    let report = inspect_sim(&started.sim, &started.config, Some(&started.post))?;
+    assert_eq!(report.phase, VaultPhase::Finished);
+    let tip = report.on_chain_coin.expect("walked coin");
+    let parent = started
+        .sim
+        .coin_state(tip.parent_coin_info)
+        .expect("finished parent")
+        .coin;
+    assert_eq!(tip.puzzle_hash, post.full_puzzle_hash);
+    assert_eq!(parent.puzzle_hash, post.full_puzzle_hash);
 
     let pushes = Arc::new(AtomicUsize::new(0));
     let outcome = finish_sim(&started.sim, &pushes, &started.config, &started.post)?;

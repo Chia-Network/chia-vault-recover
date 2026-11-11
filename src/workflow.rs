@@ -24,7 +24,7 @@ use crate::locate::{parse_vault_locator, resolve_launcher_id};
 use crate::network::Network;
 use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
-    classify_singleton, finish_recovery, load_singleton, start_recovery,
+    classify_singleton, finish_recovery, load_singleton, pending_note, start_recovery,
 };
 use crate::scan::LauncherScan;
 
@@ -55,17 +55,16 @@ pub struct ResolvedVault {
 
 /// Find the live singleton from its launcher and its lineage proof.
 ///
-/// With a post-recovery config, that coin is settled only when its parent is the recovery coin.
-pub async fn resolve_vault<C>(
+/// Returns an error unless the vault is in the READY state.
+pub async fn resolve_ready<C>(
     client: &ChainClient<C>,
     config: &VaultConfig,
-    post_recovery: Option<&VaultConfig>,
 ) -> Result<ResolvedVault>
 where
     C: ChiaRpcClient,
     C::Error: Display,
 {
-    let report = inspect(client, config, post_recovery).await?;
+    let report = inspect(client, config, None).await?;
     let Some(coin) = report.on_chain_coin else {
         return Err(Error::msg(
             "vault singleton not found on chain for this config",
@@ -73,6 +72,11 @@ where
     };
     if report.phase == VaultPhase::Unknown {
         return Err(Error::msg("on-chain vault does not match this config"));
+    }
+    if report.phase != VaultPhase::Ready {
+        return Err(Error::msg(
+            "vault is not in READY state; cannot start recovery",
+        ));
     }
     let proof = client.lineage_proof_for_coin(&coin).await?;
     Ok(ResolvedVault {
@@ -111,10 +115,15 @@ where
 {
     let launcher_id = config.launcher_id_bytes()?;
     let observed = load_singleton(client, launcher_id).await?;
-    let pending = client
-        .coin_has_pending_spend(observed.tip.coin.coin_id())
-        .await;
-    classify_singleton(config, post_recovery, &observed, pending)
+    let mut report = classify_singleton(config, post_recovery, &observed)?;
+    if report.phase == VaultPhase::InRecovery {
+        report.pending_note = pending_note(
+            client
+                .coin_has_pending_spend(observed.tip.coin.coin_id())
+                .await,
+        );
+    }
+    Ok(report)
 }
 
 pub struct StartWorkflow<'a> {
@@ -136,12 +145,7 @@ where
     C: ChiaRpcClient,
     C::Error: Display,
 {
-    let resolved = resolve_vault(client, params.config, None).await?;
-    if resolved.phase != VaultPhase::Ready {
-        return Err(Error::msg(
-            "vault is not in READY state; cannot start recovery",
-        ));
-    }
+    let resolved = resolve_ready(client, params.config).await?;
 
     let mut result = start_recovery(StartRecoveryParams {
         config: params.config,
@@ -222,7 +226,12 @@ where
         }
         VaultPhase::Finished => FinishStep::Settled(FinishAction::AlreadyFinished),
         VaultPhase::ClawedBack => FinishStep::Settled(FinishAction::ClawedBack),
-        VaultPhase::Ready | VaultPhase::Unknown => {
+        VaultPhase::Ready => {
+            return Err(Error::msg(
+                "vault is READY, not in recovery; cannot finish (did start confirm?)",
+            ));
+        }
+        VaultPhase::Unknown => {
             return Err(Error::msg(
                 "vault is not in RECOVERY state; cannot finish (did start confirm? is post-recovery config correct?)",
             ));
