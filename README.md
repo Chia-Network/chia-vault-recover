@@ -24,7 +24,7 @@ chia-vault-recover-gui
 
 The GUI is a short wizard: **Look up → Start → Finish**. Only one step is on screen at a time.
 
-1. **Look up** — Paste the vault Receive address and click **Look up vault**. This does not ask for the recovery phrase. The lookup runs in the background with a **Cancel** button and saves a successful result on disk (see [Lookup cache](#lookup-cache)). The full node URL is under Advanced.
+1. **Look up** — Paste the vault Receive address and click **Look up vault**. This does not ask for the recovery phrase. The lookup runs in the background with a **Cancel** button that stops the whole lookup, including the launcher match. A successful result is saved on disk (see [Lookup cache](#lookup-cache)). The full node URL is under Advanced.
 2. If lookup asks for a self-send, follow the on-screen steps (same as the CLI notes below). That spend publishes the recovery hint.
 3. **Start** — When the hint is present, the clawback window is already filled in. Paste the recovery phrase and a new custody phrase, then **Start recovery**. Public configs are written under `~/.chia-vault-recover/` by default (override with Browse).
 4. You can **close the app** after lookup or after Start. The next launch skips any home screen and opens **Start** (saved lookup) or **Finish** (recovery already started).
@@ -75,7 +75,11 @@ chia-vault-recover lookup --vault xch1... --created-on 2026-01-15
 chia-vault-recover lookup --vault xch1... --scan-from-height 9000000 --scan-to-height 9005000
 ```
 
-A `--created-on` scan covers about two days of blocks. Its resolved height range is rejected if it is wider than twice the 5-day limit, for a node that reports block times out of order. Height ranges are limited to 5 days (23,040 blocks); pass `--force-scan` with them to go past that. The scan is the last step of the lookup: it runs only if nothing at the address reveals the launcher, and a date is turned into block heights only then. If no launcher in the range matches, the result names the blocks it searched. A date before the first block or after the latest one is an error. A lookup has an overall 30-minute deadline; when it expires, the node may be slow or the launcher scan range can be narrowed. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
+A `--created-on` scan covers about two days of blocks. Its resolved height range is rejected if it is wider than twice the 5-day limit, for a node that reports block times out of order. Height ranges are limited to 5 days (23,040 blocks); pass `--force-scan` with them to go past that. The scan is the last step of the lookup: it runs only if nothing at the address reveals the launcher, and a date is turned into block heights only then. Launchers are matched page by page and the scan stops at the first match. If no launcher in the range matches, the result names the blocks it searched. A date before the first block or after the latest one is an error. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
+
+A lookup has an overall 30-minute deadline covering the address walk, launcher scan, and hint read; when it expires, the node may be slow or the launcher scan range can be narrowed. In the GUI, **Cancel** stops the whole lookup, including the launcher match.
+
+The address lookup follows at most 8 pages and stops at a record cap of 500,000, returning the records read so far and moving on. The launcher scan must be complete to report *not found*, so it stops with an error when the node stops paging or either limit is reached.
 
 Every Receive address the vault has is checked against the default address (nonce 0) and derived addresses up to nonce 100. That upper bound is a chosen search limit for the address walk, not a Cloud Wallet rule. An address at a higher nonce is found only from a spend that reveals its puzzle. The Receive address depends only on the launcher id and nonce, not on the vault singleton's puzzle, so the scan works for every vault puzzle Cloud Wallet has used. If Cloud Wallet changes the Receive (p2) puzzle itself, the scan reports *not found* until that puzzle is added; it never returns another singleton's launcher.
 

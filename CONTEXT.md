@@ -29,11 +29,11 @@ The delay, in seconds, during which old custody can still cancel a started recov
 _Avoid_: timeout, wait period
 
 **Lookup**:
-Resolving a Receive address to the launcher and the on-chain recovery hint, or to a prior custody spend when that hint is absent. Does not need the recovery phrase.
+Resolving a Receive address to the launcher and the on-chain recovery hint, or to a prior custody spend when that hint is absent. Does not need the recovery phrase. The whole lookup has a 30-minute deadline; in the GUI, Cancel stops it, including the launcher match.
 _Avoid_: discover, resolve (CLI aliases only)
 
 **Launcher scan**:
-Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Runs last, only when nothing at the address reveals the launcher. Height ranges are limited to 5 days unless `--force-scan`; a created-on resolved range has a sanity cap of twice that. A lookup has a 30-minute deadline.
+Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Runs last, only when nothing at the address reveals the launcher. Matching stops at the first match, page by page, and yields to the runtime so the lookup deadline or GUI Cancel can stop it. Height ranges are limited to 5 days unless `--force-scan`; a created-on resolved range has a sanity cap of twice that. The address lookup stops at 8 pages or the record cap and returns a partial list; the scan must be complete and reports an error otherwise.
 _Avoid_: deep search, brute force
 
 **Found vault**:

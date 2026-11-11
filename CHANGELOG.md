@@ -12,9 +12,11 @@ The package version is bumped at release time; it is not changed by this entry.
 - Per-request RPC timeouts, and a hint on `push_tx` timeouts that the
   transaction may still have been submitted.
 - Cache format versioning. A lookup cache from an older format is ignored.
-- Bounds on lookup work: an overall lookup deadline, a launcher-scan page cap, a
-  cap on buffered coin records, a timestamp-window cap, and a sanity cap on a
-  created-on resolved range.
+- The lookup has an overall 30-minute deadline covering the address walk,
+  launcher scan, and hint read.
+- Bounds on lookup work: a launcher-scan page cap, a cap on buffered coin
+  records, a timestamp-window cap, and a sanity cap on a created-on resolved
+  range.
 
 ### Changed
 
@@ -22,7 +24,12 @@ The package version is bumped at release time; it is not changed by this entry.
   launcher-from-spend path no longer returns an unrelated singleton launcher.
 - A lookup that needs a fallback clears the saved lookup for that address, so
   Start is no longer offered for a stale entry.
-- GUI lookup runs off the UI thread with a **Looking up…** state and a
+- GUI lookup runs in the background with a **Looking up…** state and a
   **Cancel** button.
+- The address lookup follows at most 8 pages and stops at the record cap,
+  returning the records it read; a launcher scan reports an error when its
+  listing is incomplete.
+- `workflow::lookup` and `resolve_found` take `LookupOptions`, and the launcher
+  scan API `find_launcher_matching` takes a `HeightRange` (library API changes).
 - Hint lookups that time out are reported as errors; any other hint-request
   failure reads as no hints.
