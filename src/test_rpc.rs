@@ -1,6 +1,6 @@
 //! Scripted RPC client for chain lookup tests.
 
-use chia_protocol::{Bytes32, Coin};
+use chia_protocol::{BlockRecord, Bytes32, ClassgroupElement, Coin};
 use chia_sdk_coinset::{ChiaRpcClient, CoinRecord};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -40,6 +40,25 @@ impl ChiaRpcClient for ScriptedRpc {
     }
 }
 
+/// An RPC client that never answers, for timeout tests.
+pub struct NeverRpc;
+
+impl ChiaRpcClient for NeverRpc {
+    type Error = String;
+
+    fn base_url(&self) -> &str {
+        "never"
+    }
+
+    async fn make_post_request<R, B>(&self, _endpoint: &str, _body: B) -> Result<R, String>
+    where
+        B: Serialize + Send,
+        R: DeserializeOwned + Send,
+    {
+        std::future::pending().await
+    }
+}
+
 pub fn hex_id(id: Bytes32) -> String {
     format!("0x{}", hex::encode(id))
 }
@@ -62,5 +81,66 @@ pub fn page(records: &[CoinRecord], next_cursor: Option<&str>, truncated: bool) 
         "success": true,
         "truncated": truncated,
         "next_cursor": next_cursor,
+    })
+}
+
+/// A block record with a timestamp only when `timestamp` is set.
+pub fn block_record(height: u32, timestamp: Option<u64>) -> BlockRecord {
+    BlockRecord::new(
+        Bytes32::default(),
+        Bytes32::default(),
+        height,
+        u128::from(height),
+        u128::from(height),
+        0,
+        ClassgroupElement::default(),
+        None,
+        Bytes32::default(),
+        Bytes32::default(),
+        1,
+        Bytes32::default(),
+        Bytes32::default(),
+        0,
+        15,
+        false,
+        0,
+        timestamp,
+        timestamp.map(|_| Bytes32::default()),
+        timestamp.map(|_| 0),
+        timestamp.map(|_| Vec::new()),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// A `get_blockchain_state` response whose peak is `peak`.
+pub fn blockchain_state(peak: BlockRecord) -> Value {
+    let height = peak.height;
+    json!({
+        "blockchain_state": {
+            "average_block_time": 1,
+            "block_max_cost": 11_000_000_000u64,
+            "difficulty": 1,
+            "genesis_challenge_initialized": true,
+            "mempool_cost": 0,
+            "mempool_fees": 0,
+            "mempool_max_total_cost": 110_000_000_000u64,
+            "mempool_min_fees": { "cost_5000000": 0 },
+            "mempool_size": 0,
+            "node_id": hex_id(Bytes32::default()),
+            "peak": peak,
+            "space": 0,
+            "sub_slot_iters": 1,
+            "sync": {
+                "sync_mode": false,
+                "sync_progress_height": height,
+                "sync_tip_height": height,
+                "synced": true,
+            },
+        },
+        "error": null,
+        "success": true,
     })
 }

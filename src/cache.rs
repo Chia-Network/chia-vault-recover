@@ -23,6 +23,9 @@ use crate::network::Network;
 const CACHE_ENV: &str = "CHIA_VAULT_RECOVER_CACHE";
 const DIR_ENV: &str = "CHIA_VAULT_RECOVER_DIR";
 
+/// Format version of the lookup cache. Older files are ignored rather than trusted.
+const CACHE_VERSION: u32 = 1;
+
 /// Directory for the lookup cache, GUI session, and default vault-config files.
 ///
 /// Override with `CHIA_VAULT_RECOVER_DIR`. Otherwise `~/.chia-vault-recover`
@@ -120,6 +123,8 @@ pub struct LookupCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheFile {
+    #[serde(default)]
+    cache_version: u32,
     receive_address: String,
     network: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -177,6 +182,7 @@ impl LookupCache {
         let entry = fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<CacheFile>(&text).ok())
+            .filter(|file| file.cache_version == CACHE_VERSION)
             .and_then(|file| file.into_cached().ok());
         Self { path, entry }
     }
@@ -205,6 +211,24 @@ impl LookupCache {
         fs::write(&self.path, serde_json::to_string_pretty(&file)?)?;
         self.entry = Some(entry);
         Ok(())
+    }
+
+    /// Remove the cached lookup when it belongs to `address`.
+    ///
+    /// A different address is left alone, including its file on disk.
+    pub fn discard(&mut self, address: &str) -> Result<()> {
+        let Some(entry) = self.entry.as_ref() else {
+            return Ok(());
+        };
+        if !entry.matches_address(address) {
+            return Ok(());
+        }
+        self.entry = None;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub(crate) fn require(&self, address: &str) -> Result<CachedLookup> {
@@ -268,6 +292,7 @@ fn hex_id(id: &Bytes32) -> String {
 impl CacheFile {
     fn from_cached(entry: &CachedLookup) -> Self {
         let base = Self {
+            cache_version: CACHE_VERSION,
             receive_address: entry.receive_address.clone(),
             network: entry.network.as_str().to_string(),
             launcher_id: String::new(),
@@ -499,6 +524,74 @@ mod tests {
         )
         .replace_found("xch1abc", Network::Mainnet, found(0xbb));
         assert_eq!(cleared.lookup.clawback(), ClawbackGuess::Unknown);
+    }
+
+    #[test]
+    fn versionless_cache_is_ignored() {
+        let path = temp_path();
+        let mut cache = LookupCache::open_at(&path);
+        cache
+            .store(CachedLookup::new(
+                "xch1abc",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            ))
+            .unwrap();
+        let mut file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file.as_object_mut().unwrap().remove("cacheVersion");
+        file["receiveAddress"] = serde_json::json!("xch1other");
+        file["launcherId"] = serde_json::json!(format!("0x{}", hex::encode([0xbb; 32])));
+        fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+        assert!(LookupCache::open_at(&path).matching("xch1other").is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stored_cache_includes_the_current_version() {
+        let path = temp_path();
+        let mut cache = LookupCache::open_at(&path);
+        cache
+            .store(CachedLookup::new(
+                "xch1abc",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            ))
+            .unwrap();
+        let file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file["cacheVersion"], serde_json::json!(CACHE_VERSION));
+        assert_eq!(
+            LookupCache::open_at(&path)
+                .matching("xch1abc")
+                .unwrap()
+                .launcher_id()
+                .unwrap(),
+            Bytes32::new([0xaa; 32])
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn discard_clears_only_the_matching_address() {
+        let path = temp_path();
+        let mut cache = LookupCache::open_at(&path);
+        cache
+            .store(CachedLookup::new(
+                "xch1aaa",
+                Network::Mainnet,
+                VaultLookup::Found(found(0xaa), ClawbackGuess::Unknown),
+            ))
+            .unwrap();
+        cache.discard("xch1bbb").unwrap();
+        assert!(cache.matching("xch1aaa").is_some());
+        assert!(path.is_file());
+
+        cache.discard("xch1aaa").unwrap();
+        assert!(cache.matching("xch1aaa").is_none());
+        assert!(!path.is_file());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

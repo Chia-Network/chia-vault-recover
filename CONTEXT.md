@@ -9,7 +9,7 @@ A Cloud Wallet MIPS 1-of-2 singleton (custody | recovery) identified by a launch
 _Avoid_: wallet, account
 
 **Receive address**:
-The bech32m `xch1…` / `txch1…` address shown in Cloud Wallet. It does not contain the launcher id, but it can be rebuilt from one (its p2 puzzle curries the launcher id), which is how the launcher scan recognizes the vault. A vault has one at nonce 0 and may derive more at nonces 1 to 100. It does not depend on the vault singleton's puzzle, which Cloud Wallet has changed over time.
+The bech32m `xch1…` / `txch1…` address shown in Cloud Wallet. It does not contain the launcher id, but it can be rebuilt from one (its p2 puzzle curries the launcher id), which is how the launcher scan recognizes the vault. A vault has one at nonce 0; the address walk also checks derived nonces up to 100, a chosen search bound. A spend that reveals a higher-nonce puzzle is still found. It does not depend on the vault singleton's puzzle, which Cloud Wallet has changed over time.
 _Avoid_: wallet address (ambiguous)
 
 **Recovery phrase**:
@@ -29,11 +29,11 @@ The delay, in seconds, during which old custody can still cancel a started recov
 _Avoid_: timeout, wait period
 
 **Lookup**:
-Resolving a Receive address to the launcher and the on-chain recovery hint, or to a prior custody spend when that hint is absent. Does not need the recovery phrase.
+Resolving a Receive address to the launcher and the on-chain recovery hint, or to a prior custody spend when that hint is absent. Does not need the recovery phrase. The whole lookup has a 30-minute deadline; in the GUI, Cancel stops it, including the launcher match.
 _Avoid_: discover, resolve (CLI aliases only)
 
 **Launcher scan**:
-Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Runs last, only when nothing at the address reveals the launcher. Height ranges are limited to 5 days unless `--force-scan`.
+Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Runs last, only when nothing at the address reveals the launcher. Matching stops at the first match, page by page, and yields to the runtime so the lookup deadline or GUI Cancel can stop it. Height ranges are limited to 5 days unless `--force-scan`; a created-on resolved range has a sanity cap of twice that. The address lookup stops at 8 pages or the record cap and returns a partial list; the scan must be complete and reports an error otherwise.
 _Avoid_: deep search, brute force
 
 **Found vault**:
@@ -41,7 +41,7 @@ The public chain facts from a successful lookup: launcher, custody path, current
 _Avoid_: vault-config (that file also has clawback and recovery pubkey)
 
 **Lookup cache**:
-The last successful lookup on disk (hinted layout or found vault), shared by GUI and CLI, so a later run can skip lookup.
+The last successful lookup on disk (hinted layout or found vault), shared by GUI and CLI, so a later run can skip lookup. It carries a format version; an older or unversioned file is ignored. A lookup that needs a fallback removes the entry for that address.
 _Avoid_: vault-config, session, save file
 
 **On-chain recovery hint**:

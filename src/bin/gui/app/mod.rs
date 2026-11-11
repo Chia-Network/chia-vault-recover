@@ -6,12 +6,14 @@ mod widgets;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use chia_vault_recover::cache::{CachedLookup, LookupCache};
 use chia_vault_recover::chain::ChainClient;
 use chia_vault_recover::error::Result;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
+use chia_vault_recover::workflow::LookupReport;
 use chia_vault_recover::{LookupGap, app_dir};
 use eframe::egui;
 
@@ -48,10 +50,18 @@ enum RailStep {
 #[derive(Debug, Clone)]
 enum Phase {
     Lookup,
+    LookingUp,
     Fallback(LookupGap),
     Start,
     Wait(GuiSession),
     Done,
+}
+
+struct LookupTask {
+    receiver: Receiver<std::result::Result<LookupReport, String>>,
+    handle: tokio::task::JoinHandle<()>,
+    network: Network,
+    address: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,7 +91,7 @@ impl Status {
 
 /// Opt-in launcher scan for a vault that has never been spent (same as the CLI flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LauncherScan {
+enum ScanMode {
     Off,
     CreatedOn,
     Heights,
@@ -97,7 +107,7 @@ pub struct App {
     new_recovery_mnemonic: String,
     generate_12_words: bool,
     full_node_url: String,
-    launcher_scan: LauncherScan,
+    scan_mode: ScanMode,
     scan_created_on: String,
     scan_from_height: String,
     scan_to_height: String,
@@ -108,6 +118,7 @@ pub struct App {
     /// Last inspect / wait guidance (collapsible Details).
     detail: String,
     cache: LookupCache,
+    lookup_task: Option<LookupTask>,
     /// `--smoke`: paint one frame, then close.
     smoke: bool,
     logged_first_frame: bool,
@@ -133,7 +144,7 @@ impl App {
             new_recovery_mnemonic: String::new(),
             generate_12_words: false,
             full_node_url: String::new(),
-            launcher_scan: LauncherScan::Off,
+            scan_mode: ScanMode::Off,
             scan_created_on: String::new(),
             scan_from_height: String::new(),
             scan_to_height: String::new(),
@@ -143,6 +154,7 @@ impl App {
             phase: Phase::Lookup,
             detail: String::new(),
             cache,
+            lookup_task: None,
             smoke,
             logged_first_frame: false,
         };
@@ -190,6 +202,47 @@ impl App {
         if let Err(e) = result {
             self.set_err(format!("{label}: {e}"));
         }
+    }
+
+    fn abort_lookup(&mut self) {
+        if let Some(task) = self.lookup_task.take() {
+            task.handle.abort();
+        }
+    }
+
+    pub(super) fn poll_lookup(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.lookup_task.take() else {
+            return;
+        };
+        match task.receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.phase = Phase::Lookup;
+                match report {
+                    LookupReport::Ready(lookup) => {
+                        self.apply_lookup(lookup, task.network, &task.address)
+                    }
+                    LookupReport::NeedFallback(gap) => self.apply_fallback(gap, &task.address),
+                }
+            }
+            Ok(Err(message)) => {
+                self.phase = Phase::Lookup;
+                self.set_err(format!("Lookup error: {message}"));
+            }
+            Err(TryRecvError::Empty) => {
+                self.lookup_task = Some(task);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.phase = Phase::Lookup;
+                self.set_err("Lookup stopped before it returned a result.");
+            }
+        }
+    }
+
+    pub(super) fn cancel_lookup(&mut self) {
+        self.abort_lookup();
+        self.phase = Phase::Lookup;
+        self.set_ok("Lookup cancelled. Enter a Receive address to look up a vault.");
     }
 
     fn backend(&self) -> Backend {
@@ -259,7 +312,7 @@ impl App {
 
     fn rail_step(&self) -> RailStep {
         match &self.phase {
-            Phase::Lookup | Phase::Fallback(_) => RailStep::Lookup,
+            Phase::Lookup | Phase::LookingUp | Phase::Fallback(_) => RailStep::Lookup,
             Phase::Start => RailStep::Start,
             Phase::Wait(_) | Phase::Done => RailStep::Finish,
         }
@@ -267,7 +320,7 @@ impl App {
 
     fn subtitle(&self) -> &'static str {
         match &self.phase {
-            Phase::Lookup | Phase::Fallback(_) => LOOKUP_SUBTITLE,
+            Phase::Lookup | Phase::LookingUp | Phase::Fallback(_) => LOOKUP_SUBTITLE,
             Phase::Start => START_SUBTITLE,
             Phase::Wait(_) => WAIT_SUBTITLE,
             Phase::Done => DONE_SUBTITLE,
@@ -275,6 +328,7 @@ impl App {
     }
 
     fn reset_to_lookup(&mut self) {
+        self.abort_lookup();
         GuiSession::clear();
         self.vault_address.clear();
         self.clawback_secs.clear();
@@ -366,6 +420,7 @@ impl eframe::App for App {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        self.poll_lookup(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.heading("Chia Vault Recover");
