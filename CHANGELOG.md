@@ -17,6 +17,14 @@ The package version is bumped at release time; it is not changed by this entry.
 - Bounds on lookup work: a launcher-scan page cap, a cap on buffered coin
   records, a timestamp-window cap, and a sanity cap on a created-on resolved
   range.
+- Finish and inspect follow the vault from its launcher.
+- Settled vault phases `Finished` and `ClawedBack`: finish reports them and
+  does not push a spend, and the GUI closes its session.
+- Inspect notes a pending finish or clawback, or says it could not check;
+  an unsuccessful mempool response is reported as unchecked.
+- Inspect and finish run under an overall deadline (`INSPECT_DEADLINE`).
+- Child-coin listing reports an incomplete listing instead of returning a
+  partial result.
 
 ### Changed
 
@@ -33,3 +41,7 @@ The package version is bumped at release time; it is not changed by this entry.
   scan API `find_launcher_matching` takes a `HeightRange` (library API changes).
 - Hint lookups that time out are reported as errors; any other hint-request
   failure reads as no hints.
+- Library API: `workflow::inspect`, `workflow::finish`, and `resolve_vault`
+  take a generic `ChainClient<C>`. Finish returns `FinishOutcome` /
+  `FinishAction`, `VaultPhase` adds `Finished` and `ClawedBack`, and
+  `INSPECT_DEADLINE` is public.
