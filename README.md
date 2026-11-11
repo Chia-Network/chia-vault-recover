@@ -75,7 +75,7 @@ chia-vault-recover lookup --vault xch1... --created-on 2026-01-15
 chia-vault-recover lookup --vault xch1... --scan-from-height 9000000 --scan-to-height 9005000
 ```
 
-Ranges are limited to 5 days (23,040 blocks); pass `--force-scan` to go past that. The scan runs only if no spend at the address reveals the launcher first. A date is turned into block heights only at that point. If no launcher in the range matches, the result names the blocks it searched. A date before the first block or after the latest one is an error. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
+A `--created-on` scan covers about two days of blocks. Height ranges are limited to 5 days (23,040 blocks); pass `--force-scan` with them to go past that. The scan is the last step of the lookup: it runs only if nothing at the address reveals the launcher, and a date is turned into block heights only then. If no launcher in the range matches, the result names the blocks it searched. A date before the first block or after the latest one is an error. In the GUI the same options are under **Advanced → Search launchers**, and on the *not found* screen.
 
 Every Receive address the vault has is matched: the default address (nonce 0) and Cloud Wallet's derived addresses (nonces 1 to 100). An address above nonce 100 is found only from a spend that reveals its puzzle. The Receive address depends only on the launcher id and nonce, not on the vault singleton's puzzle, so the scan works for every vault puzzle Cloud Wallet has used. If Cloud Wallet changes the Receive (p2) puzzle itself, the scan reports *not found* until that puzzle is added; it never returns another singleton's launcher.
 
@@ -169,7 +169,7 @@ Useful flags:
 | `--word-count 12\|24` | Length for an auto-generated recovery phrase (default 24) |
 | `--created-on YYYY-MM-DD` | On `lookup`, opt in to scanning launchers created on that date in any timezone. See [Finding the launcher of a never-spent vault](#finding-the-launcher-of-a-never-spent-vault) |
 | `--scan-from-height` / `--scan-to-height` | On `lookup`, opt in to scanning launchers in this block range (end exclusive). Use both, and not with `--created-on` |
-| `--force-scan` | Allow a launcher scan over 5 days |
+| `--force-scan` | Allow a `--scan-from-height` / `--scan-to-height` range over 5 days |
 | `--clawback-secs` | On `lookup`, saved as a user hint unless a recovery phrase is also given (then verified). Ignored when the on-chain hint already has the timelock, unless the value disagrees with that hint. On `start --vault` without an on-chain hint, an explicit value is tried alone; if omitted, a verified cache value, then a user hint, then common Cloud Wallet values (including 43200 / 12h) |
 
 Fees are not supported yet (zero-fee spends only).

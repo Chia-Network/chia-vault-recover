@@ -33,7 +33,7 @@ Resolving a Receive address to the launcher and the on-chain recovery hint, or t
 _Avoid_: discover, resolve (CLI aliases only)
 
 **Launcher scan**:
-Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Limited to 5 days unless `--force-scan`.
+Opt-in lookup step for a never-spent vault: check every singleton launcher in a block range (`--created-on` or `--scan-from-height`/`--scan-to-height`) against the Receive address. Runs last, only when nothing at the address reveals the launcher. Height ranges are limited to 5 days unless `--force-scan`.
 _Avoid_: deep search, brute force
 
 **Found vault**:

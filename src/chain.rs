@@ -15,6 +15,8 @@ use crate::network::{Backend, Network};
 
 /// Longest wait for one RPC response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest wait for one page of a launcher scan; a busy 5-day range takes about 100s on coinset.
+const SCAN_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Most pages followed for one launcher scan before giving up.
 const MAX_SCAN_PAGES: usize = 100;
 /// Most 32-block windows searched for a transaction block's timestamp.
@@ -52,11 +54,22 @@ where
         method: &str,
         request: impl Future<Output = std::result::Result<T, C::Error>>,
     ) -> Result<T> {
-        match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
+        self.call_within(method, REQUEST_TIMEOUT, "", request).await
+    }
+
+    /// Await one RPC call, failing after `limit` with `timeout_hint` appended to the error.
+    async fn call_within<T>(
+        &self,
+        method: &str,
+        limit: Duration,
+        timeout_hint: &str,
+        request: impl Future<Output = std::result::Result<T, C::Error>>,
+    ) -> Result<T> {
+        match tokio::time::timeout(limit, request).await {
             Ok(response) => response.map_err(|e| Error::msg(format!("{method} failed: {e}"))),
             Err(_) => Err(Error::msg(format!(
-                "{method} timed out after {}s",
-                REQUEST_TIMEOUT.as_secs()
+                "{method} timed out after {}s{timeout_hint}",
+                limit.as_secs()
             ))),
         }
     }
@@ -77,7 +90,15 @@ where
         include_spent: bool,
     ) -> Result<Vec<CoinRecord>> {
         let (records, _complete) = self
-            .paged_coin_records(puzzle_hash, None, None, include_spent, 8)
+            .paged_coin_records(
+                puzzle_hash,
+                None,
+                None,
+                include_spent,
+                8,
+                REQUEST_TIMEOUT,
+                "",
+            )
             .await?;
         Ok(records)
     }
@@ -96,6 +117,8 @@ where
                 Some(end_height),
                 true,
                 MAX_SCAN_PAGES,
+                SCAN_REQUEST_TIMEOUT,
+                "; try a narrower range",
             )
             .await?;
         if !complete {
@@ -107,8 +130,10 @@ where
         Ok(records)
     }
 
-    /// Coin records at `puzzle_hash`, following the cursor for at most `max_pages`.
+    /// Coin records at `puzzle_hash`, following the cursor for at most `max_pages`,
+    /// each page within `page_timeout`.
     /// The flag is false when pages remain, or the node truncated without a new cursor.
+    #[allow(clippy::too_many_arguments)]
     async fn paged_coin_records(
         &self,
         puzzle_hash: Bytes32,
@@ -116,13 +141,17 @@ where
         end_height: Option<u32>,
         include_spent: bool,
         max_pages: usize,
+        page_timeout: Duration,
+        timeout_hint: &str,
     ) -> Result<(Vec<CoinRecord>, bool)> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..max_pages {
             let response = self
-                .call(
+                .call_within(
                     "get_coin_records_by_puzzle_hash",
+                    page_timeout,
+                    timeout_hint,
                     self.inner.get_coin_records_by_puzzle_hash(
                         puzzle_hash,
                         start_height,
@@ -312,8 +341,14 @@ where
     }
 
     pub async fn push_tx(&self, spend_bundle: &SpendBundle) -> Result<String> {
+        // A node can accept the bundle and still answer late, so a timeout is not a failure.
         let response = self
-            .call("push_tx", self.inner.push_tx(spend_bundle.clone()))
+            .call_within(
+                "push_tx",
+                REQUEST_TIMEOUT,
+                "; the transaction may still have been submitted, so check the vault on chain before retrying",
+                self.inner.push_tx(spend_bundle.clone()),
+            )
             .await?;
         if let Some(status) = response.status
             && status != "SUCCESS"

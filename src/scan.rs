@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 
 /// Chia targets 4608 blocks a day.
 const BLOCKS_PER_DAY: u32 = 4608;
-/// Largest launcher scan without `force`.
+/// Largest height-range scan without `force`.
 pub const MAX_SCAN_DAYS: u32 = 5;
 
 /// Block heights to scan, `start` inclusive and `end` exclusive. Never empty.
@@ -57,13 +57,11 @@ impl Display for HeightRange {
     }
 }
 
-/// A requested launcher scan. Lookup turns it into heights, and holds it to the
-/// [`MAX_SCAN_DAYS`] limit, only when no cheaper step has found the launcher.
+/// A requested launcher scan. Lookup turns it into block heights only when nothing
+/// at the address reveals the launcher. Height ranges are held to [`MAX_SCAN_DAYS`]
+/// when built; a created-on window is always about two days, so it needs no limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LauncherScan {
-    window: Window,
-    force: bool,
-}
+pub struct LauncherScan(Window);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Window {
@@ -73,22 +71,16 @@ enum Window {
 
 impl LauncherScan {
     /// Every launcher from `date` (`YYYY-MM-DD`) in any timezone.
-    pub fn created_on(date: &str, force: bool) -> Result<Self> {
+    pub fn created_on(date: &str) -> Result<Self> {
         let (from, to) = created_on_timestamps(date)?;
         let date = date.trim().to_string();
-        Ok(Self {
-            window: Window::CreatedOn { date, from, to },
-            force,
-        })
+        Ok(Self(Window::CreatedOn { date, from, to }))
     }
 
-    /// Every launcher in `start..end`.
+    /// Every launcher in `start..end`; over [`MAX_SCAN_DAYS`] only with `force`.
     pub fn heights(start: u32, end: u32, force: bool) -> Result<Self> {
         let range = HeightRange::new(start, end)?.check_limit(force)?;
-        Ok(Self {
-            window: Window::Heights(range),
-            force,
-        })
+        Ok(Self(Window::Heights(range)))
     }
 
     pub(crate) async fn resolve<C>(&self, client: &ChainClient<C>) -> Result<HeightRange>
@@ -96,20 +88,18 @@ impl LauncherScan {
         C: ChiaRpcClient,
         C::Error: Display,
     {
-        let range = match &self.window {
-            Window::Heights(range) => *range,
+        match &self.0 {
+            Window::Heights(range) => Ok(*range),
             Window::CreatedOn { date, from, to } => {
                 let start = client.height_at_or_after(*from).await?;
                 let end = client.height_at_or_after(*to).await?;
-                if start >= end {
-                    return Err(Error::msg(format!(
+                HeightRange::new(start, end).map_err(|_| {
+                    Error::msg(format!(
                         "no blocks found for {date}: it is before the first block or after the latest"
-                    )));
-                }
-                HeightRange::new(start, end)?
+                    ))
+                })
             }
-        };
-        range.check_limit(self.force)
+        }
     }
 }
 
@@ -162,6 +152,8 @@ mod tests {
         let (from, to) = created_on_timestamps("2026-01-15").unwrap();
         assert_eq!(from, 1_768_435_200 - 15 * 3600);
         assert_eq!(to, 1_768_435_200 + 37 * 3600);
+        // Well inside the height-range limit, which is why created-on has none.
+        assert!(to - from < u64::from(MAX_SCAN_DAYS) * 86_400 / 2);
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2024, 2, 29), 19_782);
         for bad in [
@@ -172,7 +164,7 @@ mod tests {
             "",
             "2026-01-15-1",
         ] {
-            assert!(LauncherScan::created_on(bad, false).is_err(), "{bad}");
+            assert!(LauncherScan::created_on(bad).is_err(), "{bad}");
         }
     }
 

@@ -87,9 +87,7 @@ impl App {
     fn launcher_scan(&self) -> Result<Option<scan::LauncherScan>> {
         Ok(Some(match self.launcher_scan {
             LauncherScan::Off => return Ok(None),
-            LauncherScan::CreatedOn => {
-                scan::LauncherScan::created_on(&self.scan_created_on, self.force_scan)?
-            }
+            LauncherScan::CreatedOn => scan::LauncherScan::created_on(&self.scan_created_on)?,
             LauncherScan::Heights => scan::LauncherScan::heights(
                 Self::parsed_height(&self.scan_from_height, "scan from height")?,
                 Self::parsed_height(&self.scan_to_height, "scan to height")?,

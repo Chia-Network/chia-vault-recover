@@ -95,13 +95,13 @@ impl App {
                             .hint_text("to height (exclusive)"),
                     );
                 });
+                ui.checkbox(
+                    &mut self.force_scan,
+                    format!("Allow a range over {MAX_SCAN_DAYS} days"),
+                );
             }
             LauncherScan::Off => {}
         }
-        ui.checkbox(
-            &mut self.force_scan,
-            format!("Allow a range over {MAX_SCAN_DAYS} days"),
-        );
     }
 
     fn draw_fallback(&mut self, ui: &mut egui::Ui) {
