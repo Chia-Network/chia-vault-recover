@@ -5,7 +5,7 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
-use chia_protocol::Coin;
+use chia_protocol::{Coin, SpendBundle};
 use chia_puzzle_types::Proof;
 use chia_sdk_coinset::ChiaRpcClient;
 
@@ -171,28 +171,41 @@ where
     C: ChiaRpcClient,
     C::Error: Display,
 {
-    with_deadline(
+    let (step, pending_note) = with_deadline(
         INSPECT_DEADLINE,
         "finish",
         "; the node may be slow",
-        finish_inner(client, config, post_recovery, network),
+        finish_prepare(client, config, post_recovery, network),
     )
-    .await
+    .await?;
+    let action = match step {
+        FinishStep::Settled(action) => action,
+        FinishStep::Push(bundle) => FinishAction::Pushed(client.push_tx(&bundle).await?),
+    };
+    Ok(FinishOutcome {
+        action,
+        pending_note,
+    })
 }
 
-async fn finish_inner<C>(
+enum FinishStep {
+    Settled(FinishAction),
+    Push(Box<SpendBundle>),
+}
+
+async fn finish_prepare<C>(
     client: &ChainClient<C>,
     config: &VaultConfig,
     post_recovery: &VaultConfig,
     network: Network,
-) -> Result<FinishOutcome>
+) -> Result<(FinishStep, Option<String>)>
 where
     C: ChiaRpcClient,
     C::Error: Display,
 {
     let report = inspect_inner(client, config, Some(post_recovery)).await?;
     let pending_note = report.pending_note.clone();
-    let action = match report.phase {
+    let step = match report.phase {
         VaultPhase::InRecovery => {
             let coin = report
                 .on_chain_coin
@@ -205,20 +218,17 @@ where
                 lineage_proof: proof,
                 network,
             })?;
-            FinishAction::Pushed(client.push_tx(&bundle).await?)
+            FinishStep::Push(Box::new(bundle))
         }
-        VaultPhase::Finished => FinishAction::AlreadyFinished,
-        VaultPhase::ClawedBack => FinishAction::ClawedBack,
+        VaultPhase::Finished => FinishStep::Settled(FinishAction::AlreadyFinished),
+        VaultPhase::ClawedBack => FinishStep::Settled(FinishAction::ClawedBack),
         VaultPhase::Ready | VaultPhase::Unknown => {
             return Err(Error::msg(
                 "vault is not in RECOVERY state; cannot finish (did start confirm? is post-recovery config correct?)",
             ));
         }
     };
-    Ok(FinishOutcome {
-        action,
-        pending_note,
-    })
+    Ok((step, pending_note))
 }
 
 /// Lookup inputs beyond the vault address.

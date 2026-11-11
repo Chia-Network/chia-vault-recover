@@ -174,7 +174,9 @@ pub(crate) fn classify_singleton(
         PendingSpend::Pending if phase == VaultPhase::InRecovery => {
             Some(PENDING_FINISH_OR_CLAWBACK.to_string())
         }
-        PendingSpend::Unknown => Some(PENDING_SPEND_UNCHECKED.to_string()),
+        PendingSpend::Unknown if phase == VaultPhase::InRecovery => {
+            Some(PENDING_SPEND_UNCHECKED.to_string())
+        }
         _ => None,
     };
 

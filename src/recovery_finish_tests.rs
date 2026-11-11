@@ -711,6 +711,28 @@ fn pending_check_failure_is_reported_without_failing_inspect() -> anyhow::Result
 }
 
 #[test]
+fn unknown_pending_spend_adds_no_note_outside_recovery() -> anyhow::Result<()> {
+    let started = start_on_sim()?;
+    let launcher = started.config.launcher_id_bytes()?;
+    let ready = get_vault_internals(launcher, &started.keys)?;
+    let tip = Coin::new(Bytes32::new([7; 32]), ready.full_puzzle_hash, 1);
+    let parent = Coin::new(Bytes32::new([8; 32]), Bytes32::new([9; 32]), 1);
+    let observed = ObservedSingleton {
+        tip: stored(tip, false),
+        parent: stored(parent, true),
+    };
+    let report = classify_singleton(
+        &started.config,
+        Some(&started.post),
+        &observed,
+        PendingSpend::Unknown,
+    )?;
+    assert_eq!(report.phase, VaultPhase::Ready);
+    assert!(report.pending_note.is_none());
+    Ok(())
+}
+
+#[test]
 fn finish_after_recovery_finished_pushes_nothing() -> anyhow::Result<()> {
     let mut started = start_on_sim()?;
     started.sim.pass_time(10);
