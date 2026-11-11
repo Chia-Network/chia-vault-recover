@@ -59,7 +59,8 @@ impl Display for HeightRange {
 
 /// A requested launcher scan. Lookup turns it into block heights only when nothing
 /// at the address reveals the launcher. Height ranges are held to [`MAX_SCAN_DAYS`]
-/// when built; a created-on window is always about two days, so it needs no limit.
+/// when built. A created-on window is about two days, and its resolved range is
+/// rejected when it exceeds twice that limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherScan(Window);
 
@@ -91,16 +92,29 @@ impl LauncherScan {
         match &self.0 {
             Window::Heights(range) => Ok(*range),
             Window::CreatedOn { date, from, to } => {
-                let start = client.height_at_or_after(*from).await?;
-                let end = client.height_at_or_after(*to).await?;
-                HeightRange::new(start, end).map_err(|_| {
-                    Error::msg(format!(
+                match client.height_range_for_timestamps(*from, *to).await? {
+                    Some(range) => check_created_on_range(range, date),
+                    None => Err(Error::msg(format!(
                         "no blocks found for {date}: it is before the first block or after the latest"
-                    ))
-                })
+                    ))),
+                }
             }
         }
     }
+}
+
+/// Refuse a created-on range wider than twice the explicit height-range limit.
+/// Block times from a node that misreports them must not widen the scan.
+fn check_created_on_range(range: HeightRange, date: &str) -> Result<HeightRange> {
+    let blocks = range.end() - range.start();
+    let limit = 2 * MAX_SCAN_DAYS * BLOCKS_PER_DAY;
+    if blocks > limit {
+        return Err(Error::msg(format!(
+            "blocks for {date} span {blocks} blocks, over the {limit}-block sanity cap for a \
+             created-on scan; check the node's block times or use a height range"
+        )));
+    }
+    Ok(range)
 }
 
 /// Unix-second bounds of `date` in every timezone, UTC-12 to UTC+14, plus an hour each side.
@@ -188,5 +202,77 @@ mod tests {
             "no CLI flag in shared text"
         );
         assert!(LauncherScan::heights(100, 101 + limit, true).is_ok());
+    }
+
+    use chia_protocol::BlockRecord;
+    use serde_json::json;
+
+    use crate::test_rpc::{ScriptedRpc, block_record, blockchain_state};
+
+    fn timestamped_chain(
+        peak: u32,
+        timestamp: impl Fn(u32) -> Option<u64> + Send + Sync + 'static,
+    ) -> ScriptedRpc {
+        ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_blockchain_state" => Some(blockchain_state(block_record(peak, timestamp(peak)))),
+            "get_block_records" => {
+                let start = body["start"].as_u64()? as u32;
+                let end = body["end"].as_u64()? as u32;
+                let records: Vec<BlockRecord> = (start..end)
+                    .filter_map(|height| timestamp(height).map(|ts| block_record(height, Some(ts))))
+                    .collect();
+                Some(json!({ "block_records": records, "success": true }))
+            }
+            _ => None,
+        })
+    }
+
+    async fn resolved_range(scan: &LauncherScan, rpc: ScriptedRpc) -> Result<HeightRange> {
+        scan.resolve(&ChainClient::with_rpc(rpc)).await
+    }
+
+    #[tokio::test]
+    async fn created_on_resolves_a_past_date_to_a_non_empty_range() {
+        let rpc = timestamped_chain(1000, |height| Some(u64::from(height) * 1000));
+        let scan = LauncherScan::created_on("1970-01-01").unwrap();
+        let range = resolved_range(&scan, rpc).await.unwrap();
+        assert_eq!(range, HeightRange::new(0, 134).unwrap());
+    }
+
+    #[tokio::test]
+    async fn created_on_rejects_a_future_date_without_widening_it() {
+        let rpc = timestamped_chain(1000, |height| Some(u64::from(height) * 1000));
+        let scan = LauncherScan::created_on("2100-01-01").unwrap();
+        let err = resolved_range(&scan, rpc).await.unwrap_err();
+        assert!(err.to_string().contains("no blocks found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn created_on_propagates_block_record_errors() {
+        let rpc = ScriptedRpc::new(|endpoint, _| match endpoint {
+            "get_blockchain_state" => Some(blockchain_state(block_record(1000, Some(0)))),
+            _ => None,
+        });
+        let scan = LauncherScan::created_on("1970-01-01").unwrap();
+        let err = resolved_range(&scan, rpc).await.unwrap_err();
+        assert!(err.to_string().contains("get_block_records"), "{err}");
+        assert!(!err.to_string().contains("no blocks found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn created_on_rejects_a_range_over_the_sanity_cap() {
+        let rpc = timestamped_chain(1_000_000, |height| {
+            Some(if height == 0 { 200_000 } else { 0 })
+        });
+        let scan = LauncherScan::created_on("1970-01-01").unwrap();
+        let err = resolved_range(&scan, rpc).await.unwrap_err();
+        assert!(err.to_string().contains("sanity cap"), "{err}");
+    }
+
+    #[test]
+    fn created_on_range_cap_is_twice_the_height_limit() {
+        let limit = 2 * MAX_SCAN_DAYS * BLOCKS_PER_DAY;
+        assert!(check_created_on_range(HeightRange::new(0, limit).unwrap(), "d").is_ok());
+        assert!(check_created_on_range(HeightRange::new(0, limit + 1).unwrap(), "d").is_err());
     }
 }

@@ -154,8 +154,8 @@ where
         if let Some(spend) = client
             .get_spend(rec.coin.coin_id(), rec.spent_block_index)
             .await?
-            && let Some(id) = launcher_from_spend(&spend)
-            && spend_belongs_to_address(&spend, id, puzzle_hash)
+            && let SpendLauncher::Accepted(id) =
+                launcher_from_spend_for_address(&spend, puzzle_hash)
         {
             return Ok(Some(id));
         }
@@ -186,13 +186,12 @@ where
         } else {
             None
         };
-        if let Some(spend) = &spend
-            && let Some(id) = launcher_from_spend(spend)
-        {
-            if spend_belongs_to_address(spend, id, puzzle_hash) {
-                return Ok(Some(id));
+        if let Some(spend) = &spend {
+            match launcher_from_spend_for_address(spend, puzzle_hash) {
+                SpendLauncher::Accepted(id) => return Ok(Some(id)),
+                SpendLauncher::Other => continue,
+                SpendLauncher::None => {}
             }
-            continue;
         }
         if rec.coin.amount % 2 == 0 {
             continue;
@@ -220,30 +219,47 @@ where
     C: ChiaRpcClient,
     C::Error: Display,
 {
-    let launchers = client
-        .find_launchers_between(range.start(), range.end())
-        .await?;
-    Ok(launchers
-        .iter()
-        .map(|r| r.coin.coin_id())
-        .find(|id| launcher_matches_address(*id, puzzle_hash)))
+    client
+        .find_launcher_matching(range, |launcher| {
+            launcher_matches_address(launcher, puzzle_hash)
+        })
+        .await
 }
 
-/// A spend whose revealed p2 puzzle (under any CAT layer) hashes to the address
-/// proves the launcher directly, whatever receive puzzle Cloud Wallet used.
-/// Otherwise fall back to rebuilding the known receive puzzles.
-fn spend_belongs_to_address(spend: &CoinSpend, launcher_id: Bytes32, puzzle_hash: Bytes32) -> bool {
-    revealed_p2_puzzle_hash(spend) == Some(puzzle_hash)
-        || launcher_matches_address(launcher_id, puzzle_hash)
+enum SpendLauncher {
+    Accepted(Bytes32),
+    Other,
+    None,
 }
 
-fn revealed_p2_puzzle_hash(spend: &CoinSpend) -> Option<Bytes32> {
-    let (ctx, puzzle, _) = alloc_spend(spend).ok()?;
-    let p2 = match CatLayer::<Puzzle>::parse_puzzle(&ctx, puzzle) {
+/// The launcher a spend reveals, with whether it is accepted for `puzzle_hash`.
+///
+/// A revealed p2 puzzle (under any CAT layer) that hashes to the address proves the
+/// launcher directly, whatever receive puzzle Cloud Wallet used. Otherwise fall back
+/// to rebuilding the known receive puzzles. The revealed hash deliberately does not
+/// unwrap a `SingletonLayer`: a vault singleton spend falls through to the rebuild.
+fn launcher_from_spend_for_address(spend: &CoinSpend, puzzle_hash: Bytes32) -> SpendLauncher {
+    let Ok((ctx, puzzle, solution_ptr)) = alloc_spend(spend) else {
+        return SpendLauncher::None;
+    };
+    let Some(launcher_id) = launcher_from_puzzle(&ctx, puzzle, solution_ptr) else {
+        return SpendLauncher::None;
+    };
+    let accepted = revealed_p2_hash(&ctx, puzzle) == puzzle_hash
+        || launcher_matches_address(launcher_id, puzzle_hash);
+    if accepted {
+        SpendLauncher::Accepted(launcher_id)
+    } else {
+        SpendLauncher::Other
+    }
+}
+
+fn revealed_p2_hash(ctx: &clvmr::Allocator, puzzle: Puzzle) -> Bytes32 {
+    let p2 = match CatLayer::<Puzzle>::parse_puzzle(ctx, puzzle) {
         Ok(Some(cat)) => cat.inner_puzzle,
         _ => puzzle,
     };
-    Some(tree_hash(&ctx, p2.ptr()).into())
+    tree_hash(ctx, p2.ptr()).into()
 }
 
 async fn walk_parents_to_launcher<C>(
@@ -389,11 +405,13 @@ mod tests {
         );
         assert_eq!(launcher_from_spend(&spend), Some(launcher));
         assert!(!launcher_matches_address(launcher, address));
-        assert!(spend_belongs_to_address(&spend, launcher, address));
-        assert!(!spend_belongs_to_address(
-            &spend,
-            launcher,
-            Bytes32::new([0x47; 32])
+        assert!(matches!(
+            launcher_from_spend_for_address(&spend, address),
+            SpendLauncher::Accepted(id) if id == launcher
+        ));
+        assert!(matches!(
+            launcher_from_spend_for_address(&spend, Bytes32::new([0x47; 32])),
+            SpendLauncher::Other
         ));
     }
 
@@ -506,7 +524,10 @@ mod tests {
             ctx.serialize(&cat).unwrap(),
             ctx.serialize(&NodePtr::NIL).unwrap(),
         );
-        assert_eq!(revealed_p2_puzzle_hash(&spend), Some(address_ph));
+        assert!(matches!(
+            launcher_from_spend_for_address(&spend, address_ph),
+            SpendLauncher::Accepted(id) if id == vault
+        ));
         assert!(!launcher_matches_address(vault, address_ph));
 
         let coin = record(spend.coin, Some(9));
@@ -514,6 +535,35 @@ mod tests {
             "get_coin_records_by_puzzle_hash" => Some(page(&[], None, false)),
             "get_coin_records_by_hint" => Some(page(&[coin], None, false)),
             "get_puzzle_and_solution" => Some(json!({ "coin_solution": spend, "success": true })),
+            _ => None,
+        });
+        let found = resolve(rpc, address_ph, None).await.unwrap().unwrap();
+        assert_eq!(found.launcher_id, vault);
+    }
+
+    #[tokio::test]
+    async fn unspent_coin_parent_reveals_a_receive_puzzle_beyond_rebuilt_nonces() {
+        let vault = vault_launcher().coin_id();
+        let mut ctx = SpendContext::new();
+        let (wrapped, address_ph) = receive_puzzle(&mut ctx, vault, MAX_P2_NONCE + 100);
+        let parent_spend = CoinSpend::new(
+            Coin::new(Bytes32::new([0x74; 32]), ctx.tree_hash(wrapped).into(), 1),
+            ctx.serialize(&wrapped).unwrap(),
+            ctx.serialize(&NodePtr::NIL).unwrap(),
+        );
+        let parent = record(parent_spend.coin, Some(9));
+        let child = Coin::new(parent_spend.coin.coin_id(), Bytes32::new([0x75; 32]), 1);
+        assert!(!launcher_matches_address(vault, address_ph));
+
+        let rpc = ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_coin_records_by_puzzle_hash" => Some(page(&[record(child, None)], None, false)),
+            "get_coin_records_by_hint" => Some(page(&[], None, false)),
+            "get_coin_record_by_name" if body["name"] == hex_id(parent_spend.coin.coin_id()) => {
+                Some(json!({ "coin_record": parent, "success": true }))
+            }
+            "get_puzzle_and_solution" => {
+                Some(json!({ "coin_solution": parent_spend, "success": true }))
+            }
             _ => None,
         });
         let found = resolve(rpc, address_ph, None).await.unwrap().unwrap();
@@ -562,6 +612,37 @@ mod tests {
             .unwrap();
         assert_eq!(found.launcher_id, vault);
         assert!(found.source.contains("blocks 100..200"), "{}", found.source);
+    }
+
+    #[tokio::test]
+    async fn scan_stops_after_a_match_on_the_first_page() {
+        let vault = vault_launcher().coin_id();
+        let address_ph = address_of(vault, 0);
+        let scan = LauncherScan::heights(100, 200, false).unwrap();
+        let rpc = ScriptedRpc::new(move |endpoint, body| match endpoint {
+            "get_coin_records_by_puzzle_hash"
+                if body["puzzle_hash"] == hex_id(SINGLETON_LAUNCHER_HASH.into()) =>
+            {
+                assert!(
+                    body.get("cursor").is_none(),
+                    "a match on the first page must not fetch a later page"
+                );
+                Some(page(
+                    &[record(vault_launcher(), Some(150))],
+                    Some("next"),
+                    true,
+                ))
+            }
+            "get_coin_records_by_puzzle_hash" | "get_coin_records_by_hint" => {
+                Some(page(&[], None, false))
+            }
+            _ => None,
+        });
+        let found = resolve(rpc, address_ph, Some(&scan))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.launcher_id, vault);
     }
 
     #[tokio::test]
