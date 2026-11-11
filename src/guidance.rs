@@ -2,6 +2,8 @@
 
 use chia_protocol::Bytes32;
 
+use crate::scan::HeightRange;
+
 /// Launcher known from a successful resolve (not from the address alone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownLauncher {
@@ -14,6 +16,8 @@ pub struct KnownLauncher {
 pub enum LookupGap {
     /// Address unused, never spent, or parent spends did not reveal a launcher.
     LauncherNotFound,
+    /// Same, after an opt-in launcher scan of these blocks found no match.
+    NoLauncherInScan(HeightRange),
     /// Launcher is known but the singleton has never been spent (eve only).
     SingletonNeverSpent(KnownLauncher),
     /// Singleton spends exist but none used the current custody path.
@@ -26,6 +30,7 @@ impl LookupGap {
             Self::LauncherNotFound => {
                 "Could not find this vault’s launcher id from the address alone."
             }
+            Self::NoLauncherInScan(_) => "No launcher in the searched blocks matches this address.",
             Self::SingletonNeverSpent(_) => {
                 "Found the launcher, but this vault has never been spent with the current setup."
             }
@@ -35,27 +40,42 @@ impl LookupGap {
         }
     }
 
-    pub fn detail(&self) -> &'static str {
+    pub fn detail(&self) -> String {
         match self {
             Self::LauncherNotFound => {
                 "A Cloud Wallet receive address does not contain the launcher id. \
-                 The tool can only recover it from a spent coin at that address \
-                 (or from a parent vault spend)."
+                 The tool looks for it in spent coins at that address and their parents. \
+                 If the vault has never been spent and you know when it was created, \
+                 search the launchers created on that date."
+                    .into()
             }
+            Self::NoLauncherInScan(range) => format!(
+                "Every singleton launcher in {range} was checked against the \
+                 address and none matched. Try a nearby date or a wider height range. \
+                 Addresses Cloud Wallet derived past nonce 100 are found only once a coin \
+                 at the address has been spent."
+            ),
             Self::SingletonNeverSpent(_) => {
                 "An unspent eve singleton has no Cloud Wallet recovery hint yet. \
                  One send from the vault publishes that hint."
+                    .into()
             }
             Self::NoCustodySpend(_) => {
                 "This vault has no Cloud Wallet recovery hint and no custody spend. \
                  A send that uses the vault’s passkey or Chia Signer App publishes the hint."
+                    .into()
             }
         }
     }
 
+    /// Whether another launcher scan could still find the launcher.
+    pub fn launcher_unknown(&self) -> bool {
+        matches!(self, Self::LauncherNotFound | Self::NoLauncherInScan(_))
+    }
+
     pub fn known_launcher(&self) -> Option<&KnownLauncher> {
         match self {
-            Self::LauncherNotFound => None,
+            Self::LauncherNotFound | Self::NoLauncherInScan(_) => None,
             Self::SingletonNeverSpent(launcher) | Self::NoCustodySpend(launcher) => Some(launcher),
         }
     }
@@ -140,6 +160,7 @@ mod tests {
     fn fallback_mentions_self_send_not_a_download() {
         for gap in [
             LookupGap::LauncherNotFound,
+            LookupGap::NoLauncherInScan(HeightRange::new(1, 2).unwrap()),
             LookupGap::SingletonNeverSpent(launcher()),
             LookupGap::NoCustodySpend(launcher()),
         ] {
@@ -149,6 +170,8 @@ mod tests {
             assert!(text.contains("vault.chia.net"), "{gap:?}");
             assert!(!text.contains("download"), "{gap:?}");
             assert!(!text.contains("vault-config"), "{gap:?}");
+            // Shared with the GUI, so no CLI flags; each front end adds its own hint.
+            assert!(!text.contains("--"), "{gap:?}");
         }
     }
 

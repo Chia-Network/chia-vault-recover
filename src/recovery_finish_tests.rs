@@ -2,18 +2,21 @@ use std::collections::HashMap;
 
 use super::*;
 use chia_bls::SecretKey;
-use chia_protocol::{Coin, CoinSpend};
+use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzle_types::Memos;
-use chia_sdk_coinset::CoinRecord;
+use chia_sdk_coinset::{ChiaRpcClient, CoinRecord, MempoolItem};
 use chia_sdk_driver::{InnerPuzzleSpend, Launcher, MipsSpend, Spend, StandardLayer};
 use chia_sdk_test::Simulator;
 use chia_sdk_types::{Conditions, puzzles::BlsMember};
 use clvmr::NodePtr;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 
-use crate::chain::SingletonIndex;
-
+use crate::chain::{ChainClient, PendingSpend};
 use crate::config::{Curve, KeyType, VaultConfigMember, VaultConfigRecovery, VaultConfigSide};
 use crate::keys::{MnemonicWordCount, generate_mnemonic, public_key_to_hex};
+use crate::test_rpc::{ScriptedRpc, page};
 use crate::vault::{
     CustodyPath, RecoverySignerSet, SignerSet, VaultMemberKey, get_vault_internals,
     recovery_state_hashes,
@@ -285,7 +288,7 @@ fn clawback_during_timelock_requires_the_custody_key() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct SimChain<'a> {
+struct SimRpc<'a> {
     sim: &'a Simulator,
     pending: Option<Bytes32>,
 }
@@ -301,22 +304,76 @@ fn record_of(state: chia_protocol::CoinState) -> CoinRecord {
     }
 }
 
-impl SingletonIndex for SimChain<'_> {
-    async fn children_of(&self, parent_id: Bytes32) -> Result<Vec<CoinRecord>> {
-        Ok(self
-            .sim
-            .children(parent_id)
-            .into_iter()
-            .map(record_of)
-            .collect())
+fn body_id(body: &Value, field: &str) -> Option<Bytes32> {
+    let text = body.get(field)?.as_str()?;
+    let bytes: [u8; 32] = hex::decode(text.trim_start_matches("0x"))
+        .ok()?
+        .try_into()
+        .ok()?;
+    Some(Bytes32::new(bytes))
+}
+
+impl ChiaRpcClient for SimRpc<'_> {
+    type Error = String;
+
+    fn base_url(&self) -> &str {
+        "sim"
     }
 
-    async fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>> {
-        Ok(self.sim.coin_state(coin_id).map(record_of))
-    }
-
-    async fn coin_has_pending_spend(&self, coin_id: Bytes32) -> Result<bool> {
-        Ok(self.pending == Some(coin_id))
+    async fn make_post_request<R, B>(
+        &self,
+        endpoint: &str,
+        body: B,
+    ) -> std::result::Result<R, String>
+    where
+        B: Serialize + Send,
+        R: DeserializeOwned + Send,
+    {
+        let body = serde_json::to_value(body).map_err(|e| e.to_string())?;
+        let response = match endpoint {
+            "get_coin_records_by_parent_ids" => {
+                let parent = body
+                    .get("parent_ids")
+                    .and_then(Value::as_array)
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_str)
+                    .and_then(|text| {
+                        let bytes: [u8; 32] = hex::decode(text.trim_start_matches("0x"))
+                            .ok()?
+                            .try_into()
+                            .ok()?;
+                        Some(Bytes32::new(bytes))
+                    })
+                    .ok_or_else(|| "missing parent id".to_string())?;
+                let records: Vec<_> = self
+                    .sim
+                    .children(parent)
+                    .into_iter()
+                    .map(record_of)
+                    .collect();
+                json!({"coin_records": records, "success": true})
+            }
+            "get_coin_record_by_name" => {
+                let id = body_id(&body, "name").ok_or_else(|| "missing coin name".to_string())?;
+                let record = self.sim.coin_state(id).map(record_of);
+                json!({"coin_record": record, "success": true})
+            }
+            "get_mempool_items_by_coin_name" => {
+                let id =
+                    body_id(&body, "coin_name").ok_or_else(|| "missing coin name".to_string())?;
+                let items = if self.pending == Some(id) {
+                    vec![MempoolItem {
+                        spend_bundle: SpendBundle::aggregate(&[]),
+                        fee: 0,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                json!({"mempool_items": items, "success": true})
+            }
+            _ => return Err(format!("unscripted {endpoint}")),
+        };
+        serde_json::from_value(response).map_err(|e| e.to_string())
     }
 }
 
@@ -328,11 +385,8 @@ fn inspect_sim(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(crate::workflow::inspect(
-        &SimChain { sim, pending: None },
-        config,
-        post,
-    ))
+    let client = ChainClient::with_rpc(SimRpc { sim, pending: None });
+    runtime.block_on(crate::workflow::inspect(&client, config, post))
 }
 
 fn stored(coin: Coin, spent: bool) -> CoinRecord {
@@ -352,21 +406,35 @@ struct MapChain {
     reread: HashMap<Bytes32, CoinRecord>,
 }
 
-impl SingletonIndex for MapChain {
-    async fn children_of(&self, parent_id: Bytes32) -> Result<Vec<CoinRecord>> {
-        Ok(self.children.get(&parent_id).cloned().unwrap_or_default())
-    }
-
-    async fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>> {
-        if let Some(record) = self.reread.get(&coin_id) {
-            return Ok(Some(*record));
+fn map_rpc(chain: &MapChain) -> ScriptedRpc {
+    let children = chain.children.clone();
+    let records = chain.records.clone();
+    let reread = chain.reread.clone();
+    ScriptedRpc::new(move |endpoint, body| match endpoint {
+        "get_coin_records_by_parent_ids" => {
+            let parent = body
+                .get("parent_ids")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+                .and_then(|text| {
+                    let bytes: [u8; 32] = hex::decode(text.trim_start_matches("0x"))
+                        .ok()?
+                        .try_into()
+                        .ok()?;
+                    Some(Bytes32::new(bytes))
+                })?;
+            let page_records = children.get(&parent).map(Vec::as_slice).unwrap_or(&[]);
+            Some(page(page_records, None, false))
         }
-        Ok(self.records.get(&coin_id).copied())
-    }
-
-    async fn coin_has_pending_spend(&self, _coin_id: Bytes32) -> Result<bool> {
-        Ok(false)
-    }
+        "get_coin_record_by_name" => {
+            let id = body_id(body, "name")?;
+            let record = reread.get(&id).or_else(|| records.get(&id)).copied();
+            Some(json!({"coin_record": record, "success": true}))
+        }
+        "get_mempool_items_by_coin_name" => Some(json!({"mempool_items": [], "success": true})),
+        _ => None,
+    })
 }
 
 fn inspect_map(
@@ -377,7 +445,8 @@ fn inspect_map(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(crate::workflow::inspect(chain, config, post))
+    let client = ChainClient::with_rpc(map_rpc(chain));
+    runtime.block_on(crate::workflow::inspect(&client, config, post))
 }
 
 #[test]
@@ -401,23 +470,26 @@ fn walk_reports_the_recovery_coin_not_dust_at_the_same_hash() -> anyhow::Result<
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let dust_observed = runtime.block_on(load_singleton(
-        &SimChain {
-            sim: &started.sim,
-            pending: None,
-        },
-        dust_parent.coin_id(),
-    ))?;
+    let dust_client = ChainClient::with_rpc(SimRpc {
+        sim: &started.sim,
+        pending: None,
+    });
+    let dust_observed = runtime.block_on(load_singleton(&dust_client, dust_parent.coin_id()))?;
     assert_eq!(dust_observed.tip.coin.coin_id(), dust.coin_id());
-    let dust_report =
-        classify_singleton(&started.config, Some(&started.post), &dust_observed, false)?;
+    let dust_report = classify_singleton(
+        &started.config,
+        Some(&started.post),
+        &dust_observed,
+        PendingSpend::None,
+    )?;
     assert_eq!(dust_report.phase, VaultPhase::Unknown);
 
+    let pending_client = ChainClient::with_rpc(SimRpc {
+        sim: &started.sim,
+        pending: Some(started.child.coin.coin_id()),
+    });
     let pending = runtime.block_on(crate::workflow::inspect(
-        &SimChain {
-            sim: &started.sim,
-            pending: Some(started.child.coin.coin_id()),
-        },
+        &pending_client,
         &started.config,
         Some(&started.post),
     ))?;
@@ -564,5 +636,32 @@ fn parent_record_and_reread_gate_settled_phases() -> anyhow::Result<()> {
     };
     let ready_report = inspect_map(&untouched, &started.config, Some(&started.config))?;
     assert_eq!(ready_report.phase, VaultPhase::Ready);
+    Ok(())
+}
+
+#[test]
+fn pending_check_failure_is_reported_without_failing_inspect() -> anyhow::Result<()> {
+    let started = start_on_sim()?;
+    let launcher = started.config.launcher_id_bytes()?;
+    let client = ChainClient::with_rpc(SimRpc {
+        sim: &started.sim,
+        pending: None,
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let observed = runtime.block_on(load_singleton(&client, launcher))?;
+    let report = classify_singleton(
+        &started.config,
+        Some(&started.post),
+        &observed,
+        PendingSpend::Unknown,
+    )?;
+    assert_eq!(report.phase, VaultPhase::InRecovery);
+    let note = report.pending_note.expect("unknown pending note");
+    assert!(
+        note.contains("Could not check for a pending spend"),
+        "{note}"
+    );
     Ok(())
 }

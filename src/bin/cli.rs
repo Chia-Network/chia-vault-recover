@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -15,8 +16,9 @@ use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::{Backend, Network};
 use chia_vault_recover::recovery::{StartRecoveryResult, VaultPhase};
+use chia_vault_recover::scan::LauncherScan;
 use chia_vault_recover::workflow::{
-    self, FinishAction, LookupReport, PreparedStart, StartWorkflow,
+    self, FinishAction, LookupOptions, LookupReport, PreparedStart, StartWorkflow,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -50,6 +52,19 @@ enum Commands {
         /// File containing the 12- or 24-word recovery phrase.
         #[arg(long)]
         recovery_mnemonic_file: Option<PathBuf>,
+        /// Opt-in launcher scan for a vault that has never been spent: the date the vault
+        /// was created (`YYYY-MM-DD`). Checks every launcher from that day in any timezone.
+        #[arg(long, conflicts_with_all = ["scan_from_height", "scan_to_height", "force_scan"])]
+        created_on: Option<String>,
+        /// First block height to scan for the vault launcher (use with `--scan-to-height`).
+        #[arg(long, requires = "scan_to_height")]
+        scan_from_height: Option<u32>,
+        /// Block height to stop scanning at, exclusive (use with `--scan-from-height`).
+        #[arg(long, requires = "scan_from_height")]
+        scan_to_height: Option<u32>,
+        /// Allow a height-range scan over the 5-day limit.
+        #[arg(long, requires = "scan_from_height")]
+        force_scan: bool,
     },
     /// Start delayed recovery (signs with the 12- or 24-word Cloud Wallet recovery phrase)
     Start(Box<StartArgs>),
@@ -159,14 +174,39 @@ async fn main() -> Result<()> {
             clawback_secs,
             recovery_mnemonic,
             recovery_mnemonic_file,
+            created_on,
+            scan_from_height,
+            scan_to_height,
+            force_scan,
         } => {
             let (client, network) = client_for(&vault, backend)?;
             let extra = clawback_secs.into_iter().collect::<Vec<_>>();
-            let report = workflow::lookup(&client, &vault, &extra).await?;
+            let scan = match (created_on, scan_from_height, scan_to_height) {
+                (Some(date), _, _) => Some(LauncherScan::created_on(&date)?),
+                (None, Some(start), Some(end)) => {
+                    Some(LauncherScan::heights(start, end, force_scan)?)
+                }
+                _ => None,
+            };
+            let report = workflow::lookup(
+                &client,
+                &vault,
+                LookupOptions {
+                    extra_timelocks: &extra,
+                    scan: scan.as_ref(),
+                },
+            )
+            .await?;
             match report {
                 LookupReport::NeedFallback(gap) => {
-                    print_fallback(network, &gap);
-                    std::process::exit(2);
+                    let code = report_need_fallback(
+                        &mut std::io::stdout(),
+                        &mut std::io::stderr(),
+                        network,
+                        &gap,
+                        || LookupCache::open().discard(&vault),
+                    );
+                    std::process::exit(code);
                 }
                 LookupReport::Ready(lookup) => {
                     print_lookup(&lookup, network);
@@ -239,9 +279,17 @@ async fn main() -> Result<()> {
                     let mut cache = LookupCache::open();
                     let from_cache = cache.matching(&vault).is_some();
                     let extra = clawback_secs.into_iter().collect::<Vec<_>>();
-                    let resolved =
-                        workflow::resolve_found(&client, &mut cache, &vault, network, &extra)
-                            .await?;
+                    let resolved = workflow::resolve_found(
+                        &client,
+                        &mut cache,
+                        &vault,
+                        network,
+                        LookupOptions {
+                            extra_timelocks: &extra,
+                            scan: None,
+                        },
+                    )
+                    .await?;
                     if matches!(resolved, LookupReport::NeedFallback(_)) {
                         require_layout(network, resolved)?;
                     }
@@ -384,7 +432,7 @@ fn client_for(vault: &str, backend: BackendArgs) -> Result<(ChainClient, Network
 fn require_layout(network: Network, report: LookupReport) -> Result<()> {
     match report {
         LookupReport::NeedFallback(gap) => {
-            print_fallback(network, &gap);
+            let _ = print_fallback(&mut std::io::stdout(), network, &gap);
             bail!("cannot start recovery until lookup finds the vault layout");
         }
         LookupReport::Ready(_) => Ok(()),
@@ -521,13 +569,39 @@ fn print_reconstructed(rebuilt: &ReconstructedVault, network: Network) {
     println!("{}", reconstruct_success_guidance(rebuilt.matches_current));
 }
 
-fn print_fallback(network: Network, gap: &chia_vault_recover::LookupGap) {
-    println!("network: {}", network.as_str());
+fn print_fallback(
+    out: &mut impl Write,
+    network: Network,
+    gap: &chia_vault_recover::LookupGap,
+) -> std::io::Result<()> {
+    writeln!(out, "network: {}", network.as_str())?;
     if let Some(launcher) = gap.known_launcher() {
-        println!("launcher_id: 0x{}", hex::encode(launcher.id));
-        println!("resolved_from: {}", launcher.source);
+        writeln!(out, "launcher_id: 0x{}", hex::encode(launcher.id))?;
+        writeln!(out, "resolved_from: {}", launcher.source)?;
     }
-    println!("{}", fallback_guidance(gap));
+    writeln!(out, "{}", fallback_guidance(gap))?;
+    if gap.launcher_unknown() {
+        writeln!(
+            out,
+            "\nTo search launchers: lookup --vault <address> --created-on YYYY-MM-DD \
+             (or --scan-from-height and --scan-to-height)."
+        )?;
+    }
+    Ok(())
+}
+
+fn report_need_fallback<E: std::fmt::Display>(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    network: Network,
+    gap: &chia_vault_recover::LookupGap,
+    discard: impl FnOnce() -> std::result::Result<(), E>,
+) -> i32 {
+    let _ = print_fallback(out, network, gap);
+    if let Err(e) = discard() {
+        let _ = writeln!(err, "could not clear the saved lookup: {e}");
+    }
+    2
 }
 
 fn read_mnemonic(inline: Option<String>, file: Option<PathBuf>, label: &str) -> Result<String> {
@@ -542,4 +616,45 @@ fn optional_mnemonic(inline: Option<String>, file: Option<PathBuf>) -> Result<Op
         return Ok(Some(std::fs::read_to_string(path)?.trim().to_string()));
     }
     Ok(inline)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    struct SharedWriter(Rc<RefCell<String>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn need_fallback_writes_guidance_before_discard_warning() {
+        let events = Rc::new(RefCell::new(String::new()));
+        let mut out = SharedWriter(Rc::clone(&events));
+        let mut err = SharedWriter(Rc::clone(&events));
+        let gap = chia_vault_recover::LookupGap::LauncherNotFound;
+        let code = report_need_fallback(&mut out, &mut err, Network::Mainnet, &gap, || {
+            Err(anyhow::anyhow!("disk full"))
+        });
+        assert_eq!(code, 2);
+        let text = events.borrow();
+        let guidance = text
+            .find(&fallback_guidance(&gap))
+            .expect("guidance should be written");
+        let warning = text
+            .find("could not clear the saved lookup")
+            .expect("warning should be written");
+        assert!(guidance < warning, "{text}");
+    }
 }

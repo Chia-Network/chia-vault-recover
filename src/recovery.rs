@@ -1,9 +1,11 @@
 //! Delayed vault recovery spend construction.
 
+use std::fmt::Display;
+
 use chia_bls::{PublicKey as BlsPublicKey, SecretKey, sign};
 use chia_protocol::{Bytes32, Coin, SpendBundle};
 use chia_puzzle_types::{Memos, Proof};
-use chia_sdk_coinset::CoinRecord;
+use chia_sdk_coinset::{ChiaRpcClient, CoinRecord};
 use chia_sdk_driver::{
     InnerPuzzleSpend, MipsSpend, Spend, SpendContext, Vault, VaultInfo,
     calculate_vault_start_recovery_message,
@@ -12,7 +14,7 @@ use chia_sdk_types::{Conditions, Mod, puzzles::BlsMember, puzzles::Timelock};
 use clvm_utils::TreeHash;
 use clvmr::NodePtr;
 
-use crate::chain::{SingletonIndex, walk_singleton};
+use crate::chain::{ChainClient, PendingSpend};
 use crate::config::VaultConfig;
 use crate::error::{Error, Result};
 use crate::keys::{MnemonicWordCount, generate_mnemonic, key_from_mnemonic};
@@ -49,6 +51,8 @@ pub struct InspectReport {
 
 pub(crate) const PENDING_FINISH_OR_CLAWBACK: &str =
     "A pending spend of this vault is in the mempool and may finish recovery or claw it back.";
+pub(crate) const PENDING_SPEND_UNCHECKED: &str =
+    "Could not check for a pending spend of this vault; it may finish recovery or claw it back.";
 
 /// Confirmed singleton tip and the parent record the walk just read.
 pub(crate) struct ObservedSingleton {
@@ -56,17 +60,21 @@ pub(crate) struct ObservedSingleton {
     pub parent: CoinRecord,
 }
 
-pub(crate) async fn load_singleton(
-    index: &impl SingletonIndex,
+pub(crate) async fn load_singleton<C>(
+    client: &ChainClient<C>,
     launcher_id: Bytes32,
-) -> Result<ObservedSingleton> {
-    let (_spent, walked) = walk_singleton(index, launcher_id).await?;
-    let parent = index
-        .coin_record(walked.coin.parent_coin_info)
+) -> Result<ObservedSingleton>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    let (_spent, walked) = client.walk_singleton_chain(launcher_id).await?;
+    let parent = client
+        .get_coin_record(walked.coin.parent_coin_info)
         .await?
         .ok_or_else(|| Error::msg("parent coin record not found for the vault singleton"))?;
-    let again = index
-        .coin_record(walked.coin.coin_id())
+    let again = client
+        .get_coin_record(walked.coin.coin_id())
         .await?
         .ok_or_else(|| Error::msg("vault singleton changed while reading; try again"))?;
     if again.spent || again.coin != walked.coin {
@@ -113,7 +121,7 @@ pub(crate) fn classify_singleton(
     config: &VaultConfig,
     post_recovery: Option<&VaultConfig>,
     observed: &ObservedSingleton,
-    pending: bool,
+    pending: PendingSpend,
 ) -> Result<InspectReport> {
     let launcher_id = config.launcher_id_bytes()?;
     let keys = config.to_vault_keys()?;
@@ -162,8 +170,13 @@ pub(crate) fn classify_singleton(
         return Err(Error::msg("parent of the vault singleton is not spent"));
     }
 
-    let pending_note = (pending && phase == VaultPhase::InRecovery)
-        .then(|| PENDING_FINISH_OR_CLAWBACK.to_string());
+    let pending_note = match pending {
+        PendingSpend::Pending if phase == VaultPhase::InRecovery => {
+            Some(PENDING_FINISH_OR_CLAWBACK.to_string())
+        }
+        PendingSpend::Unknown => Some(PENDING_SPEND_UNCHECKED.to_string()),
+        _ => None,
+    };
 
     Ok(InspectReport {
         launcher_id,

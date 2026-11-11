@@ -10,14 +10,15 @@ use chia_vault_recover::error::Result;
 use chia_vault_recover::keys::MnemonicWordCount;
 use chia_vault_recover::locate::client_for_vault;
 use chia_vault_recover::network::Network;
-use chia_vault_recover::workflow::{self, FinishAction, LookupReport, StartWorkflow};
+use chia_vault_recover::scan;
+use chia_vault_recover::workflow::{self, FinishAction, StartWorkflow};
 
 use crate::session::GuiSession;
 
-use super::{App, Phase, runtime};
+use super::{App, LookupTask, Phase, ScanMode, runtime};
 
 impl App {
-    pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network) {
+    pub(super) fn apply_lookup(&mut self, lookup: VaultLookup, network: Network, address: &str) {
         let secs = lookup.clawback().secs();
         let summary = match &lookup {
             VaultLookup::Hinted(config) => {
@@ -29,7 +30,7 @@ impl App {
                 found.launcher_source
             ),
         };
-        let address = self.vault_address.trim().to_string();
+        let address = address.trim().to_string();
         GuiSession::clear();
         self.generated_recovery_mnemonic = None;
         match self.cache.persist(&address, network, lookup) {
@@ -46,24 +47,31 @@ impl App {
         }
     }
 
-    pub(super) fn apply_fallback(&mut self, gap: LookupGap) {
+    pub(super) fn apply_fallback(&mut self, gap: LookupGap, address: &str) {
+        let clear_note = self
+            .cache
+            .discard(address)
+            .err()
+            .map(|e| format!(" Could not clear the saved lookup: {e}."))
+            .unwrap_or_default();
         let launcher = match gap.known_launcher() {
             Some(known) => format!(" launcher 0x{} ({}).", hex::encode(known.id), known.source),
             None => String::new(),
         };
         self.set_err(format!(
-            "Lookup needs a self-send so Cloud Wallet can publish the recovery hint.{launcher} {}",
+            "Lookup needs a self-send so Cloud Wallet can publish the recovery hint.{launcher} {}{clear_note}",
             gap.headline()
         ));
         self.phase = Phase::Fallback(gap);
     }
 
     pub(super) fn run_lookup(&mut self) {
-        let result = self.lookup_inner();
-        self.report("Lookup error", result);
+        if let Err(e) = self.start_lookup() {
+            self.set_err(format!("Lookup error: {e}"));
+        }
     }
 
-    fn lookup_inner(&mut self) -> Result<()> {
+    fn start_lookup(&mut self) -> Result<()> {
         let vault = self.vault_address.trim();
         if vault.is_empty() {
             return Err(chia_vault_recover::Error::msg(
@@ -72,12 +80,42 @@ impl App {
         }
         let (client, network) = client_for_vault(vault, &self.backend())?;
         let extra = self.parsed_clawback()?.into_iter().collect::<Vec<_>>();
-        let report = runtime().block_on(workflow::lookup(&client, vault, &extra))?;
-        match report {
-            LookupReport::Ready(lookup) => self.apply_lookup(lookup, network),
-            LookupReport::NeedFallback(gap) => self.apply_fallback(gap),
-        }
+        let scan = self.launcher_scan()?;
+        let address = vault.to_string();
+        let task_address = address.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = runtime().spawn(async move {
+            let options = workflow::LookupOptions {
+                extra_timelocks: &extra,
+                scan: scan.as_ref(),
+            };
+            let result = workflow::lookup(&client, &address, options)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = sender.send(result);
+        });
+        self.lookup_task = Some(LookupTask {
+            receiver,
+            handle,
+            network,
+            address: task_address,
+        });
+        self.phase = Phase::LookingUp;
+        self.set_ok("Looking up…");
         Ok(())
+    }
+
+    /// The opted-in launcher scan; lookup holds it to the 5-day limit unless forced.
+    fn launcher_scan(&self) -> Result<Option<scan::LauncherScan>> {
+        Ok(Some(match self.scan_mode {
+            ScanMode::Off => return Ok(None),
+            ScanMode::CreatedOn => scan::LauncherScan::created_on(&self.scan_created_on)?,
+            ScanMode::Heights => scan::LauncherScan::heights(
+                Self::parsed_height(&self.scan_from_height, "scan from height")?,
+                Self::parsed_height(&self.scan_to_height, "scan to height")?,
+                self.force_scan,
+            )?,
+        }))
     }
 
     pub(super) fn run_confirm_clawback(&mut self) {
@@ -342,24 +380,12 @@ mod tests {
     }
 
     fn app_waiting(session: GuiSession) -> App {
-        App {
-            vault_address: session.receive_address.clone(),
-            config_path: String::new(),
-            post_recovery_path: String::new(),
-            clawback_secs: String::new(),
-            recovery_mnemonic: String::new(),
-            new_custody_mnemonic: String::new(),
-            new_recovery_mnemonic: String::new(),
-            generate_12_words: false,
-            full_node_url: String::new(),
-            status: super::super::Status::Empty,
-            generated_recovery_mnemonic: Some("shown recovery phrase".into()),
-            phase: Phase::Wait(session),
-            detail: String::new(),
-            cache: LookupCache::open_at(temp_dir().join("cache.json")),
-            smoke: true,
-            logged_first_frame: true,
-        }
+        let mut app = App::base(LookupCache::open_at(temp_dir().join("cache.json")), true);
+        app.vault_address = session.receive_address.clone();
+        app.generated_recovery_mnemonic = Some("shown recovery phrase".into());
+        app.phase = Phase::Wait(session);
+        app.logged_first_frame = true;
+        app
     }
 
     #[test]

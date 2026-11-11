@@ -1,12 +1,16 @@
 //! End-to-end recovery workflows shared by CLI and GUI.
 
+use std::fmt::Display;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use chia_protocol::Coin;
 use chia_puzzle_types::Proof;
+use chia_sdk_coinset::ChiaRpcClient;
 
 use crate::cache::{LookupCache, VaultLookup};
-use crate::chain::{ChainClient, SingletonIndex};
+use crate::chain::ChainClient;
 use crate::config::VaultConfig;
 use crate::discover::{
     ClawbackGuess, DEFAULT_TIMELOCK_CANDIDATES, FoundVault, ReconstructedVault,
@@ -22,6 +26,7 @@ use crate::recovery::{
     FinishRecoveryParams, InspectReport, StartRecoveryParams, StartRecoveryResult, VaultPhase,
     classify_singleton, finish_recovery, load_singleton, start_recovery,
 };
+use crate::scan::LauncherScan;
 
 /// What `finish` did with a vault that may already have left recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +56,15 @@ pub struct ResolvedVault {
 /// Find the live singleton from its launcher and its lineage proof.
 ///
 /// With a post-recovery config, that coin is settled only when its parent is the recovery coin.
-pub async fn resolve_vault(
-    client: &ChainClient,
+pub async fn resolve_vault<C>(
+    client: &ChainClient<C>,
     config: &VaultConfig,
     post_recovery: Option<&VaultConfig>,
-) -> Result<ResolvedVault> {
+) -> Result<ResolvedVault>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let report = inspect(client, config, post_recovery).await?;
     let Some(coin) = report.on_chain_coin else {
         return Err(Error::msg(
@@ -73,16 +82,38 @@ pub async fn resolve_vault(
     })
 }
 
-pub async fn inspect(
-    client: &impl SingletonIndex,
+pub async fn inspect<C>(
+    client: &ChainClient<C>,
     config: &VaultConfig,
     post_recovery: Option<&VaultConfig>,
-) -> Result<InspectReport> {
+) -> Result<InspectReport>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    with_deadline(
+        INSPECT_DEADLINE,
+        "vault inspection",
+        "; the node may be slow",
+        inspect_inner(client, config, post_recovery),
+    )
+    .await
+}
+
+async fn inspect_inner<C>(
+    client: &ChainClient<C>,
+    config: &VaultConfig,
+    post_recovery: Option<&VaultConfig>,
+) -> Result<InspectReport>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let launcher_id = config.launcher_id_bytes()?;
     let observed = load_singleton(client, launcher_id).await?;
     let pending = client
         .coin_has_pending_spend(observed.tip.coin.coin_id())
-        .await?;
+        .await;
     classify_singleton(config, post_recovery, &observed, pending)
 }
 
@@ -97,7 +128,14 @@ pub struct StartWorkflow<'a> {
     pub out_config: &'a Path,
 }
 
-pub async fn start(client: &ChainClient, params: StartWorkflow<'_>) -> Result<StartRecoveryResult> {
+pub async fn start<C>(
+    client: &ChainClient<C>,
+    params: StartWorkflow<'_>,
+) -> Result<StartRecoveryResult>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let resolved = resolve_vault(client, params.config, None).await?;
     if resolved.phase != VaultPhase::Ready {
         return Err(Error::msg(
@@ -123,13 +161,36 @@ pub async fn start(client: &ChainClient, params: StartWorkflow<'_>) -> Result<St
     Ok(result)
 }
 
-pub async fn finish(
-    client: &ChainClient,
+pub async fn finish<C>(
+    client: &ChainClient<C>,
     config: &VaultConfig,
     post_recovery: &VaultConfig,
     network: Network,
-) -> Result<FinishOutcome> {
-    let report = inspect(client, config, Some(post_recovery)).await?;
+) -> Result<FinishOutcome>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    with_deadline(
+        INSPECT_DEADLINE,
+        "finish",
+        "; the node may be slow",
+        finish_inner(client, config, post_recovery, network),
+    )
+    .await
+}
+
+async fn finish_inner<C>(
+    client: &ChainClient<C>,
+    config: &VaultConfig,
+    post_recovery: &VaultConfig,
+    network: Network,
+) -> Result<FinishOutcome>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    let report = inspect_inner(client, config, Some(post_recovery)).await?;
     let pending_note = report.pending_note.clone();
     let action = match report.phase {
         VaultPhase::InRecovery => {
@@ -158,6 +219,35 @@ pub async fn finish(
         action,
         pending_note,
     })
+}
+
+/// Lookup inputs beyond the vault address.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LookupOptions<'a> {
+    /// Clawback seconds tried before the common Cloud Wallet values.
+    pub extra_timelocks: &'a [u64],
+    /// Opt-in launcher scan when nothing at the address reveals the launcher.
+    pub scan: Option<&'a LauncherScan>,
+}
+
+/// Overall limit for the address lookup and its optional launcher scan.
+pub const LOOKUP_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// Overall limit for inspecting a vault and for finishing recovery.
+pub const INSPECT_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+async fn with_deadline<T>(
+    limit: Duration,
+    operation: &str,
+    hint: &str,
+    work: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, work).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::msg(format!(
+            "{operation} did not finish within {} minutes{hint}",
+            limit.as_secs() / 60
+        ))),
+    }
 }
 
 /// Result of looking up a vault from its receive address (or launcher id).
@@ -217,39 +307,82 @@ pub fn prepare_start(
 }
 
 /// Use a cached lookup when the address matches; otherwise look up and persist.
-pub async fn resolve_found(
-    client: &ChainClient,
+pub async fn resolve_found<C>(
+    client: &ChainClient<C>,
     cache: &mut LookupCache,
     vault: &str,
     network: Network,
-    extra_timelocks: &[u64],
-) -> Result<LookupReport> {
+    options: LookupOptions<'_>,
+) -> Result<LookupReport>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     if let Some(cached) = cache.matching(vault) {
         return Ok(LookupReport::Ready(cached.lookup.clone()));
     }
-    let report = lookup(client, vault, extra_timelocks).await?;
+    let report = lookup(client, vault, options).await?;
     persist_report(cache, vault, network, &report)?;
     Ok(report)
 }
 
 /// Address-first lookup. The parent spend is the only hint source.
 ///
-/// `extra_timelocks` are tried before the common Cloud Wallet values. Seconds
-/// outside that set are not recovered from the hint.
-pub async fn lookup(
-    client: &ChainClient,
+/// `options.extra_timelocks` are tried before the common Cloud Wallet values.
+/// Seconds outside that set are not recovered from the hint. `options.scan` opts in
+/// to checking every launcher in a block range when no spend reveals the launcher
+/// (a never-spent vault). The whole launcher resolve, scan, and hint read share one
+/// deadline.
+pub async fn lookup<C>(
+    client: &ChainClient<C>,
     vault: &str,
-    extra_timelocks: &[u64],
-) -> Result<LookupReport> {
+    options: LookupOptions<'_>,
+) -> Result<LookupReport>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    lookup_within(LOOKUP_DEADLINE, client, vault, options).await
+}
+
+pub(crate) async fn lookup_within<C>(
+    limit: Duration,
+    client: &ChainClient<C>,
+    vault: &str,
+    options: LookupOptions<'_>,
+) -> Result<LookupReport>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
+    with_deadline(
+        limit,
+        "lookup",
+        "; the node may be slow, or narrow the launcher scan range",
+        lookup_inner(client, vault, options),
+    )
+    .await
+}
+
+async fn lookup_inner<C>(
+    client: &ChainClient<C>,
+    vault: &str,
+    options: LookupOptions<'_>,
+) -> Result<LookupReport>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let locator = parse_vault_locator(vault)?;
-    let Some(resolved) = resolve_launcher_id(client, &locator).await? else {
-        return Ok(LookupReport::NeedFallback(LookupGap::LauncherNotFound));
+    let resolved = match resolve_launcher_id(client, &locator, options.scan).await? {
+        Ok(resolved) => resolved,
+        Err(gap) => return Ok(LookupReport::NeedFallback(gap)),
     };
 
     let (spent, current) = client.walk_singleton_chain(resolved.launcher_id).await?;
     let ancestor_puzzle_hashes: Vec<chia_protocol::Bytes32> =
         spent.iter().map(|r| r.coin.puzzle_hash).collect();
-    let candidates = timelock_candidates(extra_timelocks);
+    let candidates = timelock_candidates(options.extra_timelocks);
 
     if let Some(config) =
         hinted_config_from_parent(client, resolved.launcher_id, &current, &candidates).await?
@@ -302,12 +435,16 @@ fn timelock_candidates(extra: &[u64]) -> Vec<u64> {
     out
 }
 
-async fn hinted_config_from_parent(
-    client: &ChainClient,
+async fn hinted_config_from_parent<C>(
+    client: &ChainClient<C>,
     launcher_id: chia_protocol::Bytes32,
     current: &chia_sdk_coinset::CoinRecord,
     timelock_candidates: &[u64],
-) -> Result<Option<VaultConfig>> {
+) -> Result<Option<VaultConfig>>
+where
+    C: ChiaRpcClient,
+    C::Error: Display,
+{
     let Some(parent) = client
         .get_coin_record(current.coin.parent_coin_info)
         .await?
@@ -370,6 +507,7 @@ mod tests {
     use super::*;
     use crate::cache::LookupCache;
     use crate::discover::DiscoveredCustodyPath;
+    use crate::test_rpc::NeverRpc;
 
     fn coin() -> Coin {
         Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x02; 32]), 1)
@@ -381,6 +519,42 @@ mod tests {
             members: vec![],
             vault_launcher_ids: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn lookup_deadline_reports_a_clear_error() {
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_deadline(
+                Duration::from_millis(10),
+                "lookup",
+                "",
+                std::future::pending::<Result<()>>(),
+            ),
+        )
+        .await
+        .expect("with_deadline should apply its limit")
+        .unwrap_err();
+        assert!(err.to_string().contains("did not finish within"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn lookup_applies_the_deadline_to_the_whole_lookup() {
+        let client = ChainClient::with_rpc(NeverRpc);
+        let vault = format!("0x{}", hex::encode([0x11; 32]));
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            lookup_within(
+                Duration::from_millis(10),
+                &client,
+                &vault,
+                LookupOptions::default(),
+            ),
+        )
+        .await
+        .expect("lookup_within should apply its deadline")
+        .unwrap_err();
+        assert!(err.to_string().contains("did not finish within"), "{err}");
     }
 
     #[test]
