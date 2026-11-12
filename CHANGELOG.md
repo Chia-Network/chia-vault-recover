@@ -1,8 +1,6 @@
 # Changelog
 
-## Unreleased
-
-The package version is bumped at release time; it is not changed by this entry.
+## 1.0.0-rc10 - 2026-11-12
 
 ### Added
 
