@@ -31,9 +31,9 @@ chia-consensus = "0.36"
 chia-protocol = "0.36"
 chia-puzzle-types = "0.36"
 chia-puzzles = "0.20"
-chia-sdk-coinset = { version = "0.36", features = ["rustls"] }
-chia-sdk-driver = "0.36"
-chia-sdk-types = "0.36"
+chia-sdk-coinset = { version = "0.37", features = ["rustls"] }
+chia-sdk-driver = "0.37"
+chia-sdk-types = "0.37"
 chia-secp = "0.36"
 chia-sha2 = "0.42"
 clap = { version = "4", features = ["derive", "env"] }
@@ -52,7 +52,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
-chia-sdk-test = "0.36"
+chia-sdk-test = "0.37"
 hex-literal = "1.1"
 rstest = "0.28"
 
